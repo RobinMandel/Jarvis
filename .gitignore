@@ -40,3 +40,4 @@ Thumbs.db
 *.egg-info/
 dist/
 build/
+Mission-Control/static/legacy/videos/

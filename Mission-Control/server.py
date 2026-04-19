@@ -5241,6 +5241,8 @@ async def _run_arena(room_id: str):
     # Gather project context once at start (so bots know what exists)
     project_context = _gather_arena_context()
 
+    _activity_set("arena", active=True)
+
     # Notify start
     room["status"] = "running"
     _save_arena_rooms(rooms)
@@ -6050,6 +6052,7 @@ async def _run_arena(room_id: str):
             room["status"] = "idle"
             _save_arena_rooms(rooms)
 
+        _activity_set("arena", active=False)
         _arena_rooms.pop(room_id, None)
         await _broadcast_all_ws({
             "type": "arena.stopped",

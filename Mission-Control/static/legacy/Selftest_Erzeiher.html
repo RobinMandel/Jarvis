@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="de">
+
+<head>
+   <meta charset="uft-8">
+   <title >Selftest</title> 
+   <link rel="stylesheet"  href="Design.css" />
+   <link href="https://fonts.googleapis.com/css2?family=Anton&display=swap" rel="stylesheet">
+   <link rel = "icon" href =  
+      "images/logo.png" 
+       type = "image/x-icon"> 
+<style>
+            .auswahl {border-radius: 10%;
+                float: left; position: relative;
+                background: #00FFA8;
+                height: 120px; width: 100px;
+                margin: 20px; padding: 10px;
+                font-size: 100px;
+               color: #00FFA8;
+            }
+        </style>
+</head>  
+	
+
+<!-- Body mit margin 0 - damit kein Rand um Site -->
+
+	<body>
+	
+<!-- Navigation der Site im header -->
+
+<header role="main">
+	<nav class="site-nav" role="navigation">
+	<ul>
+                <li><a href="./index2.html">Start</a></li>
+                <li><a href="./Berufsuebersicht.html">Berufsprofile </a></li>
+                <li><a href="#">Berufe-Test  </a></li>
+                <li><a href="index2.html#Jobboersen">Jobb�rsen </a></li>
+                <li><a href="index2.html#Impressum">Impressum </a></li>
+                <li><a href="./Just4Fun.html">Just4Fun</a></li>
+         </ul>
+         </nav>	
+
+<a href="./index2.html">
+<img src="images/logo.png" align="right" class="zweitLogo" alt="logo" width="100" height="100" />
+</a>
+
+</header>
+
+<h1 class="ueberschrift shadow">
+Selftest
+</h1>
+
+
+   <body style="background: #00FFA8;">
+        <div onclick="starteNeueRunde();"
+            class ="selfKasten" >
+            <p id="Frage">Willkommen zum Quiz</p>
+            <p id="Antworten">Klicke hier, um dein Quiz zu starten.</p>
+        </div>
+        <div style="width: 500px; height: 200px; margin: 1px auto; text-align: center">
+            <p id="1" class="auswahl" onclick="tippeButton(this);">1</p>
+            <p id="2" class="auswahl" onclick="tippeButton(this);">2</p>
+            <p id="3" class="auswahl" onclick="tippeButton(this);">3</p>
+        </div>
+        <script>
+alert("Willkomen zu dem Test, der einen Einblick in die Welt eines Erziehers geben soll. Hier wirst du verschiedene Fragen aus seinem Themengebiet bekommen. Um das Quiz zu starten und zur n�chsten Frage zu gelangen musst du auf dieFragebox klicken.")
+            var fragen = new Array();
+            var punkte = 0;
+            var runden = 0;
+            var gesperrt = true;
+            var richtigeAntwort;
+            definiereDieFragen();
+            function tippeButton(gewaehlterButton) {
+                if (gesperrt) {
+                    return
+                }
+                gesperrt = true;
+                if (gewaehlterButton.getAttribute("id") == richtigeAntwort) {
+                    punkte++;
+                    runden++;
+gewaehlterButton.style.background = "green";
+                } else {
+                    gewaehlterButton.style.background = "#FF0000";
+                }
+            }
+            function starteNeueRunde() {
+                document.getElementById("1").style.background = "white";
+                document.getElementById("2").style.background = "white";
+                document.getElementById("3").style.background = "white";
+                if (runden < 11) {
+                    gesperrt = false;
+                    runden++;
+                    dieFrage = fragen.shift();
+                    var frageAufbereitet = dieFrage.split("#");
+                    document.getElementById("Frage").innerHTML = frageAufbereitet[0];
+                    document.getElementById("Antworten").innerHTML = frageAufbereitet[1];
+                    richtigeAntwort = frageAufbereitet[2];
+            /*        setTimeout(starteNeueRunde, 3000); */
+                } else {
+                    alert("Herzlichen Gl�ckwunsch,du hast das Quiz �berstanden. Du hast " + punkte + " Fragen richtig beantwortet. Jetzt hast du einen Einblick in die Welt eines Erziehers bekommen! Gehe nun, wenn du willst, auf die Seite der Spiele, um deinen Erfolg zu feiern und etwas Spa� zu haben.");
+                   window.location = 'https://www.ghhnet.de/InfoQ2Phy1920/g11/Berufsuebersicht.html';
+                }
+            }
+            function definiereDieFragen() {
+                fragen[0] = "Sollte man Sch�ler schlagen#1) Ja! 2) Nein 3) Ja aber Frauen nur ins Gesicht#2";
+                fragen[1] = "Wie sollte man auf ein auff�llige Kind reagieren#1) ignorieren 2) selber auff�llig werden 3) ruhig mit dem Kind reden#3";
+                fragen[2] = "Welches mathematische Themengebiet muss man als Lehrer (nicht Mathe) k�nnen#1) Abz�hlen 2) Stochastik 3) Analysis#1";
+                fragen[3] = "Wie lernen Kinder am besten#1) mit Respekt  2) Einzelarbeit 3) produktive Gruppenarbeit #3";
+                fragen[4] = "Was tun bei zwei streitenden Kindern?#1) Nichts,die m�ssen das selber lernen 2) mit Streiten und handgreiflich werden 3) Diplomatisch die Situation entsch�rfen#3";
+                fragen[5] = "Ist die Digitalisierung gut f�r Kinder?#1) Ja 2) Nein 3) h�ngt vom ausma� der Nutzung ab#3";
+                fragen[6] = "K�nnen Lehrer mit Kreide werfen?#1) Ja 2) nur w�hrend der Pausen 3) Nein#3";
+                fragen[7] = "Muss man studieren,um Lehrer zu werden?#1) Nein 2) Ja 3) Als Grundschullehrer nicht#2";
+                fragen[8] = "Was ist 1+1?#1) Eine Gleichung 2) Eine Formel 3) Eine Rechnung#3";
+                fragen[9] = "In welcher Klassenstufe wird Seuxualkunde unterrichtet?#1) 4&6  2) 2&3 3) 9&10#1";
+                for (var i = 1; i < 9; i++) {
+                    fragen.sort(function (a, b) {
+                        return Math.random() - 0.5;
+                    });
+                }
+            }
+        </script>
+
+
+    </body>
+
+<!-- Footer-->
+		
+<footer id="Impressum" role="contentinfo">
+    <div class="footer-content" >
+            <ul class="footer-social">
+                <li>
+                    <a href="http://www.facebook.de" target="_blank" >
+                        <img class="social-default  footer-img" src="images/f-weis.png">
+                        <img class="social-hover footer-img" src="images/f-rot.png">
+                    </a>
+                </li>
+                <li>
+                    <a href="https://www.pinterest.com" target="_blank">
+                        <img class="social-default footer-img" src="images/p-weis.png">
+                        <img class="social-hover footer-img" src="images/p-rot.png">
+                    </a>
+                </li>
+                <li>
+                    <a href="https://twitter.com/elonmusk" target="_blank"  >
+                        <img class="social-default footer-img" src="images/t-weis.png">
+                        <img class="social-hover footer-img" src="images/t-rot.png">
+                    </a>
+                </li>
+            </ul>
+            <div class="footer-info">
+                <p class="footer-credit">Website design by <a href="/cdn-cgi/l/email-protection#34465b565d5a59555a505158745b4140585b5b5f1a5051">Robin &amp; Dennis</a></p>
+                <p class="footer-disclaimer">Das ist unsere erste Website </p>
+                <p class="footer-legal">&copy; 2020 Robin &amp; Dennis</p>
+            </div>
+        </div>
+    </footer>
+    
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js" defer></script></body>
+</html>
+

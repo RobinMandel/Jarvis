@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="de">
+
+<head>
+   <meta charset="uft-8">
+   <title >Berufstest</title> 
+   <link rel="stylesheet"  href="Design.css" >
+   <link href="https://fonts.googleapis.com/css2?family=Anton&display=swap" rel="stylesheet">
+   <link rel = "icon" href =  
+      "images/logo.png" 
+       type = "image/x-icon"> 
+</head>
+
+<!-- Body mit margin 0 - damit kein Rand um Site -->
+
+	<body>
+	
+<!-- Navigation der Site im header -->
+
+<header role="main">
+	<nav class="site-nav" role="navigation" >
+	<ul>
+                <li><a href="./index2.html">Start</a></li>
+                <li><a href="./Berufsuebersicht.html">Berufsprofile </a></li>
+                <li><a href="./Berufstest.html">Berufe-Test  </a></li>
+                <li><a href="index2.html#Jobboersen">Jobbörsen </a></li>
+                <li><a href="index2.html#Impressum">Impressum </a></li>
+                <li><a href="./Just4Fun.html">Just4Fun</a></li>
+                <li><a href="./Videos.html">Videos</a></li>
+         </ul>
+         </nav>	
+
+<a href="./index2.html">
+<img src="images/logo.png" align="right" class="zweitLogo" alt="logo" width="100" height="100" />
+</a>
+
+</header>
+
+
+<h1 class="ueberschrift shadow">
+Chimpanzee Test
+</h1>
+
+
+<style>
+/* -----------Pop-up: Chimp ----------------------*/
+
+/* Popup container - can be anything you want */
+.popup {
+  position: relative; 
+  display: inline-block;
+  cursor: pointer;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+  z-index:0;
+}
+
+/* The actual popup */
+.popup .popuptext {
+  visibility: hidden;
+  width: 360px;
+  background-color: #555;
+  color: #fff;
+  text-align: center;
+  border-radius: 6px;
+  padding: 8px 0;
+  position: absolute;
+  z-index: 1;
+  bottom: 125%;
+  left: 0%;
+  margin-left: -80px;
+}
+
+/* Popup arrow */
+.popup .popuptext::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  margin-left: -5px;
+  border-width: 5px;
+  border-style: solid;
+  border-color: #555 transparent transparent transparent;
+}
+
+/* Toggle this class - hide and show the popup */
+.popup .show {
+  visibility: visible;
+  -webkit-animation: fadeIn 1s;
+  animation: fadeIn 1s;
+}
+
+/* Add animation (fade in the popup) */
+@-webkit-keyframes fadeIn {
+  from {opacity: 0;} 
+  to {opacity: 1;}
+}
+
+@keyframes fadeIn {
+  from {opacity: 0;}
+  to {opacity:1 ;}
+}
+</style>
+
+
+<div id="ersterHinweis" style="display:block;font-size:1.2em;"  class="tb_verlauf">
+<center>
+<p>Bist du <b>schlauer</b> als ein <b>
+<div class="popup" onclick="chimpPop()" style="font-size: 1.5em;"> Schimpanse? <img src="images/Fragezeichen.png" height=18px width=20px style="margin-left: -13px; margin-bottom: 13px;"> 
+<span class="popuptext" style="font-size: 0.5em;" id="meintext">Der wohl schlauste Schimpanse (einer Studie der Universität Kioto) namens "Ayumu" erreichte ein Ergebnis von 9 und schaute sich dabei die Zahlenfolge nur wenige Sekunden (2 sec.) an!</span> </div>
+</b></p> 
+
+Im Folgenden werden dir Zahlen von 1-4 angezeigt.<br> 
+Deine Aufgabe ist es diese in der richtigen Reihenfolge zu drücken.<br>
+Aber <b style="color:red;font-size:1.4em;">Achtung!</b> Sobald du die erste Zahl (im besten Fall "1" <img src="images/smiley.png">) drückst, verschwinden die restlichen Zahlen! <br>
+Am besten merkst du dir also vorher wo die Zahlen waren und fängst dann erst an. <br>
+--- Drücke <b  style="font-size:1.4em">"weiter"</b> um das Spiel zu starten. ---
+</center>
+</div>
+
+<div id="zweiterHinweis" style="display:none;font-size:1.2em" class="tb_verlauf">
+<center>
+Du hast es geschafft. <b style="color:red;font-size:1.4em">Wahnsinn!</b><img src="images/wahnsinn.png"><br>
+Jetzt wird es allerdings schwerer. Mit jeder Runde wird eine weitere Zahl hinzugefügt.<br> 
+Die Runde, in der du dich befindest wird dir hier angezeigt.<br> 
+Zusätzlich stehst du ab jetzt unter Zeitdruck<br> 
+Mal sehen wie weit du kommst! Viel Spaß!
+</div>
+
+
+<div id="dritterHinweis" style="display:none" class="tb_verlauf">
+<center>
+<p style="font-size: 2.5em; display:inline"> Hey du hast es bis zur Runde   </p>
+<b style="color:red;font-size: 3em; display:inline" id="endZaehler">Zahl</b> 
+<p style="font-size: 2.5em;display:inline">    geschafft</p>
+</div>
+
+<div id="zaehler" style="display:none;font-size:1.6em;text-align:center;padding-top:-5px;" class="tb_verlauf">
+<p><b>   Runde:<span id="rundenZaehler"> Zahl </span></b></p>
+</div>
+
+<!-- Zähler ---------------------------------------------------------->
+
+<div  style="margin-left: 42%; display:none; font-size: 4em;" id="zahl_zahl">
+Zeit:
+</div>
+ 
+
+<div style="display:inline;">
+<input type="text" id="count"  style="display:none; background-color: #ddd;   width: 5%; font-size: 4em; text-align: center;   border: 1px solid aqua; ">
+</div>
+
+
+
+<!-- Balken ----------------------------------------------> 
+<div id="ladebalken"  style="display:none">
+    <div id="fortschritt"></div>
+</div>
+
+
+
+<!-- Tabelle ----------------------------------------------> 
+<table id="chimpTabelle" style="display:">
+  <tr>
+    <td id="Feld1" onclick = "pruefen(this)"></td>
+    <td id="Feld2" onclick = "pruefen(this)"></td>
+    <td id="Feld3" onclick = "pruefen(this)"></td>
+    <td id="Feld4" onclick = "pruefen(this)"></td>
+    <td id="Feld5" onclick = "pruefen(this)"></td>
+    <td id="Feld6" onclick = "pruefen(this)"></td>
+    <td id="Feld7" onclick = "pruefen(this)"></td>
+  </tr>
+  <tr>
+    <td id="Feld8" onclick = "pruefen(this)"></td>
+    <td id="Feld9" onclick = "pruefen(this)"></td>
+    <td id="Feld10" onclick = "pruefen(this)"></td>
+    <td id="Feld11" onclick = "pruefen(this)"></td>
+    <td id="Feld12" onclick = "pruefen(this)"></td>
+    <td id="Feld13" onclick = "pruefen(this)"></td>
+    <td id="Feld14" onclick = "pruefen(this)"></td>
+  </tr>
+  <tr>
+    <td id="Feld15" onclick = "pruefen(this)"></td>
+    <td id="Feld16" onclick = "pruefen(this)"></td>
+    <td id="Feld17" onclick = "pruefen(this)"></td>
+    <td id="Feld18" onclick = "pruefen(this)"></td>
+    <td id="Feld19" onclick = "pruefen(this)"></td>
+    <td id="Feld20" onclick = "pruefen(this)"></td>
+    <td id="Feld21" onclick = "pruefen(this)"></td>
+  </tr>
+  <tr>
+    <td id="Feld22" onclick = "pruefen(this)"></td>
+    <td id="Feld23" onclick = "pruefen(this)"></td>
+    <td id="Feld24" onclick = "pruefen(this)"></td>
+    <td id="Feld25" onclick = "pruefen(this)"></td>
+    <td id="Feld26" onclick = "pruefen(this)"></td>
+    <td id="Feld27" onclick = "pruefen(this)"></td>
+    <td id="Feld28" onclick = "pruefen(this)"></td>
+  </tr>
+  <tr>
+    <td id="Feld29" onclick = "pruefen(this)"></td>
+    <td id="Feld30" onclick = "pruefen(this)"></td>
+    <td id="Feld31" onclick = "pruefen(this)"></td>
+    <td id="Feld32" onclick = "pruefen(this)"></td>
+    <td id="Feld33" onclick = "pruefen(this)"></td>
+    <td id="Feld34" onclick = "pruefen(this)"></td>
+    <td id="Feld35" onclick = "pruefen(this)"></td>
+  </tr>
+  <tr>
+    <td id="Feld36" onclick = "pruefen(this)"></td>
+    <td id="Feld37" onclick = "pruefen(this)"></td>
+    <td id="Feld38" onclick = "pruefen(this)"></td>
+    <td id="Feld39" onclick = "pruefen(this)"></td>
+    <td id="Feld40" onclick = "pruefen(this)"></td>
+    <td id="Feld41" onclick = "pruefen(this)"></td>
+    <td id="Feld42" onclick = "pruefen(this)"></td>
+  </tr>
+  <tr>
+    <td id="Feld43" onclick = "pruefen(this)"></td>
+    <td id="Feld44" onclick = "pruefen(this)"></td>
+    <td id="Feld45" onclick = "pruefen(this)"></td>
+    <td id="Feld46" onclick = "pruefen(this)"></td>
+    <td id="Feld47" onclick = "pruefen(this)"></td>
+    <td id="Feld48" onclick = "pruefen(this)"></td>
+    <td id="Feld49" onclick = "pruefen(this)"></td>
+  </tr>
+</table>
+
+
+<p>
+<center>
+<button class="buttonBlue" onclick="fuellen(); zeitdauer(runde);" id="knopf"  style="display:block" >Weiter</button>
+</center>
+</p>
+
+
+<script>
+
+var iMax = 7;
+var jMax = 7;
+var myItems = [];
+var speicher= [];
+var feldliste = [];
+
+var runde = 1;
+var zielZelle;
+var k;
+var z = 1;
+var wert = 1;
+var ident;
+
+var abgleich = 1;
+var x = 0;
+
+var schw = false;
+var element;
+var element2 ;
+var element3 ;
+var element4 ;
+var element5 ;
+var element6 ;
+var element7 ;
+var element8 ;
+var element9 ;
+
+var zeit;
+var c;
+var t;
+var timer_is_on = 0;
+
+var erhoehe_pixel = 860;
+var ladevorgang;
+
+
+reset();
+/* ladenStoppen(); */
+
+/* Array erstellen und mit Nullen füllen:    */
+
+function reset() {
+
+for (let i=0; i<iMax; i++) {
+   myItems[i] = [];
+   for (let j=0; j<jMax; j++) {
+      myItems[i][j] = 0;
+   }
+}
+
+}
+
+
+
+
+function fuellen(){
+
+var schritt = document.getElementById("fortschritt");
+schritt.style.width = "860px";
+
+startCount();
+
+/*random Zellen mit zahlen von 1- Runde füllen:   */
+
+for (k = 0; k <  (runde+3); k++) {
+
+var nummer= (Math.floor(Math.random() * 49) + 1);
+
+if(feldliste.includes(nummer) == true) {
+var nummer= (Math.floor(Math.random() * 49) + 1);
+feldliste[k] = nummer;
+speicher[k] = nummer;
+}
+else{
+feldliste[k] = nummer;
+speicher[k] = nummer;
+}
+
+ident = "Feld" + nummer;
+
+document.getElementById(ident).classList.add("hebung"); 
+document.getElementById(ident).innerHTML = k+1;
+
+}
+
+
+
+/* button und Hinweise verschwinden lassen */
+      
+       
+element = document.getElementById("knopf");
+if(element.style.display!='none'){
+	element.style.display='none';
+	}
+
+element2 = document.getElementById("ersterHinweis");
+if(element2.style.display!='none'){
+	element2.style.display='none';
+	}
+
+element3 = document.getElementById("zweiterHinweis");
+if(element3.style.display!='none'){
+	element3.style.display='none';
+	}
+
+element4 = document.getElementById("dritterHinweis");
+if(element4.style.display!='none'){
+	element4.style.display='none';
+	}
+
+element5 = document.getElementById("zaehler");
+     if(element5.style.display =='none'){
+     element5.style.display='block'; 
+	            } 
+
+element6 = document.getElementById("chimpTabelle");
+       if(element6.style.display =='none'){
+       element6.style.display=''; 
+	         } 
+
+element7 = document.getElementById("count");
+     element7.style.display='none'; 
+	         
+
+element8 = document.getElementById("zahl_zahl");
+       element8.style.display='none'; 
+	         
+
+element9 = document.getElementById("ladebalken");
+       element9.style.display='none'; 
+    
+
+if(runde >= 2){
+element7 = document.getElementById("count");
+     element7.style.display='inline-block'; 
+	         
+
+element8 = document.getElementById("zahl_zahl");
+       element8.style.display='inline-block'; 
+	         
+
+element9 = document.getElementById("ladebalken");
+       element9.style.display='block'; 
+}    
+}
+
+
+/*Ende fuellen*/
+
+
+
+
+/*Prüfen ob in richtiger Reihenfolge geklickt wird:   */
+
+function pruefen(feldnummer) {
+
+     if( (abgleich ==  document.getElementById("Feld" + feldliste[x]).innerHTML) && ("Feld" + feldliste[x] == feldnummer.id))  {
+     document.getElementById("Feld" + feldliste[x]).innerHTML = 0;
+
+     document.getElementById("Feld"+feldliste[x]).style ="border: 0px solid #000; background-color: white; color: white;";     
+     feldliste[x] = 0;
+
+     abgleich ++;
+     x ++;
+     }
+
+     else { 
+             zurueck();
+      }
+
+if(schw == false){
+     for (k = 1; k < runde+3; k++) { 
+     /* document.getElementById("Feld" + speicher[k]).style ="border: 5px solid #FFF; background-color: black; color: black; border-radius: 10px;"; */
+     document.getElementById("Feld" + speicher[k]).classList.add("hebung_schwarz"); 
+     } 
+      schw = true;
+}
+
+
+
+
+var isNull = (currentValue) => currentValue == 0;
+
+
+    if(feldliste.every(isNull) == true) {
+         for (k = 0; k < runde+3; k++) {
+              document.getElementById("Feld" + speicher[k]).classList.remove("hebung"); 
+              document.getElementById("Feld" + speicher[k]).classList.remove("hebung_schwarz"); 
+              document.getElementById("Feld" + speicher[k]).innerHTML = "";
+              document.getElementById("Feld" + speicher[k]).style =""; 
+              speicher[k] = 0;
+              wert = 1;
+              spalte = 0;
+              zeile = 0;
+              z = 1;
+             }
+          runde ++;
+          reset();
+          x = 0;
+          abgleich = 1;
+         schw = false;
+         clearTimeout(zeit);
+         stopCount();
+         ladenStoppen();
+         neu = true;
+
+document.getElementById("rundenZaehler").innerHTML = runde; 
+
+        element = document.getElementById("knopf");
+           if(element.style.display =='none'){
+	   element.style.display='block';
+	         }
+
+           if(runde == 2){
+             element3 = document.getElementById("zweiterHinweis");
+              if(element3.style.display =='none'){
+	      element3.style.display='block';
+	         }
+          }
+    }
+}
+/* Ende Pruefen()  */
+
+
+document.getElementById("rundenZaehler").innerHTML = runde; 
+
+
+
+/* Zurücksetzten */
+function zurueck() {
+             for (k = 0; k < runde+3; k++) {
+              document.getElementById("Feld" + speicher[k]).innerHTML = "";
+              document.getElementById("Feld" + speicher[k]).classList.remove("hebung"); 
+              document.getElementById("Feld" + speicher[k]).classList.remove("hebung_schwarz"); 
+              document.getElementById("Feld" + speicher[k]).style =""; 
+              feldliste[k] = 0;
+              speicher[k] = 0;
+              wert = 1;
+              spalte = 0;
+              zeile = 0;
+              z = 1;
+             }
+
+            document.getElementById("endZaehler").innerHTML = runde; 
+            element4 = document.getElementById("dritterHinweis");
+               if(element4.style.display =='none'){
+	       element4.style.display='block';
+	              }
+
+             reset();
+             x = 0;
+             abgleich = 1;
+             schw = false;
+             runde = 1;
+             clearTimeout(zeit);
+             stopCount();
+             ladenStoppen();
+             neu = true;
+
+             document.getElementById("rundenZaehler").innerHTML = runde; 
+
+
+          element = document.getElementById("knopf");
+              if(element.style.display =='none'){
+	      element.style.display='block';
+                   }
+
+          element5 = document.getElementById("zaehler");
+             if(element5.style.display !='none'){
+	     element5.style.display='none'; 
+	            } 
+
+         element6 = document.getElementById("chimpTabelle");
+             if(element6.style.display !='none'){
+	     element6.style.display='none'; 
+	         } 
+     }
+
+
+
+/* Timer ---------------------------------------------------------------------------*/
+
+function zeitdauer(runde) {
+      if (runde >= 2) {
+          zeit = setTimeout(zurueck, 5050+1000*runde);
+          c = 4 + runde;
+          startCount();
+          erhoehe_pixel = 860;
+          ladeBalken();
+      }
+}
+
+
+
+
+function timedCount() {
+  document.getElementById("count").value = c;
+  c = c - 1;
+  t = setTimeout(timedCount, 1000);
+}
+
+function startCount() {
+  if (!timer_is_on) {
+    timer_is_on = 1;
+    timedCount();
+  }
+}
+
+function stopCount() {
+  clearTimeout(t);
+  timer_is_on = 0;
+}
+
+
+/* Ladebalken ---------------------------------------------------------------------------*/
+
+/*
+if (window.addEventListener) {
+    window.addEventListener("load", ladeBalken, false); 
+}
+*/
+
+/* Funktion für die Fortschrittsanzeige */
+
+function ladeBalken() {
+        erhoehe_pixel--;
+
+/*
+   if(runde == 2){
+    erhoehe_pixel = erhoehe_pixel - 2.1 ;
+   }
+   if(runde == 3){
+    erhoehe_pixel = erhoehe_pixel - 1.8;
+   }
+   if(runde == 4){
+    erhoehe_pixel = erhoehe_pixel - 1.6 ;
+   }
+   if(runde == 5){
+    erhoehe_pixel = erhoehe_pixel - 1.5 ;
+   }
+   if(runde == 6){
+    erhoehe_pixel = erhoehe_pixel - 1.4 ;
+   }
+   if(runde == 7){
+    erhoehe_pixel = erhoehe_pixel - 1.3 ;
+   }
+   if(runde == 8){
+    erhoehe_pixel = erhoehe_pixel - 1.2 ;
+   }
+   if(runde == 9){
+    erhoehe_pixel = erhoehe_pixel - 1.1 ;
+   }
+   if(runde >= 10){
+    erhoehe_pixel = erhoehe_pixel - 1.0 ;
+   }
+*/
+
+
+
+
+
+var schritt = document.getElementById("fortschritt");
+
+    if (erhoehe_pixel >= 0) {
+        ladevorgang = window.setTimeout("ladeBalken()", 5+runde);
+        schritt.style.width = erhoehe_pixel + "px";
+    }
+
+}
+
+/* Funktionen zum Stoppen und zum Fortsetzen des Ladevorgangs */
+
+function ladenStoppen() {
+
+    window.clearTimeout(ladevorgang); 
+
+}
+
+
+function chimpPop() {
+  var popup = document.getElementById("meintext");
+  popup.classList.toggle("show");
+}
+
+</script>
+
+<!-- Footer-->
+		
+<footer id="Impressum" role="contentinfo">
+    <div class="footer-content" >
+            <ul class="footer-social">
+                <li>
+                    <a href="http://www.facebook.de" target="_blank" >
+                        <img class="social-default  footer-img" src="images/f-weis.png">
+                        <img class="social-hover footer-img" src="images/f-rot.png">
+                    </a>
+                </li>
+                <li>
+                    <a href="https://www.pinterest.com" target="_blank">
+                        <img class="social-default footer-img" src="images/p-weis.png">
+                        <img class="social-hover footer-img" src="images/p-rot.png">
+                    </a>
+                </li>
+                <li>
+                    <a href="https://twitter.com/elonmusk" target="_blank"  >
+                        <img class="social-default footer-img" src="images/t-weis.png">
+                        <img class="social-hover footer-img" src="images/t-rot.png">
+                    </a>
+                </li>
+            </ul>
+            <div class="footer-info">
+                <p class="footer-credit">Website design by <a href="/cdn-cgi/l/email-protection#196b767b70777478777d7c7559766c6d75767672377d7c">Robin &amp; Dennis</a></p>
+                <p class="footer-disclaimer">Das ist unsere erste Website </p>
+                <p class="footer-legal">&copy; 2020 Robin &amp; Dennis</p>
+            </div>
+        </div>
+    </footer>
+    
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js" defer></script></body>
+</html>
+

@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="de">
+
+<head>
+   <meta charset="uft-8">
+   <title >Berufstest</title> 
+   <link rel="stylesheet"  href="Design.css" />
+   <link href="https://fonts.googleapis.com/css2?family=Anton&display=swap" rel="stylesheet">
+   <link rel = "icon" href =  
+      "images/logo.png" 
+       type = "image/x-icon"> 
+   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
+</head>
+
+<!-- Body mit margin 0 - damit kein Rand um Site -->
+
+	<body>
+	
+<!-- Navigation der Site im header -->
+
+<header role="main">
+	<nav class="site-nav" role="navigation">
+	<ul>
+                <li><a href="./index2.html">Start</a></li>
+                <li><a href="./Berufsuebersicht.html">Berufsprofile </a></li>
+                <li><a href="./Berufstest.html">Berufe-Test  </a></li>
+                <li><a href="index2.html#Jobboersen">Jobbörsen </a></li>
+                <li><a href="index2.html#Impressum">Impressum </a></li>
+                <li><a href="./Just4Fun.html">Just4Fun</a></li>
+                <li><a href="./Videos.html">Videos</a></li>
+         </ul>
+         </nav>	
+
+<a href="./index2.html">
+<img src="images/logo.png" align="right" class="zweitLogo" alt="logo" width="100" height="100" />
+</a>
+
+</header>
+
+
+ <div class="sidenav">
+        <div class="flexbox">
+  
+         <div  class="flexelement"> <a href="#"Start> Start</a> </div>
+
+         <div  class="flexelement"> <a href="./Berufsuebersicht.html"> Berufs-profile </a> </div>
+
+         <div  class="flexelement"> <a href="Berufstest.html"> Berufe-Test </a> </div>
+	
+         <div  class="flexelement"> <a href="#Jobboersen"> Job-börsen </a> </div>
+
+          <div  class="flexelement"> <a href="#Impressum"> Impres-sum </a> </div>
+
+ <div  class="flexelement"> <a href="./Just4Fun.html"> Just4-Fun </a> </div>
+
+        </div>
+</div>
+
+
+
+<h1 class="ueberschrift2 shadow">
+Präsentation des Projektes
+</h1>
+
+
+
+
+<p style="height: 5em; background: #000; margin: -1em">
+</p>
+
+<!-- Video zu der Startseite und zum Test-->
+<div style="background-color: #ddd;"> 
+<div style="color: black; margin-left: 1.5em; font-size: 30px;">
+Hauptseite: 
+</div>
+</div>
+
+<div style="height: 2em; background: #000; ">
+</div>
+
+<div style="text-align:center; background: #000"> 
+  <button class="button" onclick="playPause1()">&#9654;&#65039;    &#9208;&#65039;</button> 
+  <button class="button"onclick="oeffneFenster1()">Vollbild</button> 
+  <br><br>
+  <video id="video1" width="600" style="border: 12px solid #FFF;">
+    <source src="./videos/Hauptseite.mp4" type="video/mp4">
+  </video>
+</div> 
+
+<center>
+<a href="./videos/Hauptseite.mp4" download>
+<button class="btn"><i class="fa fa-download"></i> Download</button>
+</a>
+</center>
+
+<p style="height: 10em; background: #000; margin: -3em">
+</p>
+
+
+
+
+<!-- Video zu den Spielen-->
+<div style="background-color: #ddd;"> 
+<div style="color: black; margin-left: 1.5em; font-size: 30px;">
+Just4fun: 
+</div>
+</div>
+
+<div style="height: 2em; background: #000; ">
+</div>
+<div style="text-align:center; background: #000"> 
+  <button class="button"onclick="playPause2()">&#9654;&#65039;   &#9208;&#65039;</button> 
+  <button class="button"onclick="oeffneFenster2()">Vollbild</button> 
+  <br><br>
+  <video id="video2" width="600" style="border: 12px solid #FFF;">
+    <source src="./videos/Just4fun.mp4" type="video/mp4">
+  </video>
+</div> 
+
+<center>
+<a href="./videos/Just4fun.mp4" download>
+<button class="btn"><i class="fa fa-download"></i> Download</button>
+</a>
+</center>
+
+<p style="height: 15em; background: #000; margin: -3em">
+</p>
+
+
+
+
+
+<!--- Youtube videos --->
+<div style="background-color: #ddd;"> 
+<div style="color: black; margin-left: 1.5em; font-size: 30px;">
+Youtube: 
+</div>
+</div>
+
+<div style="height: 2em; background: #000; ">
+</div>
+
+<center style="background-color: black;">
+<iframe width="560" height="315" style="border: 12px solid #FFF;" src="https://www.youtube-nocookie.com/embed/Kg7AkQlpohU" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+</center>
+
+<center style="background-color: black; ">
+<iframe width="560" height="315" style="border: 12px solid #FFF;" src="https://www.youtube.com/embed/1LWleRg4zII" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+</center>
+
+
+
+
+
+
+
+<script> 
+var myVideo1 = document.getElementById("video1"); 
+
+function playPause1() { 
+  if (myVideo1.paused) 
+    myVideo1.play(); 
+  else 
+    myVideo1.pause(); 
+} 
+
+
+function oeffneFenster1() {
+window.open("https://www.ghhnet.de/InfoQ2Phy1920/g11/videos/Hauptseite.mp4");
+}
+
+
+var myVideo2 = document.getElementById("video2"); 
+
+function playPause2() { 
+  if (myVideo2.paused) 
+    myVideo2.play(); 
+  else 
+    myVideo2.pause(); 
+} 
+
+function oeffneFenster2() {
+window.open("https://www.ghhnet.de/InfoQ2Phy1920/g11/videos/Just4fun.mp4");
+}
+
+</script> 
+
+
+
+
+
+
+<!-- Footer-->
+		
+<footer id="Impressum" role="contentinfo">
+    <div class="footer-content" >
+            <ul class="footer-social">
+                <li>
+                    <a href="http://www.facebook.de" target="_blank" >
+                        <img class="social-default  footer-img" src="images/f-weis.png">
+                        <img class="social-hover footer-img" src="images/f-rot.png">
+                    </a>
+                </li>
+                <li>
+                    <a href="https://www.pinterest.com" target="_blank">
+                        <img class="social-default footer-img" src="images/p-weis.png">
+                        <img class="social-hover footer-img" src="images/p-rot.png">
+                    </a>
+                </li>
+                <li>
+                    <a href="https://twitter.com/elonmusk" target="_blank"  >
+                        <img class="social-default footer-img" src="images/t-weis.png">
+                        <img class="social-hover footer-img" src="images/t-rot.png">
+                    </a>
+                </li>
+            </ul>
+            <div class="footer-info">
+                <p class="footer-credit">Website design by <a href="/cdn-cgi/l/email-protection#463429242f282b272822232a062933322a29292d682223">Robin &amp; Dennis</a></p>
+                <p class="footer-disclaimer">Das ist unsere erste Website </p>
+                <p class="footer-legal">&copy; 2020 Robin &amp; Dennis</p>
+            </div>
+        </div>
+    </footer>
+    
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js" defer></script></body>
+</html>
+

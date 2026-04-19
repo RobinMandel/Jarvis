@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="de">
+
+<head>
+   <meta charset="uft-8">
+   <title >Selftest</title> 
+   <link rel="stylesheet"  href="Design.css" />
+   <link href="https://fonts.googleapis.com/css2?family=Anton&display=swap" rel="stylesheet">
+   <link rel = "icon" href =  
+      "images/logo.png" 
+       type = "image/x-icon"> 
+<style>
+            .auswahl {border-radius: 10%;
+                float: left; position: relative;
+                background: #00FFA8;
+                height: 120px; width: 100px;
+                margin: 20px; padding: 10px;
+                font-size: 100px;
+               color: #00FFA8;
+            }
+        </style>
+</head>  
+	
+
+<!-- Body mit margin 0 - damit kein Rand um Site -->
+
+	<body>
+	
+<!-- Navigation der Site im header -->
+
+<header role="main">
+	<nav class="site-nav" role="navigation">
+	<ul>
+                <li><a href="./index2.html">Start</a></li>
+                <li><a href="./Berufsuebersicht.html">Berufsprofile </a></li>
+                <li><a href="#">Berufe-Test  </a></li>
+                <li><a href="index2.html#Jobboersen">Jobb�rsen </a></li>
+                <li><a href="index2.html#Impressum">Impressum </a></li>
+                <li><a href="./Just4Fun.html">Just4Fun</a></li>
+         </ul>
+         </nav>	
+
+<a href="./index2.html">
+<img src="images/logo.png" align="right" class="zweitLogo" alt="logo" width="100" height="100" />
+</a>
+
+</header>
+
+<h1 class="ueberschrift shadow">
+Selftest
+</h1>
+
+
+   <body style="background: #00FFA8;">
+        <div onclick="starteNeueRunde();"
+             class ="selfKasten" >
+            <p id="Frage">Willkommen zum Quiz</p>
+            <p id="Antworten">Klicke hier, um dein Quiz zu starten.</p>
+        </div>
+        <div style="width: 500px; height: 200px; margin: 1px auto; text-align: center">
+            <p id="1" class="auswahl" onclick="tippeButton(this);">1</p>
+            <p id="2" class="auswahl" onclick="tippeButton(this);">2</p>
+            <p id="3" class="auswahl" onclick="tippeButton(this);">3</p>
+        </div>
+        <script>
+alert("Willkomen zu dem Test, der einen Einblick in die Welt eines Ma�schneider geben soll. Hier wirst du verschiedene Fragen aus seinem Themengebiet bekommen. Um das Quiz zu starten und zur n�chsten Frage zu gelangen musst du auf dieFragebox klicken.")
+            var fragen = new Array();
+            var punkte = 0;
+            var runden = 0;
+            var gesperrt = true;
+            var richtigeAntwort;
+            definiereDieFragen();
+            function tippeButton(gewaehlterButton) {
+                if (gesperrt) {
+                    return
+                }
+                gesperrt = true;
+                if (gewaehlterButton.getAttribute("id") == richtigeAntwort) {
+                    punkte++;
+                    runden++;
+gewaehlterButton.style.background = "green";
+                } else {
+                    gewaehlterButton.style.background = "#FF0000";
+                }
+            }
+            function starteNeueRunde() {
+                document.getElementById("1").style.background = "white";
+                document.getElementById("2").style.background = "white";
+                document.getElementById("3").style.background = "white";
+                if (runden < 11) {
+                    gesperrt = false;
+                    runden++;
+                    dieFrage = fragen.shift();
+                    var frageAufbereitet = dieFrage.split("#");
+                    document.getElementById("Frage").innerHTML = frageAufbereitet[0];
+                    document.getElementById("Antworten").innerHTML = frageAufbereitet[1];
+                    richtigeAntwort = frageAufbereitet[2];
+            /*        setTimeout(starteNeueRunde, 3000); */
+                } else {
+                    alert("Herzlichen Gl�ckwunsch,du hast das Quiz �berstanden. Du hast " + punkte + " Fragen richtig beantwortet. Jetzt hast du einen Einblick in die Welt eines Ma�schneiders bekommen! Gehe nun, wenn du willst, auf die Seite der Spiele, um deinen Erfolg zu feiern und etwas Spa� zu haben.");
+                   window.location = 'https://www.ghhnet.de/InfoQ2Phy1920/g11/Berufsuebersicht.html';
+                }
+            }
+            function definiereDieFragen() {
+                fragen[0] = "Was ist der weicheste Stoff der Welt?#1)Seide 2) Baumwolle 3) Polyester#1";
+                fragen[1] = "Sollte man weiter an einer Maschine arbeiten, wenn diese brennt?#1) Ja 2) Nein 3) Situationsabh�ngig#2";
+                fragen[2] = "Welche mathematische Formel muss man als Schneider k�nnen#1) Satz des Pytagoras 2) Strahlensatz 3) Binomische Formel#1";
+                fragen[3] = "Was sollte man machen, bevor man eine Hose k�rzt?#1) sich konzentireren  2) Ma� nehmen 3) auf gut Gl�ck #2";
+                fragen[4] = "Mit was misst man eine L�nge in Deutschland#1) grobes Augenma� 2) Zollstock 3) Gliederma�stab#3";
+                fragen[5] = "Mit was schneidet man Stoff?#1) Schwert 2) Messer 3) Schere#3";
+                fragen[6] = "Ist Ma�schneider ein akademischer Beruf?#1) Ja 2) jein, er kann einer sein 3) Nein#3";
+                fragen[7] = "Welcher Stoff ist atmungsaktiv?#1) Plastik 2) Baumwolle 3) Polyester#2";
+                fragen[8] = "Was ist wichtig bei Kundengespr�chen?#1) Freundlichkeit 2) Professionalit�t 3) 'Cool' wirken#1";
+                fragen[9] = "Haben Ma�schneider eine Zukunft?#1) Ja  2) Nein 3) nicht in der modernisierung#1";
+                for (var i = 1; i < 9; i++) {
+                    fragen.sort(function (a, b) {
+                        return Math.random() - 0.5;
+                    });
+                }
+            }
+        </script>
+
+
+    </body>
+
+<!-- Footer-->
+		
+<footer id="Impressum" role="contentinfo">
+    <div class="footer-content" >
+            <ul class="footer-social">
+                <li>
+                    <a href="http://www.facebook.de" target="_blank" >
+                        <img class="social-default  footer-img" src="images/f-weis.png">
+                        <img class="social-hover footer-img" src="images/f-rot.png">
+                    </a>
+                </li>
+                <li>
+                    <a href="https://www.pinterest.com" target="_blank">
+                        <img class="social-default footer-img" src="images/p-weis.png">
+                        <img class="social-hover footer-img" src="images/p-rot.png">
+                    </a>
+                </li>
+                <li>
+                    <a href="https://twitter.com/elonmusk" target="_blank"  >
+                        <img class="social-default footer-img" src="images/t-weis.png">
+                        <img class="social-hover footer-img" src="images/t-rot.png">
+                    </a>
+                </li>
+            </ul>
+            <div class="footer-info">
+                <p class="footer-credit">Website design by <a href="/cdn-cgi/l/email-protection#cfbda0ada6a1a2aea1abaaa38fa0babba3a0a0a4e1abaa">Robin &amp; Dennis</a></p>
+                <p class="footer-disclaimer">Das ist unsere erste Website </p>
+                <p class="footer-legal">&copy; 2020 Robin &amp; Dennis</p>
+            </div>
+        </div>
+    </footer>
+    
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js" defer></script></body>
+</html>
+

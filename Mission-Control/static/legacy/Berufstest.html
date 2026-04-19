@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="de">
+
+<head>
+   <meta charset="uft-8">
+   <title >Berufstest</title> 
+   <link rel="stylesheet"  href="Design.css" />
+   <link href="https://fonts.googleapis.com/css2?family=Anton&display=swap" rel="stylesheet">
+   <link rel = "icon" href =  
+      "images/logo.png" 
+       type = "image/x-icon"> 
+<style>
+            .auswahl {
+                float: left; position: relative;
+                background: white;
+                height: 120px; width: 100px;
+                margin: 20px; padding: 10px;
+                font-size: 100px;
+                box-shadow: 15px 15px 15px grey;
+            }
+        </style>
+</head>  
+	
+
+<!-- Body mit margin 0 - damit kein Rand um Site -->
+
+	<body>
+	
+<!-- Navigation der Site im header -->
+
+<header role="main">
+	<nav class="site-nav" role="navigation">
+	<ul>
+                <li><a href="./index2.html">Start</a></li>
+                <li><a href="./Berufsuebersicht.html">Berufsprofile </a></li>
+                <li><a href="#">Berufe-Test  </a></li>
+                <li><a href="index2.html#Jobboersen">Jobb�rsen </a></li>
+                <li><a href="index2.html#Impressum">Impressum </a></li>
+                <li><a href="./Just4Fun.html">Just4Fun</a></li>
+                <li><a href="./Videos.html">Videos</a></li>
+         </ul>
+         </nav>	
+
+<a href="./index2.html">
+<img src="images/logo.png" align="right" class="zweitLogo" alt="logo" width="100" height="100" />
+</a>
+
+</header>
+
+
+ <div class="sidenav">
+        <div class="flexbox">
+  
+         <div  class="flexelement"> <a href="#"Start> Start</a> </div>
+
+         <div  class="flexelement"> <a href="./Berufsuebersicht.html"> Berufs-profile </a> </div>
+
+         <div  class="flexelement"> <a href="Berufstest.html"> Berufe-Test </a> </div>
+	
+         <div  class="flexelement"> <a href="#Jobboersen"> Job-b�rsen </a> </div>
+
+          <div  class="flexelement"> <a href="#Impressum"> Impres-sum </a> </div>
+
+ <div  class="flexelement"> <a href="./Just4Fun.html"> Just4-Fun </a> </div>
+
+        </div>
+</div>
+
+
+
+<!-- die Seite kommt noch-->
+
+<h1 class="ueberschrift shadow">
+Berufstest
+</h1>
+
+
+<div id="ersterHinweis" style="display:block;font-size:1.2em;"  class="tb_verlauf">
+<center>
+<p>Welcher <b> Beruf </b> passt zu <b> Dir?</b></p> 
+Im Folgenden werden dir einige Fragen gestellt.<br> 
+�berlege dir genau, wie du sie beantworten willst.<br>
+Nachdem du dir im Klaren bist, was du ausw�hlen m�chtest, schiebst du den Regler auf die Position. <br>
+--- Dr�cke <b  style="font-size:1.4em">"weiter"</b>, um das Quiz zu starten. ---
+</center>
+</div>
+
+        <div id="Start" 
+             style="font-size:40px;
+	background-image: -webkit-linear-gradient(bottom left, rgb(79,179,255) 0%, 
+         rgb(215,115,255) 100%);
+	background-image: -o-linear-gradient(bottom left, rgb(79,179,255) 0%, 
+        rgb(215,115,255) 100%);
+	background-image: linear-gradient(to top right, rgb(79,179,255) 0%, 
+        rgb(215,115,255) 100%);
+             font-family: 'Lucida Grande', 'Lucida Sans Unicode', 'Lucida Sans', 'DejaVu Sans', Verdana, 'sans-serif';
+             width: 95%; height: 150px;
+             border: 10px solid #eb34de;
+             padding-top: 65px;
+             margin: 30px auto;
+             text-align: center;
+             color: white;">
+            Willkommen zum Test 
+            <p style = "font-size:20px; font-style: italic; color: black; ">Klicke <b>"<u>weiter</u>"</u></b>, um den Test zu starten.</p>
+        </div>
+
+
+<p>
+<center>
+
+<a style="margin-left: 10px";>
+<img src="images/Skala.png"  alt="Skala" width="550" height="50" />
+</a>
+
+<div class="slidecontainer">
+  <input type="range" min="0" max="10" value="5" class="slider" id="myRange">
+   <p>Value: <span id="demo"></span></p> 
+</div>
+</center>
+</p>
+
+<br>
+
+<center>
+<div> 
+<button class="button" type="button" ID ="knopf">weiter</button>
+</div>
+</center>
+
+<br>
+<br>
+<br>
+
+<script>
+var i = 0; 
+var fragen = new Array();
+var gesperrt = false;
+var erg = 0;
+var zaehler = 0;
+var name = prompt("Tippe deinen Namen ein");
+
+                fragen[0] = "M�gen Sie es mit Kindern zu arbeiten?";
+                fragen[1] = "Sind Sie gerne unterwegs?";
+                fragen[2] = "Sind Sie gerne der Leiter einer Gruppe?" ;
+                fragen[3] = "Wie motivierend/motiviert sind Sie in Gruppenarbeiten?" ;
+                fragen[4] = "Wie aktiv sind Sie privat?" ;
+                fragen[5] = "Sind Sie bereit k�rperlich aktive T�tigkeiten auszuf�hren?" ;
+                fragen[6] = "Wie gerne arbeiten Sie in Gruppen?";
+                fragen[7] = "Wie organisiert sind Sie?";
+                fragen[8] = "Sind Sie spontan?" ;
+                fragen[9] = "Wie sehr wollen Sie die Karriereleiter aufsteigen?" ;
+                fragen[10] = "Sind Sie eher praktisch (0) oder theoretisch (10) veranlagt?";
+                fragen[11] = "Stehen Sie gerne fr�h auf?";
+                fragen[12] = "Geben Sie oft die Verantwortung ab?";
+                fragen[13] = "Legen Sie Wert auf Ver�nderung?";
+
+
+document.getElementById("knopf").onclick= function() {
+                
+                 document.getElementById("Start").innerHTML= fragen[i];
+                  i ++;
+                 erg= erg+ parseInt(slider.value);
+                 zaehler++;
+                 slider.value = 5;
+                 output.innerHTML = 5; 
+                 if (i > 14) {
+                window.location.href = "Berufsergebnis.html?name=" + name + "&" + "berufErg=" + erg;
+}
+}
+
+var slider = document.getElementById("myRange");
+var output = document.getElementById("demo");
+output.innerHTML = slider.value;
+
+
+
+slider.oninput = function() {
+  output.innerHTML = this.value;
+}
+
+
+
+
+            
+      
+
+
+     
+                                                             
+</script>
+
+
+
+
+<!-- Footer-->
+		
+<footer id="Impressum" role="contentinfo">
+    <div class="footer-content" >
+            <ul class="footer-social">
+                <li>
+                    <a href="http://www.facebook.de" target="_blank" >
+                        <img class="social-default  footer-img" src="images/f-weis.png">
+                        <img class="social-hover footer-img" src="images/f-rot.png">
+                    </a>
+                </li>
+                <li>
+                    <a href="https://www.pinterest.com" target="_blank">
+                        <img class="social-default footer-img" src="images/p-weis.png">
+                        <img class="social-hover footer-img" src="images/p-rot.png">
+                    </a>
+                </li>
+                <li>
+                    <a href="https://twitter.com/elonmusk" target="_blank"  >
+                        <img class="social-default footer-img" src="images/t-weis.png">
+                        <img class="social-hover footer-img" src="images/t-rot.png">
+                    </a>
+                </li>
+            </ul>
+            <div class="footer-info">
+                <p class="footer-credit">Website design by <a href="/cdn-cgi/l/email-protection#11637e73787f7c707f75747d517e64657d7e7e7a3f7574">Robin &amp; Dennis</a></p>
+                <p class="footer-disclaimer">Das ist unsere erste Website </p>
+                <p class="footer-legal">&copy; 2020 Robin &amp; Dennis</p>
+            </div>
+        </div>
+    </footer>
+    
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js" defer></script></body>
+</html>
+

@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="de">
+
+<head>
+   <meta charset="uft-8">
+   <title >Selftest</title> 
+   <link rel="stylesheet"  href="Design.css" />
+   <link href="https://fonts.googleapis.com/css2?family=Anton&display=swap" rel="stylesheet">
+   <link rel = "icon" href =  
+      "images/logo.png" 
+       type = "image/x-icon"> 
+<style>
+            .auswahl {border-radius: 10%;
+                float: left; position: relative;
+                background: #00FFA8;
+                height: 120px; width: 100px;
+                margin: 20px; padding: 10px;
+                font-size: 100px;
+                color:#00FFA8;
+            }
+        </style>
+</head>  
+	
+
+<!-- Body mit margin 0 - damit kein Rand um Site -->
+
+	<body>
+	
+<!-- Navigation der Site im header -->
+
+<header role="main">
+	<nav class="site-nav" role="navigation">
+	<ul>
+                <li><a href="./index2.html">Start</a></li>
+                <li><a href="./Berufsuebersicht.html">Berufsprofile </a></li>
+                <li><a href="#">Berufe-Test  </a></li>
+                <li><a href="index2.html#Jobboersen">Jobb�rsen </a></li>
+                <li><a href="index2.html#Impressum">Impressum </a></li>
+                <li><a href="./Just4Fun.html">Just4Fun</a></li>
+         </ul>
+         </nav>	
+
+<a href="./index2.html">
+<img src="images/logo.png" align="right" class="zweitLogo" alt="logo" width="100" height="100" />
+</a>
+
+</header>
+
+<h1 class="ueberschrift shadow">
+Selftest
+</h1>
+
+
+   <body style="background: #00FFA8;">
+        <div onclick="starteNeueRunde();"
+             class ="selfKasten" >
+            <p id="Frage">Willkommen zum Quiz</p>
+            <p id="Antworten">Klicke hier, um dein Quiz zu starten.</p>
+        </div>
+        <div style="width: 500px; height: 200px; margin: 1px auto; text-align: center">
+            <p id="1" class="auswahl" onclick="tippeButton(this);">1</p>
+            <p id="2" class="auswahl" onclick="tippeButton(this);">2</p>
+            <p id="3" class="auswahl" onclick="tippeButton(this);">3</p>
+        </div>
+        <script>
+alert("Willkomen zu dem Test, der einen Einblick in die Welt eines Arztes geben soll. Hier wirst du verschiedene Fragen aus seinem Themengebiet bekommen. Um das Quiz zu starten und zur n�chsten Frage zu gelangen musst du auf dieFragebox klicken.")
+            var fragen = new Array();
+            var punkte = 0;
+            var runden = 0;
+            var gesperrt = true;
+            var richtigeAntwort;
+            definiereDieFragen();
+
+            function tippeButton(gewaehlterButton) {
+                if (gesperrt) {
+                    return
+                }
+                gesperrt = true;
+                if (gewaehlterButton.getAttribute("id") == richtigeAntwort) {
+                    punkte++;
+                    runden++;
+gewaehlterButton.style.background = "green";
+                } else {
+                    gewaehlterButton.style.background = "#FF0000";
+                }
+            }
+
+            function starteNeueRunde() {
+                document.getElementById("1").style.background = "white";
+                document.getElementById("2").style.background = "white";
+                document.getElementById("3").style.background = "white";
+                if (runden < 11) {
+                    gesperrt = false;
+                    runden++;
+                    dieFrage = fragen.shift();
+                    var frageAufbereitet = dieFrage.split("#");
+                    document.getElementById("Frage").innerHTML = frageAufbereitet[0];
+                    document.getElementById("Antworten").innerHTML = frageAufbereitet[1];
+                    richtigeAntwort = frageAufbereitet[2];
+            /*        setTimeout(starteNeueRunde, 3000); */
+                } else {
+                    alert("Herzlichen Gl�ckwunsch,du hast das Quiz �berstanden. Du hast " + punkte + " Fragen richtig beantwortet. Jetzt hast du einen Einblick in die Welt eines Arztes bekommen! Gehe nun, wenn du willst, auf die Seite der Spiele, um deinen Erfolg zu feiern und etwas Spa� zu haben.");
+                   window.location = 'https://www.ghhnet.de/InfoQ2Phy1920/g11/Berufsuebersicht.html';
+                }
+            }
+
+            function definiereDieFragen() {
+                fragen[0] = "Wie nennt man das Instrument zum Abh�ren der Herzt�ne? #1)Stethoskop 2) Teleskop 3) Echolot#1";
+                fragen[1] = "Welche Krankheit wurde fr�her auch als 'Schwindsucht' bezeichnet ? #1) Malaria 2) Lepra 3) Tuberkolose #3";
+                fragen[2] = "Welcher bedeutende Mediziner erfand das Penicillin?#1) Sir Alexander Fleming 2) Willem Einthoven 3) Thomas Hunt Morgan#1";
+                fragen[3] = "Wie viele Knochen besitzt der Mensch?#1) 175  2) 210 3) 305 #2";
+                fragen[4] = "Welche Art von Krankheitserregern bek�mpft man mit Antibiotika?#1) Viren 2) Pilze 3) Bakterien#3";
+                fragen[5] = "Welches Organ des Menschen produziert das lebenswichtige Hormon Insulin? #1) Nebenniere 2) Schilddr�se 3) Bauchspeicheldr�se#3";
+                fragen[6] = "Die Lunge des Menschen ist in mehrere 'Lungenlappen' unterteilt. Wie viele sind es genau? #1) zwei 2) f�nf 3) sechs#2";
+                fragen[7] = "Welche Blutzellen geh�ren zum Immunsystem des K�rpers? #1) rote Blutk�rper 2) wei�e Blutk�rper 3) Blutpl�ttchen#2";
+                fragen[8] = "Welcher Gr��e entspricht sch�tzungsweise die Oberfl�che des menschlichen Darmes? #1) Fu�ballfeld 2) Tennisplatz 3) DIN-A4 Zettel#1";
+                fragen[9] = "Wie viele Z�hne hat das Gebiss des erwachsenen Menschen? #1) 16  2) 24 3) 32#3";
+                for (var i = 1; i < 9; i++) {
+                    fragen.sort(function (a, b) {
+                        return Math.random() - 0.5;
+                    });
+                }
+            }
+
+
+        </script>
+
+
+    </body>
+
+<!-- Footer-->
+		
+<footer id="Impressum" role="contentinfo">
+    <div class="footer-content" >
+            <ul class="footer-social">
+                <li>
+                    <a href="http://www.facebook.de" target="_blank" >
+                        <img class="social-default  footer-img" src="images/f-weis.png">
+                        <img class="social-hover footer-img" src="images/f-rot.png">
+                    </a>
+                </li>
+                <li>
+                    <a href="https://www.pinterest.com" target="_blank">
+                        <img class="social-default footer-img" src="images/p-weis.png">
+                        <img class="social-hover footer-img" src="images/p-rot.png">
+                    </a>
+                </li>
+                <li>
+                    <a href="https://twitter.com/elonmusk" target="_blank"  >
+                        <img class="social-default footer-img" src="images/t-weis.png">
+                        <img class="social-hover footer-img" src="images/t-rot.png">
+                    </a>
+                </li>
+            </ul>
+            <div class="footer-info">
+                <p class="footer-credit">Website design by <a href="/cdn-cgi/l/email-protection#74061b161d1a19151a101118341b0100181b1b1f5a1011">Robin &amp; Dennis</a></p>
+                <p class="footer-disclaimer">Das ist unsere erste Website </p>
+                <p class="footer-legal">&copy; 2020 Robin &amp; Dennis</p>
+            </div>
+        </div>
+    </footer>
+    
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js" defer></script></body>
+</html>
+

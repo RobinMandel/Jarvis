@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<title>Just4Fun — robinmandel.de</title>
+<meta name="viewport" content="width=1440" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="site/shared.css?v=9">
+<style>
+  .j4f-head { padding: 72px 0 40px; }
+  .j4f-head h1 {
+    font-family: var(--display); font-size: 104px; font-weight: 500;
+    letter-spacing: -0.03em; line-height: 0.94; text-wrap: balance;
+  }
+  .j4f-head h1 em { font-style: italic; color: var(--accent); }
+  .j4f-head p { font-size: 17px; line-height: 1.6; color: var(--ink-dim); margin-top: 28px; max-width: 620px; text-wrap: pretty; }
+
+  .hero-chimp {
+    background: #0a0a0a; color: #f5f5f0;
+    padding: 64px 56px; position: relative; overflow: hidden;
+    display: grid; grid-template-columns: 1.2fr 1fr; gap: 56px; align-items: center;
+    margin-bottom: 80px;
+    border-radius: 2px;
+  }
+  .hero-chimp h2 {
+    font-family: var(--display); font-size: 80px; font-weight: 500;
+    letter-spacing: -0.025em; line-height: 0.98;
+  }
+  .hero-chimp h2 em { font-style: italic; color: #d4ff00; }
+  .hero-chimp p { font-size: 15px; line-height: 1.6; color: #c8c4b8; margin: 24px 0 32px; max-width: 520px; }
+  .hero-chimp .cta { display: flex; gap: 14px; }
+  .hero-chimp .btn-primary { background: #d4ff00; color: #0a0a0a; }
+  .hero-chimp .btn-primary:hover { background: #f5f5f0; }
+  .hero-chimp .btn-ghost { border-color: #f5f5f0; color: #f5f5f0; }
+  .hero-chimp .btn-ghost:hover { background: #f5f5f0; color: #0a0a0a; }
+  .chimp-visual {
+    aspect-ratio: 1; border: 0.5px solid #3a3a30; padding: 20px;
+    display: grid; grid-template-columns: repeat(5,1fr); gap: 6px;
+    background: #141414;
+  }
+  .chimp-cell {
+    border: 0.5px solid #2a2a2a; display: flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-size: 28px; color: #f5f5f0;
+    background: #0a0a0a;
+  }
+  .chimp-cell.empty { background: transparent; border-color: #1a1a1a; }
+  .chimp-cell.active { color: #d4ff00; border-color: #d4ff00; }
+
+  .fun-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 0;
+    border-top: 0.5px solid var(--rule); border-left: 0.5px solid var(--rule);
+    margin-bottom: 80px;
+  }
+  .fun-item {
+    padding: 32px; border-right: 0.5px solid var(--rule); border-bottom: 0.5px solid var(--rule);
+    min-height: 260px;
+    display: flex; flex-direction: column; justify-content: space-between;
+    gap: 18px; transition: background 0.15s;
+    cursor: pointer; text-decoration: none; color: inherit;
+  }
+  .fun-item:hover { background: var(--paper-2); }
+  .fun-item h3 {
+    font-family: var(--display); font-size: 28px; font-weight: 500;
+    letter-spacing: -0.015em; line-height: 1.05;
+  }
+  .fun-item p { font-size: 13px; color: var(--ink-dim); line-height: 1.55; }
+  .fun-item .kind {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.2em;
+    text-transform: uppercase; color: var(--accent);
+  }
+  .fun-item .soon {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.15em;
+    text-transform: uppercase; color: var(--ink-faint);
+    padding: 4px 10px; border: 0.5px dashed var(--rule);
+    align-self: flex-start;
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script type="text/babel" src="site/shared.jsx?v=9"></script>
+<script type="text/babel">
+  const { Shell } = window.Shared;
+  const positions = { 2: 1, 6: 2, 10: 3, 13: 4, 17: 5, 22: 6 };
+  const FUN = [
+    { title: 'Chimpanzee Test', desc: 'Arbeitsgedächtnis-Experiment nach Ayumu. Der Klassiker von 2020 — jetzt im Labor-Look.', kind: 'Spiel', href: 'Chimpanzee Test.html', live: true },
+    { title: 'Flappy Bird', desc: 'Die Hommage — als Canvas-Remake in unserem Look. Leertaste, Klick, Tap.', kind: 'Arcade', href: 'Flappy Bird.html', live: true },
+    { title: 'Reaktionstest', desc: 'Wie schnell bist du? Klassisch mit grünem Kreis und Timer.', kind: 'Spiel', href: '#', live: false },
+    { title: 'Typing Challenge', desc: '60 Sekunden, so viele Wörter wie möglich. Deutsche Wortliste.', kind: 'Spiel', href: '#', live: false },
+    { title: 'Berufe-Memory', desc: 'Klassisches Memory mit Berufsbildern aus unserer Datenbank.', kind: 'Spiel', href: '#', live: false },
+    { title: 'Gehalts-Quiz', desc: 'Drei Gehälter, ein Beruf — welches ist richtig?', kind: 'Quiz', href: '#', live: false },
+    { title: 'Wer bin ich?', desc: 'Berufe erraten aus Beschreibungen ohne Titel.', kind: 'Quiz', href: '#', live: false },
+  ];
+
+  function App() {
+    return (
+      <Shell active="just4fun">
+        <div className="container">
+          <div className="j4f-head">
+            <div className="eyebrow">Just4Fun · Kleine Experimente</div>
+            <h1>Kleine Spiele,<br/>große <em>Pausen</em>.</h1>
+            <p>Nebenbei-Projekte, die wir aus Neugier gebaut haben. Manche haben mit Berufen zu tun, manche nicht. Angefangen 2020 mit dem Chimpanzee Test.</p>
+          </div>
+
+          <div className="hero-chimp">
+            <div>
+              <div style={{fontFamily:'var(--mono)', fontSize:10, letterSpacing:'0.3em', color:'#d4ff00', marginBottom: 18 }}>⊹ HIGHLIGHT · SEIT 2020</div>
+              <h2>Bist du<br/>schlauer als<br/>ein <em>Schimpanse</em>?</h2>
+              <p>Der Schimpanse Ayumu erreichte 9 Zahlen in 2 Sekunden. Der Original-Test von Robin aus 2020 — komplett neu aufgelegt im Labor-Look. Drei Varianten: Labor, Terminal, Studie.</p>
+              <div className="cta">
+                <a href="Chimpanzee Test.html" className="btn btn-primary">Test starten →</a>
+                <a href="https://robinmandel.de/Chimptest.html" target="_blank" rel="noopener" className="btn btn-ghost">Original v1 ↗</a>
+              </div>
+            </div>
+            <div className="chimp-visual">
+              {Array.from({length: 25}, (_, i) => {
+                const v = positions[i];
+                return <div key={i} className={`chimp-cell ${v ? 'active' : 'empty'}`}>{v || ''}</div>;
+              })}
+            </div>
+          </div>
+
+          <div style={{
+            fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: '0.2em',
+            textTransform: 'uppercase', color: 'var(--ink-dim)', marginBottom: 16,
+          }}>Mehr Experimente · In Arbeit</div>
+
+          <div className="fun-grid">
+            {FUN.map(f => (
+              <a key={f.title} href={f.href} className="fun-item"
+                style={f.live ? null : { cursor: 'default' }}
+                onClick={e => { if (!f.live) e.preventDefault(); }}>
+                <div>
+                  <div className="kind">{f.kind}</div>
+                  <h3 style={{ marginTop: 10 }}>{f.title}</h3>
+                  <p style={{ marginTop: 12 }}>{f.desc}</p>
+                </div>
+                {f.live ? (
+                  <span style={{ fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: '0.15em', textTransform: 'uppercase', color: 'var(--accent)' }}>
+                    Spielen →
+                  </span>
+                ) : <span className="soon">Bald</span>}
+              </a>
+            ))}
+          </div>
+        </div>
+      </Shell>
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

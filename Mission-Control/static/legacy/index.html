@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="de">
+
+<head>
+   <meta charset="uft-8">
+   <title >Startseite</title> 
+   <link rel="stylesheet"  href="Design.css" />
+   <link href="https://fonts.googleapis.com/css2?family=Anton&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.gstatic.com">
+<link href="https://fonts.googleapis.com/css2?family=Nerko+One&display=swap" rel="stylesheet">
+   <link rel = "icon" href = "images/logo.png" > 
+</head>  
+	
+
+<body onload="pass()">
+
+<center style="margin-top: 10em;">
+<a href="index2.html">
+<img src ="images/logo.png" class="hauptLogo" width="25%" height="25%">
+</a>
+</center>
+
+
+<center>
+<a href="index2.html">
+<img src ="images/clickme.gif" style="margin: -2em; padding:=0px">
+</a>
+</center>
+
+
+<script>
+function pass()
+{      
+  var Passwort;
+	var echtesPasswort = "Schlüssel";
+        var runde = 0;
+	do 
+         {
+         Passwort = prompt("Passwort nötig! - Wo könntet ihr das rausfinden?" , "Passwort");
+          if (Passwort != echtesPasswort)
+          {
+          Passwort = prompt("Hinweis: Strg + 'U'" , "Passwort");
+          runde ++;
+          if (runde >=5)
+            {
+                Passwort = prompt("Weil du es immer noch nicht gefunden hast:" , "Schlüssel");
+            }
+          }
+         }
+        while (Passwort != echtesPasswort);
+        
+}
+
+
+</script>
+</body>
+
+
+</html>
+

@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<title>Berufsprofile — robinmandel.de</title>
+<meta name="viewport" content="width=1440" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="site/shared.css?v=9">
+<style>
+  .page-head { padding: 72px 0 40px; }
+  .page-head h1 {
+    font-family: var(--display); font-size: 88px; font-weight: 500;
+    letter-spacing: -0.03em; line-height: 0.95; color: var(--ink);
+    text-wrap: balance; margin-top: 16px; max-width: 900px;
+  }
+  .page-head h1 em { font-style: italic; color: var(--accent); }
+  .page-head p {
+    font-size: 17px; color: var(--ink-dim); line-height: 1.6; margin-top: 24px;
+    max-width: 640px; text-wrap: pretty;
+  }
+
+  .filters {
+    display: flex; align-items: center; gap: 20px;
+    padding: 20px 0; margin-top: 40px;
+    border-top: 0.5px solid var(--rule);
+    border-bottom: 0.5px solid var(--rule);
+    font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.1em; text-transform: uppercase;
+  }
+  .filter-group { display: flex; gap: 8px; flex-wrap: wrap; }
+  .filter-chip {
+    padding: 7px 12px; border: 0.5px solid var(--rule);
+    color: var(--ink-dim); cursor: pointer;
+    transition: all 0.15s;
+    letter-spacing: 0.1em; text-transform: uppercase;
+    font-family: var(--mono); font-size: 10px;
+    background: transparent;
+  }
+  .filter-chip:hover { border-color: var(--ink); color: var(--ink); }
+  .filter-chip.active { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+  .search-input {
+    padding: 9px 14px; border: 0.5px solid var(--rule);
+    background: transparent; color: var(--ink);
+    font-family: var(--mono); font-size: 12px;
+    min-width: 220px; letter-spacing: 0.05em;
+    text-transform: none;
+  }
+  .search-input:focus { border-color: var(--accent); outline: none; }
+
+  .results-head {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 28px 0 14px;
+    font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.15em; text-transform: uppercase;
+    color: var(--ink-dim);
+  }
+
+  .list-row {
+    display: grid;
+    grid-template-columns: 60px 2fr 1.4fr 1fr 1fr 60px;
+    gap: 24px; align-items: center;
+    padding: 24px 16px;
+    border-bottom: 0.5px solid var(--rule);
+    transition: background 0.15s;
+    cursor: pointer;
+    position: relative;
+  }
+  .list-row:hover { background: var(--paper-2); }
+  .list-row:first-child { border-top: 0.5px solid var(--rule); }
+  .list-row .num {
+    font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.15em; color: var(--ink-faint);
+  }
+  .list-row h3 {
+    font-family: var(--display); font-size: 22px; font-weight: 500;
+    letter-spacing: -0.01em; color: var(--ink);
+  }
+  .list-row .desc { font-size: 13px; color: var(--ink-dim); margin-top: 3px; line-height: 1.4; }
+  .list-row .pill {
+    display: inline-block;
+    padding: 4px 10px; border: 0.5px solid var(--rule);
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--ink-2);
+  }
+  .list-row .data {
+    font-family: var(--mono); font-size: 13px; color: var(--ink-2);
+    font-feature-settings: '"tnum"';
+  }
+  .list-row .arr { color: var(--ink-faint); transition: color 0.15s, transform 0.15s; }
+  .list-row:hover .arr { color: var(--accent); transform: translate(4px,-4px); }
+
+  /* Detail view */
+  .detail-grid {
+    display: grid; grid-template-columns: 1.6fr 1fr; gap: 80px; align-items: start;
+    padding-top: 40px;
+  }
+  .detail-img { aspect-ratio: 4/5; width: 100%; }
+  .detail-title {
+    font-family: var(--display); font-size: 96px; font-weight: 500;
+    letter-spacing: -0.03em; line-height: 0.94;
+    margin: 20px 0 28px; text-wrap: balance;
+  }
+  .detail-lead {
+    font-family: var(--display); font-size: 22px; font-weight: 400;
+    line-height: 1.35; color: var(--ink-2); margin-bottom: 36px;
+    text-wrap: balance; max-width: 720px;
+  }
+  .detail-fact-table {
+    width: 100%; border-collapse: collapse;
+    font-family: var(--mono); font-size: 13px;
+  }
+  .detail-fact-table tr { border-bottom: 0.5px solid var(--rule); }
+  .detail-fact-table td {
+    padding: 14px 0; vertical-align: top;
+  }
+  .detail-fact-table td:first-child {
+    color: var(--ink-faint); letter-spacing: 0.1em; text-transform: uppercase;
+    font-size: 10px; width: 38%; padding-top: 18px;
+  }
+  .detail-fact-table td:last-child { color: var(--ink); }
+  .detail-body h4 {
+    font-family: var(--display); font-size: 24px; font-weight: 500;
+    letter-spacing: -0.01em; margin: 40px 0 14px;
+  }
+  .detail-body p { font-size: 15px; line-height: 1.7; color: var(--ink-2); margin-bottom: 14px; text-wrap: pretty; }
+  .detail-body ul { list-style: none; margin-bottom: 16px; }
+  .detail-body li {
+    padding: 10px 0; border-bottom: 0.5px dashed var(--rule);
+    font-size: 14px; color: var(--ink-2); display: flex; gap: 12px;
+  }
+  .detail-body li::before { content: '→'; color: var(--accent); }
+</style>
+</head>
+<body>
+
+<div id="root"></div>
+
+<script>
+  window.__TWEAKS = /*EDITMODE-BEGIN*/{
+    "view": "list"
+  }/*EDITMODE-END*/;
+</script>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script type="text/babel" src="site/shared.jsx?v=9"></script>
+<script type="text/babel" src="site/berufsprofile-page.jsx?v=9"></script>
+
+</body>
+</html>

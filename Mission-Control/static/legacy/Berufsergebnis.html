@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="de">
+
+<head>
+   <meta charset="uft-8">
+   <title >Berufstest</title> 
+   <link rel="stylesheet"  href="Design.css" />
+   <link href="https://fonts.googleapis.com/css2?family=Anton&display=swap" rel="stylesheet">
+   <link rel = "icon" href =  
+      "images/logo.png" 
+       type = "image/x-icon"> 
+</head>
+
+<!-- Body mit margin 0 - damit kein Rand um Site -->
+
+	<body>
+	
+<!-- Navigation der Site im header -->
+
+<header role="main">
+	<nav class="site-nav" role="navigation">
+	<ul>
+                <li><a href="./index2.html">Start</a></li>
+                <li><a href="./Berufsuebersicht.html">Berufsprofile </a></li>
+                <li><a href="#">Berufe-Test  </a></li>
+                <li><a href="index2.html#Jobboersen">Jobbörsen </a></li>
+                <li><a href="index2.html#Impressum">Impressum </a></li>
+                <li><a href="./Just4Fun.html">Just4Fun</a></li>
+                <li><a href="./Videos.html">Videos</a></li>
+         </ul>
+         </nav>	
+
+<a href="./index2.html">
+<img src="images/logo.png" align="right" class="zweitLogo" alt="logo" width="100" height="100" />
+</a>
+
+</header>
+
+
+<h1 class="ueberschrift shadow">
+Ihr Ergebnis: 
+</h1>
+
+
+
+
+<body  onload="Start()">
+
+
+
+
+<div style="font-size:15px;
+	background-image: -webkit-linear-gradient(bottom left, rgb(79,179,255) 0%, 
+         rgb(215,115,255) 100%);
+	background-image: -o-linear-gradient(bottom left, rgb(79,179,255) 0%, 
+        rgb(215,115,255) 100%);
+	background-image: linear-gradient(to top right, rgb(79,179,255) 0%, 
+        rgb(215,115,255) 100%);
+             font-family: 'Lucida Grande', 'Lucida Sans Unicode', 'Lucida Sans', 'DejaVu Sans', Verdana, 'sans-serif';
+             width: 95%; height: 350px;
+             border: 10px solid #eb34de;
+             padding-top: 5px;
+             margin: 30px auto;
+             color: white;">
+                <h1 style="margin-left: 1.5em; display: inline;"> Moin: </h1>
+                <h1 id="variabelen" style="display: inline;"> Name</h1>
+
+                <h1 id="beruf" style="margin-left: 1.5em;"> beruf</h1>
+
+                <p class="half1"  id="text"> Text</p>
+
+                 <p class="half erscheine">
+
+                                <a class="" >
+                                <img src="example.png"  id="bild" width="250" height="250" style="margin-left: 1.5em; margin-top: -2em; " href="linkexample"> 
+                                </a>
+                  <a href="linkexample" id="linkexample">
+                 <button class="buttonText" href="linkexample">mehr Info</button>
+                 </a>
+                 </p>
+
+
+<center>
+<div>
+ <a href="linkexample1" id="linkexample1"> 
+<button onclick="window.location.href = "linkexample1";" type='button' id="knopf" class="button3">Selftest</button>
+</a>
+</div>
+</center>
+</p>
+</div>
+
+
+
+
+
+
+
+<script>
+function Start(){
+var searchString = window.location.search;
+var urlParams = new URLSearchParams(searchString);
+
+document.getElementById("variabelen").innerHTML = urlParams.get("name");
+
+var ergeb = urlParams.get("berufErg");
+
+var urlText= window.location.href;
+
+
+if ( ergeb <= 15) {
+document.getElementById("beruf").innerHTML = "Der perfekte Beruf für dich ist der Erzieher";
+document.getElementById("text").innerHTML = "Erzieher sind pädagogische Fachkräfte, die eine Ausbildung an einer Fachschule, einer Fachakademie oder einem Berufskolleg durchlaufen haben. Kindergärtner dagegen ist eine in Deutschland zwar noch teilweise gebräuchliche, aber veraltete Berufsbezeichnung. Durch Rahmenvereinbarungen der Kultusministerkonferenz von 1967 wurden die bis dahin getrennten Ausbildungen Kindergärtner, Hortner und Jugend- und Heimerzieher zusammengefasst, vereinheitlicht und das Tätigkeitsfeld deutlich ausgeweitet.[1] " ;
+document.getElementById("bild").src = "images/erzieher.png";
+document.getElementById("linkexample").href = "erzieher.html";
+document.getElementById("linkexample1").href = "Selftest_Erzeiher.html";
+}
+
+
+if( ergeb > 15 && ergeb <= 30){
+document.getElementById("beruf").innerHTML = "Der perfekte Beruf für dich ist der Lehrer";
+document.getElementById("text").innerHTML = "Ein Lehrer oder eine Lehrerin ist eine Person, die andere Personen auf einem Gebiet weiterbildet, auf dem sie selber einen Vorsprung an Können, Wissen oder Erfahrung hat. Da es sich um keine geschützte Bezeichnung handelt, kann sich grundsätzlich jede Person so nennen, die sich in einer Phase der Vermittlung von Wissen, Können, Lebensweisheit, Ausbildung oder Bildung befindet. „Lehrer“ kann in der Umgangssprache als Berufsbezeichnung oder als Ehrentitel sehr unterschiedliche Bedeutung annehmen und ist eine Sammelbezeichnung für alle Arten von Lehrenden; diese lassen sich durch eine entsprechende Wortverbindung jeweils näher kennzeichnen, etwa Schullehrer, Hauslehrer, Tanzlehrer oder Segellehrer." ;
+document.getElementById("bild").src = "images/lehrer.png";
+document.getElementById("linkexample").href = "Lehrer.html";
+document.getElementById("linkexample1").href = "Selftest_Lehrer.html";
+}
+
+if( ergeb > 30 && ergeb <= 45 ){
+document.getElementById("beruf").innerHTML = "Der perfekte Beruf für dich ist der Maßschneider";
+document.getElementById("text").innerHTML = "Maßschneider (Deutschland/Schweiz) bzw. Bekleidungsgestalter (Österreich) ist ein handwerklicher Ausbildungsberuf als Schneider im Textilbereich. Im Gegensatz zu beispielsweise zu den industriellen Modeschneidern stellen Maßschneider Kleidung individuell „nach Maß“ her." ;
+document.getElementById("bild").src = "images/masschneider.png";
+document.getElementById("linkexample").href = "masschneider.html";
+document.getElementById("linkexample1").href = "Selftest_Mass.html";
+}
+
+
+if( ergeb > 45 && ergeb <= 60 ){
+document.getElementById("beruf").innerHTML = "Der perfekte Beruf für dich ist der Handwerker";
+document.getElementById("text").innerHTML = "Als Handwerk werden zahlreiche gewerbliche Tätigkeiten bezeichnet, die Produkte meist auf Bestellung fertigen oder Dienstleistungen auf Nachfrage erbringen. Der Begriff bezeichnet auch den gesamten Berufsstand. Die handwerkliche Tätigkeit steht der industriellen Massenproduktion gegenüber." ;
+document.getElementById("bild").src = "images/handwerker.png";
+document.getElementById("linkexample").href = "Handwerker.html";
+document.getElementById("linkexample1").href = "Selftest_Hand.hmtl";
+}
+
+
+if( ergeb > 60 && ergeb <= 75 ){
+document.getElementById("beruf").innerHTML = "Der perfekte Beruf für dich ist der Informatiker" ;
+document.getElementById("text").innerHTML = "Informatiker arbeiten im Bereich der Informatik. Sie forschen oder wenden die Informatik an, dies vor allem in der Softwareentwicklung sowie der Informationstechnik (IT). Die Pioniere der Informatik prägten und prägen die Informatik, die die Grundlage der Softwaretechnik und der IT ist. Manche Informatiker untersuchen ausschließlich Probleme theoretischer Natur in der wissenschaftlichen Informatik. Softwareentwickler und Informationstechniker lösen praktische Probleme im konkreten Anwendungskontext durch die Erstellung und Nutzung von Software.";
+document.getElementById("bild").src = "images/informatiker.png";
+document.getElementById("linkexample").href = "informatiker.html";
+document.getElementById("linkexample1").href = "Selftest_Inf.html";
+
+}
+
+
+if(ergeb > 75 && ergeb <= 90){
+document.getElementById("beruf").innerHTML = "Der perfekte Beruf für dich ist der Ingenieur" ;
+document.getElementById("text").innerHTML = "Ingenieur (von französisch ingénieur, Schweizer Hochdeutsch; Abkürzung Ing.) ist die Berufs- bzw. Standesbezeichnung (nur in Österreich) für Fachleute auf dem Gebiet der Technik. Die Ausbildung zum Ingenieur und die Berufsausübung sind in den Ländern Europas teilweise sehr unterschiedlich geregelt. In Deutschland, Österreich und der Schweiz werden Ingenieure an Universitäten, Technischen Hochschulen und Fachhochschulen (Hochschulen für angewandte Wissenschaften) ausgebildet; allein in Deutschland auch über ein duales Studium an einer Berufsakademie und allein in Österreich auch an Höheren Technischen Lehranstalten (HTL) sowie vergleichbaren berufsbildenden höheren Schulen (in einem technischen und gewerblichen, land- und forstwirtschaftlichen oder umweltbezogenen Ausbildungszweig)." ;
+document.getElementById("bild").src = "images/ingenieur.png";
+document.getElementById("linkexample").href = "Ingenieur.html";
+document.getElementById("linkexample1").href = "Selftest.html";
+}
+
+
+if( ergeb > 90 && ergeb <= 105 ){
+document.getElementById("beruf").innerHTML = "Der perfekte Beruf für dich ist der Pilot";
+document.getElementById("text").innerHTML = "Ein Pilot (französisch pilote, von italienisch pilota, ältere Form pedotta „Steuermann“, zu altgriechisch &#960;&#951;&#948;&#972;&#957; p&#275;dón, deutsch ‚Steuerruder‘)[1] ist eine Person, die ein Luftfahrzeug steuert oder dazu berechtigt ist. Im offiziellen Sprachgebrauch wird er deshalb auch oft als Luftfahrzeugführer bezeichnet. Mitunter wird der Ausdruck „Pilot“ im übertragenen Sinne auch für Führer anderer Fahrzeuge verwendet, um deren Professionalität auszudrücken." ;
+document.getElementById("bild").src = "images/pilot.png";
+document.getElementById("linkexample").href = "pilot.html";
+document.getElementById("linkexample1").href = "Selftest_Pilot.html";
+}
+
+if( ergeb > 105 && ergeb <= 160){
+document.getElementById("beruf").innerHTML = "Der perfekte Beruf für dich ist der Arzt";
+document.getElementById("text").innerHTML = "Ein Arzt oder eine Ärztin ist eine medizinisch ausgebildete und zur Ausübung der Heilkunde zugelassene Person. Der Arztberuf gilt der Vorbeugung (Prävention), Erkennung (Diagnose), Behandlung (Therapie) und Nachsorge von Krankheiten, Leiden oder gesundheitlichen Beeinträchtigungen und umfasst auch ausbildende Tätigkeiten. Ärzte stellen sich in den Dienst der Gesundheit und sind bei ihrem Handeln moralischen und ethischen Grundsätzen verpflichtet (siehe etwa die Genfer Deklaration des Weltärztebundes). Die Vielfalt an Krankheiten und Behandlungsmöglichkeiten hat in der Humanmedizin und der Tiermedizin zu einer großen Anzahl von Fachgebieten und weiteren Differenzierungen geführt (siehe die Liste medizinischer Fachgebiete). " ;
+document.getElementById("bild").src = "images/arzt.png";
+document.getElementById("linkexample").href = "Arzt.html";
+document.getElementById("linkexample1").href = "Selftest_Arzt.html";
+}
+
+}
+
+</script>
+
+
+</body>
+
+
+
+
+<!-- Footer-->
+		
+<footer id="Impressum" role="contentinfo">
+    <div class="footer-content" >
+            <ul class="footer-social">
+                <li>
+                    <a href="http://www.facebook.de" target="_blank" >
+                        <img class="social-default  footer-img" src="images/f-weis.png">
+                        <img class="social-hover footer-img" src="images/f-rot.png">
+                    </a>
+                </li>
+                <li>
+                    <a href="https://www.pinterest.com" target="_blank">
+                        <img class="social-default footer-img" src="images/p-weis.png">
+                        <img class="social-hover footer-img" src="images/p-rot.png">
+                    </a>
+                </li>
+                <li>
+                    <a href="https://twitter.com/elonmusk" target="_blank"  >
+                        <img class="social-default footer-img" src="images/t-weis.png">
+                        <img class="social-hover footer-img" src="images/t-rot.png">
+                    </a>
+                </li>
+            </ul>
+            <div class="footer-info">
+                <p class="footer-credit">Website design by <a href="/cdn-cgi/l/email-protection#a8dac7cac1c6c5c9c6cccdc4e8c7dddcc4c7c7c386cccd">Robin &amp; Dennis</a></p>
+                <p class="footer-disclaimer">Das ist unsere erste Website </p>
+                <p class="footer-legal">&copy; 2020 Robin &amp; Dennis</p>
+            </div>
+        </div>
+    </footer>
+    
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js" defer></script></body>
+</html>
+

@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<title>Videos — robinmandel.de</title>
+<meta name="viewport" content="width=1440" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="site/shared.css?v=9">
+<style>
+  .vid-head { padding: 72px 0 40px; }
+  .vid-head h1 {
+    font-family: var(--display); font-size: 96px; font-weight: 500;
+    letter-spacing: -0.03em; line-height: 0.94; text-wrap: balance;
+  }
+  .vid-head h1 em { font-style: italic; color: var(--accent); }
+  .vid-head p { font-size: 17px; line-height: 1.6; color: var(--ink-dim); margin-top: 28px; max-width: 620px; text-wrap: pretty; }
+
+  .vid-featured {
+    display: grid; grid-template-columns: 1.4fr 1fr; gap: 40px;
+    margin-bottom: 64px;
+  }
+  .vid-featured .thumb {
+    aspect-ratio: 16/9; position: relative;
+  }
+  .vid-featured .thumb .play {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%);
+    width: 84px; height: 84px; border-radius: 50%;
+    background: var(--accent); color: var(--ink);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 28px; transition: transform 0.15s;
+  }
+  .vid-featured .thumb:hover .play { transform: translate(-50%,-50%) scale(1.08); }
+  .vid-featured .meta-row {
+    display: flex; gap: 16px; font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.15em; text-transform: uppercase; color: var(--ink-dim);
+    margin-bottom: 16px;
+  }
+  .vid-featured h2 {
+    font-family: var(--display); font-size: 44px; font-weight: 500;
+    letter-spacing: -0.02em; line-height: 1.05; color: var(--ink);
+    text-wrap: balance; margin-bottom: 16px;
+  }
+  .vid-featured p { font-size: 14px; line-height: 1.6; color: var(--ink-2); }
+
+  .vid-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 32px 24px;
+  }
+  .vid-card { display: flex; flex-direction: column; gap: 14px; cursor: pointer; text-decoration: none; color: inherit; }
+  .vid-card .thumb {
+    aspect-ratio: 16/9; position: relative; transition: transform 0.15s;
+  }
+  .vid-card .thumb .duration {
+    position: absolute; bottom: 10px; right: 10px;
+    background: #0a0a0a; color: #f5f5f0; padding: 3px 8px;
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.05em;
+    border-radius: 2px;
+  }
+  .vid-card .thumb .play {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%);
+    width: 48px; height: 48px; border-radius: 50%;
+    background: rgba(0,0,0,0.5); color: #fff; backdrop-filter: blur(4px);
+    display: flex; align-items: center; justify-content: center;
+    opacity: 0; transition: opacity 0.15s;
+  }
+  .vid-card:hover .play { opacity: 1; }
+  .vid-card h3 { font-family: var(--display); font-size: 20px; font-weight: 500; letter-spacing: -0.01em; line-height: 1.2; text-wrap: balance; }
+  .vid-card .meta { font-family: var(--mono); font-size: 10px; letter-spacing: 0.15em; text-transform: uppercase; color: var(--ink-dim); }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script type="text/babel" src="site/shared.jsx?v=9"></script>
+<script type="text/babel">
+  const { Shell } = window.Shared;
+  const VIDS = [
+    { t: 'Ein Tag als Mechatroniker:in', d: '12:04', kat: 'Handwerk & Technik', slug: 'mechatroniker' },
+    { t: 'Pflegefachkraft — Frühschicht im Klinikum', d: '18:22', kat: 'Gesundheit & Soziales', slug: 'pflegefachkraft' },
+    { t: 'Data Analyst zwischen Dashboard und Daily', d: '09:41', kat: 'Design & Tech', slug: 'data-analyst' },
+    { t: 'Tischler:in — vom Rohling zum Möbelstück', d: '14:10', kat: 'Handwerk & Technik', slug: 'tischler' },
+    { t: 'Lehrkraft: Was man im Ref. wirklich lernt', d: '22:56', kat: 'Bildung', slug: 'lehrkraft' },
+    { t: 'UX-Designer — Der Weg von der Idee zum Launch', d: '11:37', kat: 'Design & Tech', slug: 'ux-designer' },
+    { t: 'Notfallsanitäter:in — eine Nachtschicht', d: '24:03', kat: 'Gesundheit & Soziales', slug: 'notfallsanitaeter' },
+    { t: 'Koch:Köchin — à la minute im Service', d: '16:45', kat: 'Handwerk & Technik', slug: 'koch' },
+    { t: 'Polizist:in auf Streife', d: '21:11', kat: 'Öffentlicher Dienst', slug: 'polizist' },
+  ];
+  const { PORTRAITS } = window.Shared;
+
+  function App() {
+    return (
+      <Shell active="videos">
+        <div className="container">
+          <div className="vid-head">
+            <div className="eyebrow">Videos · Berufsportraits</div>
+            <h1>Ein Beruf sagt mehr,<br/>wenn jemand ihn <em>macht</em>.</h1>
+            <p>Kurze Einblicke in den Alltag verschiedener Berufe — gedreht mit Leuten, die den Job wirklich machen. Keine HR-Hochglanzvideos, keine Werbung.</p>
+          </div>
+
+          <div className="vid-featured">
+            <div className="thumb" style={{
+            backgroundImage: `url(${PORTRAITS['pflegefachkraft']})`,
+            backgroundSize: 'cover', backgroundPosition: 'center',
+            border: '0.5px solid var(--rule)',
+            aspectRatio: '16/9', position: 'relative',
+          }}>
+            <div style={{ position: 'absolute', inset: 0, background: 'linear-gradient(0deg, rgba(0,0,0,0.4), rgba(0,0,0,0.05))' }} />
+            <div className="play" style={{ zIndex: 2 }}>
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+            </div>
+          </div>
+            <div>
+              <div className="meta-row">
+                <span style={{ color: 'var(--accent)' }}>Neu</span>
+                <span>·</span>
+                <span>18:22</span>
+                <span>·</span>
+                <span>Gesundheit & Soziales</span>
+              </div>
+              <h2>Pflegefachkraft — Frühschicht im Uniklinikum Köln</h2>
+              <p>Marie, 23, arbeitet seit zwei Jahren auf einer Intensivstation. Wir haben sie eine Frühschicht lang begleitet und hinter die Kulissen geschaut.</p>
+              <div style={{ marginTop: 28, display: 'flex', gap: 12 }}>
+                <a href="#" className="btn btn-primary">Video ansehen →</a>
+                <a href="berufsprofile.html?slug=pflegefachkraft" className="btn btn-ghost">Profil lesen</a>
+              </div>
+            </div>
+          </div>
+
+          <div style={{ fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: '0.2em', textTransform: 'uppercase', color: 'var(--ink-dim)', marginBottom: 20 }}>
+            Alle Videos · {VIDS.length}
+          </div>
+          <div className="vid-grid">
+            {VIDS.map((v,i) => (
+              <a key={i} href="#" className="vid-card">
+                <div className="thumb" style={{
+                  aspectRatio: '16/9', position: 'relative',
+                  backgroundImage: `url(${PORTRAITS[v.slug]})`,
+                  backgroundSize: 'cover', backgroundPosition: 'center',
+                  border: '0.5px solid var(--rule)',
+                }}>
+                  <div style={{ position: 'absolute', inset: 0, background: 'linear-gradient(0deg, rgba(0,0,0,0.45), transparent 50%)' }} />
+                  <div className="duration" style={{ zIndex: 2 }}>{v.d}</div>
+                  <div className="play" style={{ zIndex: 2 }}>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+                  </div>
+                </div>
+                <div className="meta">{v.kat} · {v.d}</div>
+                <h3>{v.t}</h3>
+              </a>
+            ))}
+          </div>
+        </div>
+      </Shell>
+    );
+  }
+  ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

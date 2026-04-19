@@ -1,0 +1,42 @@
+# Secrets - NEVER commit
+secrets/
+*.env
+*.key
+*.pem
+.env*
+
+# Config with secrets
+Mission-Control/config.json
+
+# Data & Caches
+data/
+rag/
+tmp_summary.json
+$null
+check_file.py
+
+# Dependencies
+node_modules/
+ruflo/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Claude/Swarm internals
+.claude-flow/
+.swarm/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+*.egg-info/
+dist/
+build/

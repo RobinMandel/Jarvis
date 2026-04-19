@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<title>Flappy Bird — Just4Fun — robinmandel.de</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="site/shared.css?v=9">
+<style>
+  /* Flappy page */
+  .fb-wrap { padding: 56px 0 80px; }
+  .fb-head {
+    display: grid; grid-template-columns: 1.2fr 1fr; gap: 64px;
+    margin-bottom: 48px; align-items: end;
+  }
+  .fb-head h1 {
+    font-family: var(--display); font-size: 96px; font-weight: 500;
+    letter-spacing: -0.03em; line-height: 0.94; text-wrap: balance;
+  }
+  .fb-head h1 em { font-style: italic; color: var(--accent); }
+  .fb-head p { font-size: 15px; line-height: 1.6; color: var(--ink-dim); text-wrap: pretty; }
+
+  /* Stage */
+  .stage {
+    position: relative;
+    max-width: 480px;
+    margin: 0 auto;
+    aspect-ratio: 3/4;
+    border: 0.5px solid var(--rule);
+    background: linear-gradient(180deg, #cfe7f0 0%, #dfe8c8 55%, #c9b890 100%);
+    overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.08);
+    border-radius: 3px;
+  }
+  [data-theme='dark'] .stage {
+    background: linear-gradient(180deg, #1a2530 0%, #2a2a1f 55%, #3a2a1a 100%);
+  }
+  .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  .stage .overlay {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px;
+    background: rgba(10,10,10,0.55); color: #fff; backdrop-filter: blur(2px);
+    padding: 24px; text-align: center;
+  }
+  .stage .overlay.hidden { display: none; }
+  .stage .overlay h2 {
+    font-family: var(--display); font-size: 44px; font-weight: 500;
+    letter-spacing: -0.02em; line-height: 1; text-wrap: balance;
+  }
+  .stage .overlay .small {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.25em;
+    text-transform: uppercase; opacity: 0.75;
+  }
+  .stage .overlay .score-row {
+    display: flex; gap: 40px; margin-top: 8px;
+  }
+  .stage .overlay .score-row div {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.15em;
+    text-transform: uppercase; opacity: 0.8;
+  }
+  .stage .overlay .score-row strong {
+    display: block; font-family: var(--display); font-size: 36px; font-weight: 500;
+    letter-spacing: -0.01em; color: #d4ff00; margin-top: 4px;
+  }
+  .stage .overlay button {
+    margin-top: 18px;
+    background: #d4ff00; color: #0a0a0a;
+    padding: 14px 26px; font-family: var(--mono); font-size: 11px;
+    font-weight: 600; letter-spacing: 0.22em; text-transform: uppercase;
+    border-radius: 2px;
+  }
+  .stage .overlay button:hover { background: #fff; }
+
+  .hud {
+    position: absolute; top: 16px; left: 16px; right: 16px; z-index: 2;
+    display: flex; justify-content: space-between;
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.2em;
+    text-transform: uppercase; color: #fff;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.4);
+  }
+  .hud .score-big {
+    font-family: var(--display); font-size: 54px; font-weight: 500;
+    letter-spacing: -0.02em; line-height: 1;
+    position: absolute; left: 50%; top: 40px; transform: translateX(-50%);
+    color: #fff; text-shadow: 0 2px 12px rgba(0,0,0,0.35);
+  }
+
+  .fb-foot {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px;
+    margin-top: 48px; max-width: 720px;
+    margin-left: auto; margin-right: auto;
+  }
+  .fb-tile {
+    padding: 20px; border: 0.5px solid var(--rule); background: var(--paper-2);
+  }
+  .fb-tile .k { font-family: var(--mono); font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--ink-dim); }
+  .fb-tile .v { font-family: var(--display); font-size: 32px; font-weight: 500; letter-spacing: -0.02em; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script type="text/babel" src="site/shared.jsx?v=9"></script>
+<script type="text/babel">
+  const { Shell } = window.Shared;
+  const { useState, useEffect, useRef } = React;
+
+  // --- Physics (tuned to feel like the classic) ---
+  const CFG = {
+    W: 480, H: 640,               // logical canvas resolution
+    gravity: 1400,                // px/s^2
+    flap: -420,                   // px/s  (upward kick)
+    maxFall: 600,
+    birdSize: 30,
+    pipeW: 70,
+    gap: 160,                     // gap height
+    pipeSpeed: 180,               // px/s
+    pipeSpacing: 230,             // horizontal distance between pipes
+    groundH: 80,
+  };
+
+  function Game() {
+    const canvasRef = useRef(null);
+    const stateRef = useRef(null);   // mutable game state (no re-render)
+    const [mode, setMode] = useState('ready'); // ready | playing | dead
+    const [score, setScore] = useState(0);
+    const [best, setBest] = useState(() => {
+      try { return parseInt(localStorage.getItem('rm.flappy.best') || '0', 10); } catch { return 0; }
+    });
+
+    // ---- init state
+    function reset() {
+      stateRef.current = {
+        birdY: CFG.H * 0.45,
+        birdV: 0,
+        birdR: 0,
+        pipes: [],     // {x, gapY, scored}
+        nextPipeX: CFG.W + 40,
+        t: 0,
+        dead: false,
+        flash: 0,
+        cloudOffset: 0,
+        groundOffset: 0,
+      };
+      setScore(0);
+    }
+
+    function flap() {
+      if (mode === 'ready') { reset(); setMode('playing'); stateRef.current.birdV = CFG.flap; return; }
+      if (mode === 'playing' && stateRef.current) stateRef.current.birdV = CFG.flap;
+      if (mode === 'dead') { reset(); setMode('ready'); }
+    }
+
+    // Keys + click
+    useEffect(() => {
+      const onKey = (e) => {
+        if (e.code === 'Space' || e.code === 'ArrowUp') { e.preventDefault(); flap(); }
+      };
+      window.addEventListener('keydown', onKey);
+      return () => window.removeEventListener('keydown', onKey);
+    }, [mode]);
+
+    // ---- resize canvas for crispness
+    useEffect(() => {
+      const cvs = canvasRef.current;
+      function sync() {
+        const rect = cvs.getBoundingClientRect();
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        cvs.width = Math.round(rect.width * dpr);
+        cvs.height = Math.round(rect.height * dpr);
+      }
+      sync();
+      window.addEventListener('resize', sync);
+      return () => window.removeEventListener('resize', sync);
+    }, []);
+
+    // ---- game loop
+    useEffect(() => {
+      if (!stateRef.current) reset();
+      let raf, last = performance.now();
+      const cvs = canvasRef.current;
+      const ctx = cvs.getContext('2d');
+
+      const loop = (now) => {
+        const dt = Math.min((now - last) / 1000, 1/30);
+        last = now;
+        const s = stateRef.current;
+
+        if (mode === 'playing' && !s.dead) {
+          s.t += dt;
+          s.birdV = Math.min(s.birdV + CFG.gravity * dt, CFG.maxFall);
+          s.birdY += s.birdV * dt;
+          s.birdR = Math.max(-0.5, Math.min(1.3, s.birdV / 700));
+
+          // spawn pipes
+          s.nextPipeX -= CFG.pipeSpeed * dt;
+          if (s.nextPipeX <= CFG.W - CFG.pipeSpacing) {
+            const minY = 80, maxY = CFG.H - CFG.groundH - 80 - CFG.gap;
+            const gapY = minY + Math.random() * (maxY - minY);
+            s.pipes.push({ x: CFG.W + 20, gapY, scored: false });
+            s.nextPipeX = CFG.W + 20;
+          }
+          s.pipes.forEach(p => p.x -= CFG.pipeSpeed * dt);
+          s.pipes = s.pipes.filter(p => p.x + CFG.pipeW > -10);
+
+          // scoring
+          for (const p of s.pipes) {
+            if (!p.scored && p.x + CFG.pipeW < CFG.W * 0.32) {
+              p.scored = true;
+              setScore(sc => sc + 1);
+            }
+          }
+
+          // collision
+          const bx = CFG.W * 0.32, by = s.birdY, br = CFG.birdSize/2;
+          if (by + br > CFG.H - CFG.groundH || by - br < 0) s.dead = true;
+          for (const p of s.pipes) {
+            if (bx + br > p.x && bx - br < p.x + CFG.pipeW) {
+              if (by - br < p.gapY || by + br > p.gapY + CFG.gap) { s.dead = true; break; }
+            }
+          }
+          if (s.dead) {
+            s.flash = 0.5;
+            setMode('dead');
+          }
+        }
+
+        if (mode === 'playing' || mode === 'dead') {
+          s.cloudOffset = (s.cloudOffset + 20 * dt) % CFG.W;
+          if (mode === 'playing') s.groundOffset = (s.groundOffset + CFG.pipeSpeed * dt) % 24;
+        } else if (mode === 'ready') {
+          // idle bob
+          s.t += dt;
+          s.birdY = CFG.H * 0.45 + Math.sin(s.t * 4) * 8;
+        }
+
+        // --- Render ---
+        draw(ctx, cvs, s);
+        if (s.flash > 0) s.flash -= dt;
+        raf = requestAnimationFrame(loop);
+      };
+      raf = requestAnimationFrame(loop);
+      return () => cancelAnimationFrame(raf);
+    }, [mode]);
+
+    // persist best
+    useEffect(() => {
+      if (score > best) {
+        setBest(score);
+        try { localStorage.setItem('rm.flappy.best', String(score)); } catch {}
+      }
+    }, [score]);
+
+    function draw(ctx, cvs, s) {
+      const W = cvs.width, H = cvs.height;
+      const sx = W / CFG.W, sy = H / CFG.H;
+      ctx.clearRect(0, 0, W, H);
+
+      // distant clouds
+      ctx.fillStyle = 'rgba(255,255,255,0.55)';
+      for (let i = 0; i < 5; i++) {
+        const x = ((i * 120 - s.cloudOffset * 0.6) % (CFG.W + 80) + CFG.W + 80) % (CFG.W + 80) - 80;
+        const y = 80 + (i%2) * 40;
+        ctx.beginPath();
+        ctx.ellipse(x * sx, y * sy, 40*sx, 14*sy, 0, 0, Math.PI*2);
+        ctx.fill();
+      }
+
+      // pipes
+      for (const p of s.pipes) {
+        drawPipe(ctx, p.x * sx, 0, CFG.pipeW * sx, p.gapY * sy);
+        drawPipe(ctx, p.x * sx, (p.gapY + CFG.gap) * sy, CFG.pipeW * sx, H - (p.gapY + CFG.gap) * sy - CFG.groundH * sy, true);
+      }
+
+      // ground
+      const gy = (CFG.H - CFG.groundH) * sy;
+      ctx.fillStyle = '#c9b890';
+      ctx.fillRect(0, gy, W, CFG.groundH * sy);
+      ctx.fillStyle = '#a99560';
+      for (let i = -1; i < CFG.W/24 + 1; i++) {
+        const gx = i * 24 * sx - (s.groundOffset) * sx;
+        ctx.fillRect(gx, gy, 12*sx, 6*sy);
+      }
+      ctx.fillStyle = '#7ea34a';
+      ctx.fillRect(0, gy, W, 8 * sy);
+
+      // bird
+      drawBird(ctx, CFG.W * 0.32 * sx, s.birdY * sy, CFG.birdSize * Math.min(sx,sy), s.birdR, s.t);
+
+      // death flash
+      if (s.flash > 0) {
+        ctx.fillStyle = `rgba(255,255,255,${s.flash})`;
+        ctx.fillRect(0, 0, W, H);
+      }
+    }
+
+    function drawPipe(ctx, x, y, w, h, bottom) {
+      const grd = ctx.createLinearGradient(x, 0, x+w, 0);
+      grd.addColorStop(0, '#3e8c3a');
+      grd.addColorStop(0.3, '#79c563');
+      grd.addColorStop(0.55, '#5ba84a');
+      grd.addColorStop(1, '#3e8c3a');
+      ctx.fillStyle = grd; ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = '#2d6b2a'; ctx.lineWidth = 2; ctx.strokeRect(x+1, y+1, w-2, h-2);
+      // lip
+      const lipH = 18;
+      const lipY = bottom ? y : y + h - lipH;
+      ctx.fillStyle = '#5ba84a'; ctx.fillRect(x - 4, lipY, w + 8, lipH);
+      ctx.strokeStyle = '#2d6b2a'; ctx.strokeRect(x - 4, lipY, w + 8, lipH);
+    }
+
+    function drawBird(ctx, cx, cy, size, rot, t) {
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(rot);
+      // body
+      ctx.fillStyle = '#f3c530';
+      ctx.strokeStyle = '#1a1814'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.ellipse(0, 0, size*0.9, size*0.75, 0, 0, Math.PI*2);
+      ctx.fill(); ctx.stroke();
+      // wing (flap with time)
+      const flap = Math.sin(t * 14) * 0.4;
+      ctx.save();
+      ctx.translate(-size*0.2, 0);
+      ctx.rotate(flap);
+      ctx.fillStyle = '#d9a51b';
+      ctx.beginPath(); ctx.ellipse(0, 0, size*0.55, size*0.35, 0, 0, Math.PI*2);
+      ctx.fill(); ctx.stroke();
+      ctx.restore();
+      // eye
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(size*0.35, -size*0.2, size*0.22, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#1a1814';
+      ctx.beginPath(); ctx.arc(size*0.42, -size*0.2, size*0.11, 0, Math.PI*2); ctx.fill();
+      // beak
+      ctx.fillStyle = '#e8621c';
+      ctx.beginPath();
+      ctx.moveTo(size*0.6, 0);
+      ctx.lineTo(size*1.05, -size*0.1);
+      ctx.lineTo(size*1.05, size*0.1);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.restore();
+    }
+
+    return (
+      <div className="container fb-wrap">
+        <div className="fb-head">
+          <div>
+            <div className="eyebrow">Just4Fun · Klassiker</div>
+            <h1 style={{ marginTop: 16 }}>Flappy<br/><em>Bird</em>.</h1>
+          </div>
+          <p>Das Ur-Spiel von 2013 — als Hommage neu gebaut. Leertaste / Klick / Tap zum Flattern. Persönliche Bestmarke wird lokal gespeichert.</p>
+        </div>
+
+        <div className="stage" onMouseDown={(e)=>{e.preventDefault(); flap();}} onTouchStart={(e)=>{e.preventDefault(); flap();}}>
+          <div className="hud">
+            <span>High · {String(best).padStart(3,'0')}</span>
+            <span>v1.0</span>
+          </div>
+          {mode === 'playing' && <div className="hud score-big">{score}</div>}
+
+          <canvas ref={canvasRef} />
+
+          {mode === 'ready' && (
+            <div className="overlay">
+              <div className="small">Anleitung</div>
+              <h2>Tippen zum Flattern,<br/>Röhren ausweichen.</h2>
+              <div className="small" style={{marginTop: 6}}>Leertaste · Klick · Tap</div>
+              <button onClick={flap}>Los geht's →</button>
+            </div>
+          )}
+          {mode === 'dead' && (
+            <div className="overlay">
+              <div className="small">Game Over</div>
+              <div className="score-row">
+                <div>Score<strong>{score}</strong></div>
+                <div>Best<strong style={{color: score >= best ? '#d4ff00' : '#fff'}}>{best}</strong></div>
+              </div>
+              <button onClick={flap}>Noch einmal →</button>
+            </div>
+          )}
+        </div>
+
+        <div className="fb-foot">
+          <div className="fb-tile">
+            <div className="k">Aktuell</div>
+            <div className="v">{score}</div>
+          </div>
+          <div className="fb-tile">
+            <div className="k">Dein Rekord</div>
+            <div className="v" style={{ color: 'var(--accent)' }}>{best}</div>
+          </div>
+          <div className="fb-tile">
+            <div className="k">Steuerung</div>
+            <div className="v" style={{ fontSize: 18, lineHeight: 1.3 }}>Space · Klick · Tap</div>
+          </div>
+        </div>
+
+        <p style={{
+          fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: '0.15em',
+          textTransform: 'uppercase', color: 'var(--ink-faint)',
+          textAlign: 'center', marginTop: 40,
+        }}>
+          Neu geschrieben als Canvas-Spiel · Original: Dong Nguyen, 2013
+        </p>
+      </div>
+    );
+  }
+
+  function App() {
+    return <Shell active="just4fun"><Game /></Shell>;
+  }
+  ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

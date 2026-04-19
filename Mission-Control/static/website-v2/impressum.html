@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<title>Impressum — robinmandel.de</title>
+<meta name="viewport" content="width=1440" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="site/shared.css?v=9">
+<style>
+  .imp-wrap { max-width: 820px; margin: 0 auto; padding: 72px 40px 60px; }
+  .imp-wrap h1 {
+    font-family: var(--display); font-size: 88px; font-weight: 500;
+    letter-spacing: -0.03em; line-height: 0.95; margin-top: 16px;
+    text-wrap: balance;
+  }
+  .imp-wrap h1 em { font-style: italic; color: var(--accent); }
+  .imp-wrap h2 {
+    font-family: var(--display); font-size: 28px; font-weight: 500;
+    letter-spacing: -0.015em; margin: 48px 0 14px;
+  }
+  .imp-wrap p { font-size: 15px; line-height: 1.7; color: var(--ink-2); margin-bottom: 10px; }
+  .imp-wrap table {
+    width: 100%; border-collapse: collapse; margin-top: 8px;
+    font-family: var(--mono); font-size: 13px;
+  }
+  .imp-wrap table tr { border-bottom: 0.5px solid var(--rule); }
+  .imp-wrap table td { padding: 12px 0; vertical-align: top; }
+  .imp-wrap table td:first-child {
+    color: var(--ink-faint); text-transform: uppercase; letter-spacing: 0.12em;
+    font-size: 10px; width: 40%; padding-top: 16px;
+  }
+  .imp-wrap a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script type="text/babel" src="site/shared.jsx?v=9"></script>
+<script type="text/babel">
+  const { Shell } = window.Shared;
+  function App() {
+    return (
+      <Shell active="impressum">
+        <div className="imp-wrap">
+          <div className="eyebrow">§ Impressum · Angaben gemäß § 5 TMG</div>
+          <h1>Wer <em>hinter</em><br/>der Seite steht.</h1>
+          <p style={{ marginTop: 28, color: 'var(--ink-dim)' }}>
+            robinmandel.de ist 2020 als Schulprojekt von Robin Mandel und Dennis gestartet. 2026 haben wir sie neu aufgelegt — gleicher Inhalt, sauberes Fundament.
+          </p>
+
+          <h2>Verantwortlich</h2>
+          <table>
+            <tbody>
+              <tr><td>Name</td><td>Robin Mandel</td></tr>
+              <tr><td>Anschrift</td><td>— wird ergänzt —</td></tr>
+              <tr><td>E-Mail</td><td><a href="mailto:robinmandel@outlook.de">robinmandel@outlook.de</a></td></tr>
+              <tr><td>Telefon</td><td>— auf Anfrage —</td></tr>
+            </tbody>
+          </table>
+
+          <h2>Redaktion & Konzept</h2>
+          <p>Robin Mandel &amp; Dennis — seit 2020, im Wechsel in Pflege und Betreuung.</p>
+
+          <h2>Haftungsausschluss</h2>
+          <p>
+            Die Inhalte dieser Seite sind mit Sorgfalz erstellt. Für die Richtigkeit, Vollständigkeit und Aktualität kann jedoch keine Gewähr übernommen werden. Als Diensteanbieter sind wir für eigene Inhalte gem. § 7 Abs. 1 TMG verantwortlich; nach §§ 8–10 TMG jedoch nicht verpflichtet, übermittelte oder gespeicherte fremde Informationen zu überwachen.
+          </p>
+
+          <h2>Urheberrecht</h2>
+          <p>
+            Die durch die Seitenbetreiber erstellten Inhalte und Werke auf diesen Seiten unterliegen dem deutschen Urheberrecht. Vervielfältigung, Bearbeitung, Verbreitung jeder Art bedarf der schriftlichen Zustimmung.
+          </p>
+
+          <h2>Datenschutz</h2>
+          <p>
+            Wir erheben keine personenbezogenen Daten. Der Berufstest läuft vollständig in deinem Browser; Ergebnisse werden nicht übertragen. Der einzige persistente Speicher ist localStorage (Theme, Chimpanzee-Test-Rekord) — vollständig lokal auf deinem Gerät.
+          </p>
+
+          <h2>Externe Links</h2>
+          <p>
+            Unsere Seite enthält Links zu Jobbörsen und sozialen Netzwerken. Für den Inhalt dieser externen Seiten ist stets der jeweilige Anbieter verantwortlich.
+          </p>
+
+          <h2>Das Original</h2>
+          <p>
+            Die erste Version dieser Seite liegt unter{' '}
+            <a href="https://robinmandel.de/" target="_blank" rel="noopener">robinmandel.de (v1, 2020)</a>. Sie bleibt als Archiv erhalten.
+          </p>
+        </div>
+      </Shell>
+    );
+  }
+  ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

@@ -1,5 +1,12 @@
 {
   "mcpServers": {
+    "jarvis": {
+      "command": "python",
+      "args": ["C:/Users/Robin/Jarvis/Mission-Control/jarvis_mcp.py"],
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      }
+    },
     "claude-flow": {
       "command": "cmd",
       "args": [
@@ -50,6 +57,18 @@
       },
       "optional": true,
       "requiresAuth": true
+    },
+    "playwright": {
+      "command": "cmd",
+      "args": [
+        "/c",
+        "npx",
+        "-y",
+        "@playwright/mcp@latest"
+      ],
+      "env": {
+        "npm_config_update_notifier": "false"
+      }
     }
   }
 }

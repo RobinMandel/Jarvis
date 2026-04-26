@@ -262,3 +262,85 @@ def update_bot(bot_id: str, updates: dict[str, Any]) -> dict | None:
     _save(bots)
     _write_config(bot)
     return _enrich(bot)
+
+
+# ---------------------------------------------------------------------------
+# Sortino-Ratio Ranking
+# ---------------------------------------------------------------------------
+
+def _sortino(returns: list[float], target: float = 0.0) -> float:
+    """Berechnet die Sortino Ratio aus einer Liste von Renditen."""
+    if not returns:
+        return 0.0
+    mean = sum(returns) / len(returns) - target
+    downside = [min(r - target, 0.0) ** 2 for r in returns]
+    downside_std = (sum(downside) / len(downside)) ** 0.5
+    if downside_std == 0:
+        return float("inf") if mean > 0 else 0.0
+    return mean / downside_std
+
+
+def rank_bots_by_sortino() -> list[dict]:
+    """Gibt alle Bots sortiert nach Sortino (bester zuerst) zurück."""
+    enriched = list_bots()
+    for bot in enriched:
+        # Renditen aus dem State lesen (last_result.returns falls vorhanden)
+        state = _read_state(bot["id"])
+        returns = state.get("returns", [])
+        bot["sortino"] = round(_sortino(returns), 4)
+    enriched.sort(key=lambda b: b["sortino"], reverse=True)
+    return enriched
+
+
+# ---------------------------------------------------------------------------
+# Mutation: Gewinner spawnt 2 Mutanten, Verlierer wird gekickt
+# ---------------------------------------------------------------------------
+
+_MUTATION_DELTAS = [
+    {"short_window": -2, "long_window": -5},  # aggressiver
+    {"short_window": +3, "long_window": +10},  # konservativer
+]
+
+
+def mutate_bot(winner_id: str) -> list[dict]:
+    """Erstellt 2 Parameter-Mutanten des Gewinner-Bots. Gibt neue Bot-Dicts zurück."""
+    winner = get_bot(winner_id)
+    if not winner:
+        raise KeyError(f"Bot {winner_id} nicht gefunden")
+
+    created = []
+    base_params = dict(winner.get("params", {}))
+    for i, delta in enumerate(_MUTATION_DELTAS, start=1):
+        new_params = dict(base_params)
+        for key, dv in delta.items():
+            if key in new_params:
+                new_val = int(new_params[key]) + dv
+                new_params[key] = max(1, new_val)  # Guard: kein negativer Window
+        # short_window muss < long_window bleiben
+        sw = new_params.get("short_window", 5)
+        lw = new_params.get("long_window", 20)
+        if sw >= lw:
+            new_params["long_window"] = sw + 5
+
+        label = "fast" if delta.get("short_window", 0) < 0 else "slow"
+        new_name = f"{winner['name']}_mut{i}_{label}"
+        new_bot = create_bot(
+            name=new_name,
+            strategy=winner.get("strategy", "sma_crossover"),
+            params=new_params,
+            interval_sec=winner.get("interval_sec", 300),
+        )
+        created.append(new_bot)
+    return created
+
+
+def kick_and_mutate(loser_id: str, winner_id: str) -> dict:
+    """Kickt den schlechtesten Bot und spawnt 2 Mutanten des besten."""
+    stop_bot(loser_id)
+    delete_bot(loser_id)
+    new_bots = mutate_bot(winner_id)
+    return {
+        "kicked": loser_id,
+        "mutants": [b["id"] for b in new_bots],
+        "mutant_names": [b["name"] for b in new_bots],
+    }

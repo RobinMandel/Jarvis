@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "jarvis": {
+      "command": "python",
+      "args": [
+        "C:/Users/Robin/Jarvis/Mission-Control/jarvis_mcp.py"
+      ]
+    }
+  }
+}

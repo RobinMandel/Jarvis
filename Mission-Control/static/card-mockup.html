@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Anki-Karten Design — Beta-Mockup</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #060910;
+    color: #e2e8f0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    padding: 32px 24px;
+    min-height: 100vh;
+  }
+  .page-header {
+    max-width: 640px;
+    margin: 0 auto 32px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .badge {
+    background: #a78bfa22;
+    color: #a78bfa;
+    border: 1px solid #a78bfa44;
+    border-radius: 20px;
+    padding: 4px 14px;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+  .page-title {
+    color: #94a3b8;
+    font-size: 13px;
+  }
+  .cards-grid {
+    max-width: 640px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  /* ── CARD ── */
+  .card {
+    border-radius: 14px;
+    overflow: hidden;
+    border: 1px solid rgba(255,255,255,.07);
+    box-shadow: 0 8px 32px rgba(0,0,0,.5), 0 0 0 0.5px rgba(255,255,255,.04);
+  }
+
+  /* Header stripe */
+  .card-header {
+    padding: 8px 16px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid rgba(255,255,255,.06);
+  }
+  .card-subject {
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+  }
+  .card-meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .source-badge {
+    border-radius: 20px;
+    padding: 2px 8px;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: .05em;
+    text-transform: uppercase;
+  }
+  .source-amboss {
+    background: #16a34a22;
+    color: #4ade80;
+    border: 1px solid #16a34a44;
+  }
+  .source-folien {
+    background: #2563eb22;
+    color: #60a5fa;
+    border: 1px solid #2563eb44;
+  }
+  .card-num {
+    border-radius: 20px;
+    padding: 2px 9px;
+    font-size: 10px;
+    font-weight: 700;
+  }
+
+  /* Front */
+  .card-front {
+    padding: 18px 20px 16px;
+    border-bottom: 1px solid rgba(255,255,255,.05);
+  }
+  .section-label {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin-bottom: 10px;
+    opacity: .6;
+  }
+  .section-label::before {
+    content: '';
+    display: inline-block;
+    width: 16px;
+    height: 1.5px;
+    border-radius: 1px;
+    background: currentColor;
+    opacity: .7;
+  }
+  .card-question {
+    color: #f1f5f9;
+    font-weight: 600;
+    font-size: 15px;
+    line-height: 1.55;
+  }
+
+  /* Back */
+  .card-back {
+    background: #070a13;
+    padding: 16px 20px 18px;
+  }
+  .card-answer {
+    color: #cbd5e1;
+    font-size: 13px;
+    line-height: 1.7;
+    margin-bottom: 14px;
+    white-space: pre-line;
+  }
+
+  /* Image slot */
+  .card-img-wrap {
+    margin-bottom: 14px;
+    border-radius: 9px;
+    overflow: hidden;
+    border: 1px solid rgba(255,255,255,.06);
+    background: #0d1117;
+    text-align: center;
+  }
+  .card-img-placeholder {
+    padding: 28px 16px;
+    color: #334155;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+  }
+  .card-img-placeholder svg {
+    opacity: .25;
+  }
+
+  /* Fun Fact */
+  .funfact {
+    margin-bottom: 10px;
+    padding: 10px 14px;
+    background: #f59e0b0d;
+    border: 1px solid #f59e0b22;
+    border-left: 3px solid #f59e0b;
+    border-radius: 0 9px 9px 0;
+  }
+  .funfact-label {
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: .1em;
+    color: #f59e0b;
+    margin-bottom: 5px;
+    text-transform: uppercase;
+  }
+  .funfact-text {
+    color: #fde68a;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+
+  /* Merkhilfe */
+  .merkhilfe {
+    padding: 10px 14px;
+    border-left: 3px solid;
+    border-radius: 0 9px 9px 0;
+  }
+  .merkhilfe-label {
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: .1em;
+    margin-bottom: 5px;
+    text-transform: uppercase;
+  }
+  .merkhilfe-text {
+    font-size: 12px;
+    line-height: 1.6;
+    color: #e2d9f3;
+  }
+
+  /* Design variants strip */
+  .variants-label {
+    max-width: 640px;
+    margin: 40px auto 14px;
+    font-size: 11px;
+    font-weight: 700;
+    color: #475569;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+  }
+  .variants-strip {
+    max-width: 640px;
+    margin: 0 auto;
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .color-chip {
+    border-radius: 8px;
+    padding: 6px 14px;
+    font-size: 11px;
+    font-weight: 700;
+    border: 1px solid transparent;
+    cursor: pointer;
+    opacity: .7;
+    transition: opacity .15s;
+  }
+  .color-chip:hover { opacity: 1; }
+</style>
+</head>
+<body>
+
+<div class="page-header">
+  <span class="badge">Beta-Design v1</span>
+  <span class="page-title">amkiphil-Style · Claude Touch · Jarvis Lernraum</span>
+</div>
+
+<!-- ═══════════════════════════════════════════════
+     KARTE 1 — Kardiologie (mit Amboss-Bild-Slot)
+═══════════════════════════════════════════════ -->
+<div class="cards-grid" id="cards-grid">
+
+  <div class="card" style="--accent:#e11d48;--accent-bg:#0f172a;--accent-border:#e11d48">
+    <div class="card-header" style="background:linear-gradient(90deg,#0f0d16,#e11d4822)">
+      <span class="card-subject" style="color:#e11d48">Kardiologie</span>
+      <span class="card-meta">
+        <span class="source-badge source-amboss">Amboss</span>
+        <span class="card-num" style="background:#e11d4822;color:#e11d48cc;border:1px solid #e11d4844">#1</span>
+      </span>
+    </div>
+    <div class="card-front" style="background:#0f0d16ee">
+      <div class="section-label" style="color:#e11d48">Frage</div>
+      <div class="card-question">Welche 4 Klassen von Antiarrhythmika gibt es nach Vaughan-Williams und was ist ihr jeweiliger Wirkmechanismus?</div>
+    </div>
+    <div class="card-back">
+      <div class="section-label" style="color:#475569">Antwort</div>
+      <div class="card-answer">Klasse I: Na-Kanalblocker (Ia/Ib/Ic) — verlängern/verkürzen/keine ÄP-Dauer
+Klasse II: Betablocker — reduzieren sympathische Stimulation des SA-Knotens
+Klasse III: K-Kanalblocker (z.B. Amiodaron) — verlängern Repolarisation
+Klasse IV: Ca-Kanalblocker — Verapamil, Diltiazem, verlängern AV-Überleitung</div>
+
+      <div class="card-img-wrap">
+        <div class="card-img-placeholder">
+          <svg width="40" height="40" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="4" y="8" width="32" height="24" rx="3" stroke="#94a3b8" stroke-width="1.5"/>
+            <circle cx="14" cy="17" r="3" stroke="#94a3b8" stroke-width="1.5"/>
+            <path d="M4 26l8-6 6 5 5-4 9 7" stroke="#94a3b8" stroke-width="1.5" stroke-linejoin="round"/>
+          </svg>
+          Amboss-Bild · EKG Antiarrhythmika
+        </div>
+      </div>
+
+      <div class="funfact">
+        <div class="funfact-label">💡 Fun Fact</div>
+        <div class="funfact-text">Amiodaron (Klasse III) enthält <strong>37% Jod nach Gewicht</strong> — deswegen TFT-Kontrollen alle 6 Monate! NW: Hypo-/Hyperthyreose, Lungenfibrose, Photosensibilität.</div>
+      </div>
+
+      <div class="merkhilfe" style="background:#e11d480c;border-color:#e11d48">
+        <div class="merkhilfe-label" style="color:#e11d48">🧠 Merkhilfe</div>
+        <div class="merkhilfe-text"><strong>SINKEN:</strong> Sinus-Inhibition, Na-Block, Kalium-Block, Einschränkung Ca²⁺</div>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- ═══════════════════════════════════════════════
+       KARTE 2 — Neurologie (mit Folien-Badge)
+  ═══════════════════════════════════════════════ -->
+  <div class="card" style="--accent:#6366f1">
+    <div class="card-header" style="background:linear-gradient(90deg,#0d0c18,#6366f122)">
+      <span class="card-subject" style="color:#6366f1">Neurologie</span>
+      <span class="card-meta">
+        <span class="source-badge source-folien">Folien</span>
+        <span class="card-num" style="background:#6366f122;color:#6366f1cc;border:1px solid #6366f144">#2</span>
+      </span>
+    </div>
+    <div class="card-front" style="background:#0d0c18ee">
+      <div class="section-label" style="color:#6366f1">Frage</div>
+      <div class="card-question">Nenne die 3 Hauptsymptome der Parkinson-Krankheit und erkläre den zugrundeliegenden Pathomechanismus.</div>
+    </div>
+    <div class="card-back">
+      <div class="section-label" style="color:#475569">Antwort</div>
+      <div class="card-answer">1. Rigor (Zahnrad- oder Bleirohrenphänomen)
+2. Tremor (Ruhetremor 4–6 Hz, "Pillendreher")
+3. Akinese/Bradykinese (Hypokinese, Mikrographie)
+
+Pathomechanismus: Degeneration dopaminerger Neurone in der Substantia nigra pars compacta → Dopaminmangel im Striatum → gestörte Basalganglien-Motorikschleife.</div>
+
+      <div class="funfact">
+        <div class="funfact-label">💡 Fun Fact</div>
+        <div class="funfact-text">Lewy-Bodies (α-Synuclein-Aggregate) finden sich nicht nur im Gehirn — sie treten auch im <strong>enterischen Nervensystem</strong> auf. Deshalb ist Verstopfung oft ein Frühsymptom Jahre vor den motorischen Beschwerden!</div>
+      </div>
+
+      <div class="merkhilfe" style="background:#6366f10c;border-color:#6366f1">
+        <div class="merkhilfe-label" style="color:#6366f1">🧠 Merkhilfe</div>
+        <div class="merkhilfe-text"><strong>TRA-RI-AK:</strong> Tremor, Rigor, Akinese — die drei Kardinalsymptome</div>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- ═══════════════════════════════════════════════
+       KARTE 3 — Pharmakologie (kein Bild, zeigt Fallback)
+  ═══════════════════════════════════════════════ -->
+  <div class="card" style="--accent:#0ea5e9">
+    <div class="card-header" style="background:linear-gradient(90deg,#070e17,#0ea5e922)">
+      <span class="card-subject" style="color:#0ea5e9">Pharmakologie</span>
+      <span class="card-meta">
+        <span class="card-num" style="background:#0ea5e922;color:#0ea5e9cc;border:1px solid #0ea5e944">#3</span>
+      </span>
+    </div>
+    <div class="card-front" style="background:#070e17ee">
+      <div class="section-label" style="color:#0ea5e9">Frage</div>
+      <div class="card-question">Erkläre den Unterschied zwischen kompetitiver und nicht-kompetitiver Hemmung. Welchen Einfluss hat jede auf Vmax und Km?</div>
+    </div>
+    <div class="card-back">
+      <div class="section-label" style="color:#475569">Antwort</div>
+      <div class="card-answer">Kompetitiv: Inhibitor bindet reversibel an aktives Zentrum
+→ Km ↑ (scheinbar), Vmax unverändert (überwinnbar durch ↑ [S])
+
+Nicht-kompetitiv: Inhibitor bindet an allosterische Stelle
+→ Km unverändert, Vmax ↓ (nicht überwindbar)</div>
+
+      <div class="funfact">
+        <div class="funfact-label">💡 Fun Fact</div>
+        <div class="funfact-text">Methotrexat ist ein klassischer kompetitiver Inhibitor der Dihydrofolat-Reduktase — so effektiv, dass es heute noch in der Chemotherapie <em>und</em> Rheumatologie eingesetzt wird.</div>
+      </div>
+
+      <div class="merkhilfe" style="background:#0ea5e90c;border-color:#0ea5e9">
+        <div class="merkhilfe-label" style="color:#0ea5e9">🧠 Merkhilfe</div>
+        <div class="merkhilfe-text"><strong>KomKm:</strong> Kompetitiv → Km-Änderung · <strong>NichtVmax:</strong> Nicht-kompetitiv → Vmax-Änderung</div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /cards-grid -->
+
+<!-- Farbpaletten-Auswahl -->
+<div class="variants-label">Fach-Farbpaletten</div>
+<div class="variants-strip">
+  <span class="color-chip" style="background:#e11d4822;color:#e11d48;border-color:#e11d4844">Kardiologie</span>
+  <span class="color-chip" style="background:#6366f122;color:#6366f1;border-color:#6366f144">Neurologie</span>
+  <span class="color-chip" style="background:#0ea5e922;color:#0ea5e9;border-color:#0ea5e944">Pharmakologie</span>
+  <span class="color-chip" style="background:#10b98122;color:#10b981;border-color:#10b98144">Innere Medizin</span>
+  <span class="color-chip" style="background:#f59e0b22;color:#f59e0b;border-color:#f59e0b44">Chirurgie</span>
+  <span class="color-chip" style="background:#a78bfa22;color:#a78bfa;border-color:#a78bfa44">Allgemein</span>
+</div>
+
+<div style="max-width:640px;margin:48px auto 0;padding:20px;background:#0d1117;border-radius:12px;border:1px solid rgba(255,255,255,.05)">
+  <div style="font-size:10px;font-weight:800;letter-spacing:.1em;color:#475569;text-transform:uppercase;margin-bottom:10px">Design-Entscheidungen in diesem Mockup</div>
+  <ul style="color:#64748b;font-size:12px;line-height:1.8;padding-left:16px">
+    <li>Dunkler Hintergrund (~#060910 Body, #070a13 Karten-Back) — amkiphil-typisch</li>
+    <li>Fach-Akzentfarbe durchzieht Header-Stripe, Labels, Nummern-Badge</li>
+    <li>Amboss-Badge grün · Folien-Badge blau · kein Badge = nur Textinhalt</li>
+    <li>Fun Fact: amber-Akzent, linker Border — sofort erkennbar</li>
+    <li>Merkhilfe: Fach-Akzentfarbe, linker Border — visuell verbunden mit Fach</li>
+    <li>Bild-Slot: 200px Höhe, object-fit contain — zeigt immer ganzes Bild</li>
+    <li>Karten-Nummer #1/#2/… oben rechts als Pill-Badge</li>
+  </ul>
+</div>
+
+<div style="max-width:640px;margin:16px auto 48px;text-align:center;color:#1e293b;font-size:11px">
+  Jarvis · Lernraum · Beta-Design v1 · Feedback in der Arena
+</div>
+
+<script>
+(function () {
+  var raw = localStorage.getItem('dlr_preview_card');
+  if (!raw) return;
+  try {
+    var parsed = JSON.parse(raw);
+    var c = parsed.card;
+    var subject = parsed.subject || '';
+    if (!c || !c.front) return;
+
+    // Fach-Farben (Fallback auf Lila)
+    var palette = {
+      'Kardiologie':    { bg: '#130810', accent: '#e11d48', border: '#9f1239' },
+      'Neurologie':     { bg: '#0d0c18', accent: '#6366f1', border: '#4338ca' },
+      'Pharmakologie':  { bg: '#070e17', accent: '#0ea5e9', border: '#0369a1' },
+      'Innere Medizin': { bg: '#061410', accent: '#10b981', border: '#065f46' },
+      'Chirurgie':      { bg: '#131008', accent: '#f59e0b', border: '#b45309' },
+      'Anatomie':       { bg: '#1a1000', accent: '#fbbf24', border: '#b45309' },
+      'Biochemie':      { bg: '#0a1a0f', accent: '#4ade80', border: '#166534' },
+      'Physiologie':    { bg: '#0f172a', accent: '#60a5fa', border: '#1d4ed8' },
+    };
+    var col = palette[subject] || { bg: '#100e1a', accent: '#a78bfa', border: '#7c3aed' };
+
+    // Quelle → Badge
+    var sourceHtml = '';
+    if (c.source === 'amboss') {
+      sourceHtml = '<span class="source-badge source-amboss">Amboss</span>';
+    } else if (c.source === 'folien') {
+      sourceHtml = '<span class="source-badge source-folien">Folien</span>';
+    }
+
+    // Bild (mit optionalem Occlusion-Overlay)
+    var imgHtml = '';
+    if (c.image && c.image.trim()) {
+      var occs = c.occlusions || [];
+      if (occs.length) {
+        var rects = occs.map(function(o) {
+          var lbl = String(o.label||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+          var cx = (Number(o.x)+Number(o.w)/2).toFixed(2);
+          var cy = (Number(o.y)+Number(o.h)/2+1).toFixed(2);
+          return '<g><rect x="'+o.x+'" y="'+o.y+'" width="'+o.w+'" height="'+o.h+
+            '" fill="#0a0c12" fill-opacity="0.88" stroke="#a78bfa" stroke-width="0.3" rx="0.5" ry="0.5" style="cursor:pointer" '+
+            'onclick="var r=this,t=r.nextElementSibling;if(r.getAttribute(\'fill-opacity\')===\'0.88\'){r.setAttribute(\'fill-opacity\',\'0.12\');t.style.display=\'\'}else{r.setAttribute(\'fill-opacity\',\'0.88\');t.style.display=\'none\'}">'+
+            '<title>'+lbl+'</title></rect>'+
+            '<text x="'+cx+'" y="'+cy+'" text-anchor="middle" fill="#ef4444" font-weight="800" font-size="3.5" paint-order="stroke" stroke="#0a0c12" stroke-width="0.5" style="display:none;pointer-events:none;user-select:none">'+lbl+'</text></g>';
+        }).join('');
+        imgHtml = '<div class="card-img-wrap" style="position:relative"><img src="'+c.image+'" style="max-width:100%;max-height:280px;object-fit:contain;display:block;margin:0 auto">'+
+          '<svg viewBox="0 0 100 100" preserveAspectRatio="none" style="position:absolute;inset:0;width:100%;height:100%">'+rects+'</svg>'+
+          '<div style="font-size:10px;color:#94a3b8;margin-top:4px;text-align:center">🔍 Klicke auf die Flächen zum Aufdecken</div></div>';
+      } else {
+        imgHtml = '<div class="card-img-wrap"><img src="' + c.image + '" style="max-width:100%;max-height:240px;object-fit:contain;display:block;margin:0 auto"></div>';
+      }
+    }
+
+    // Fun Fact
+    var ffHtml = '';
+    if (c.funfact) {
+      ffHtml = '<div class="funfact"><div class="funfact-label">💡 Fun Fact</div><div class="funfact-text">' + c.funfact + '</div></div>';
+    }
+
+    // Merkhilfe
+    var mhHtml = '';
+    if (c.merkhilfe) {
+      mhHtml = '<div class="merkhilfe" style="background:' + col.accent + '0c;border-color:' + col.accent + '">'
+             + '<div class="merkhilfe-label" style="color:' + col.accent + '">🧠 Merkhilfe</div>'
+             + '<div class="merkhilfe-text">' + c.merkhilfe + '</div></div>';
+    }
+
+    // Quellen-Footer: Primärquelle + optional Ergänzung
+    var footerHtml = '';
+    var fParts = [];
+    function esc(s) { return String(s).replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+    if (c.source && String(c.source).trim()) fParts.push(esc(String(c.source).trim()));
+    if (c.external_source) {
+      var extColor = String(c.external_source).indexOf('Amboss') >= 0 ? '#34d399' : '#38bdf8';
+      fParts.push('<span style="color:' + extColor + '">Ergänzt aus ' + esc(c.external_source) + '</span>');
+    }
+    if (fParts.length) {
+      footerHtml = '<div style="margin-top:12px;padding-top:8px;border-top:1px solid #1e293b;font-size:10px;color:#64748b;letter-spacing:.03em">' +
+        fParts.join(' <span style="color:#334155">·</span> ') + '</div>';
+    }
+
+    var cardHtml = [
+      '<div class="card" style="--accent:' + col.accent + ';border-color:' + col.border + '33">',
+        '<div class="card-header" style="background:linear-gradient(90deg,' + col.bg + ',' + col.accent + '22)">',
+          '<span class="card-subject" style="color:' + col.accent + '">' + subject + '</span>',
+          '<span class="card-meta">',
+            sourceHtml,
+            '<span class="card-num" style="background:' + col.accent + '22;color:' + col.accent + 'cc;border:1px solid ' + col.accent + '44">#1</span>',
+          '</span>',
+        '</div>',
+        '<div class="card-front" style="background:' + col.bg + 'ee">',
+          '<div class="section-label" style="color:' + col.accent + '">Frage</div>',
+          '<div class="card-question">' + _cloze(c.front) + '</div>',
+        '</div>',
+        '<div class="card-back">',
+          '<div class="section-label" style="color:#475569">Antwort</div>',
+          '<div class="card-answer">' + _cloze((c.back || '').replace(/\n/g, '<br>')) + '</div>',
+          imgHtml,
+          ffHtml,
+          mhHtml,
+          footerHtml,
+        '</div>',
+      '</div>',
+    ].join('');
+
+    var grid = document.querySelector('.cards-grid');
+    if (grid) {
+      var banner = '<div style="max-width:640px;margin:0 auto 12px;padding:8px 14px;background:#34d39910;border:1px solid #34d39930;border-radius:8px;font-size:11px;color:#34d399">✓ Echte Probe-Karte aus dem Lernraum · <button onclick="localStorage.removeItem(\'dlr_preview_card\');location.reload()" style="background:none;border:none;color:#64748b;cursor:pointer;font-size:11px;text-decoration:underline">Demo wiederherstellen</button></div>';
+      grid.insertAdjacentHTML('beforebegin', banner);
+      grid.innerHTML = cardHtml;
+    }
+    // Mermaid-Diagramme rendern falls Claude welche in Back eingebaut hat
+    var mmNodes = document.querySelectorAll('.mermaid');
+    if (mmNodes.length) {
+      var s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js';
+      s.onload = function() { try { mermaid.initialize({startOnLoad:false, theme:'dark', securityLevel:'loose'}); mermaid.run({nodes: mmNodes}); } catch(e){} };
+      document.head.appendChild(s);
+    }
+  } catch(e) { /* malformed JSON — zeige Dummy */ }
+
+  // Cloze-Syntax {{c1::Antwort}} → rot-fett im DOM (RAW bleibt im localStorage für Anki)
+  function _cloze(t) {
+    if (!t) return '';
+    return t.replace(/\{\{c\d+::(.+?)(?:::.+?)?\}\}/g,
+      '<span style="color:#ef4444;font-weight:800;background:#ef444410;padding:1px 5px;border-radius:3px">$1</span>');
+  }
+})();
+</script>
+
+</body>
+</html>

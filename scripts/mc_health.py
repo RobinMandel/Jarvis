@@ -303,26 +303,48 @@ def main() -> int:
 
     if not all_issues:
         log("OK")
+        # Reset push cooldown on clean run so next real issue gets through
+        state.pop("last_push_time", None)
+        save_state(state)
         return 0
 
     for i in all_issues:
         log(f"ISSUE: {i}")
 
-    # Escalation: HTTP unreachable OR crash-loop → priority 5 (urgent)
+    # If HTTP is reachable, crash-loop entries are watchdog noise — downgrade to info only
+    http_ok = not any("HTTP unreachable" in i for i in all_issues)
+    real_issues = [i for i in all_issues if not (http_ok and "crash-loop" in i)]
+
+    if not real_issues:
+        log("INFO: crash-loop events logged but server is HTTP-reachable — no push")
+        save_state(state)
+        return 0
+
+    # Rate-limit: max one push per hour
+    now = time.time()
+    last_push = state.get("last_push_time", 0)
+    if now - last_push < 3600:
+        mins_ago = int((now - last_push) / 60)
+        log(f"INFO: suppressing push (last sent {mins_ago}min ago, cooldown 60min)")
+        save_state(state)
+        return 0
+
+    # Escalation: HTTP unreachable OR cloudflared hard-fail → priority 5 (urgent)
     urgent = any(
         "HTTP unreachable" in i
-        or "crash-loop" in i
         or "cloudflared stopped AND auto-restart failed" in i
-        for i in all_issues
+        for i in real_issues
     )
     title = "MC Health: PROBLEM" if urgent else "MC Health: Warnung"
-    body = "\n".join(all_issues)[:1500]
+    body = "\n".join(real_issues)[:1500]
     ntfy_push(
         title=title,
         message=body,
         priority=5 if urgent else 3,
         tags="rotating_light" if urgent else "warning",
     )
+    state["last_push_time"] = now
+    save_state(state)
     return 0
 
 

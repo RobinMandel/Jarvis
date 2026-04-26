@@ -12,9 +12,11 @@ from datetime import datetime
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
-TRIGGER_FILE = BASE_DIR / "data" / "restart.trigger"
+# v2 path: isolates any still-running pre-lock watcher that polls the old path.
+TRIGGER_FILE = BASE_DIR / "data" / "restart.v2.trigger"
 STOP_FLAG = BASE_DIR / "data" / "stop.flag"
 LOG_FILE = BASE_DIR / "data" / "watcher.log"
+PID_FILE = BASE_DIR / "data" / "watcher.pid"
 POLL_INTERVAL = 0.5
 
 if sys.platform == 'win32':
@@ -124,20 +126,17 @@ def start_mc() -> bool:
 
 def handle_trigger() -> None:
     log("Restart trigger detected")
-    # Signal existing start.bat loop to exit after python dies (prevents crash-loop)
-    STOP_FLAG.touch()
+    # Just kill the running server — the (singleton) watchdog.py will auto-restart
+    # it after its ~15s backoff. Spawning our own start.bat here would collide with
+    # the existing watchdog's own restart attempt and reintroduces the race this
+    # whole layer was meant to prevent.
     kill_mc_processes()
     if wait_port_free(8090, timeout_s=15.0):
-        log("Port 8090 free")
+        log("Port 8090 free — watchdog will relaunch server in ~15s")
     else:
         log("WARN: port 8090 still busy after wait — forcing second kill pass")
         kill_mc_processes()
         time.sleep(1.5)
-
-    if start_mc():
-        log("MC restart dispatched")
-    else:
-        log("ERROR: Failed to restart MC")
 
     try:
         TRIGGER_FILE.unlink()
@@ -147,25 +146,61 @@ def handle_trigger() -> None:
     except Exception as e:
         log(f"Trigger unlink failed: {e}")
 
-    # Clean up stop.flag in case start.bat didn't consume it
-    STOP_FLAG.unlink(missing_ok=True)
+    time.sleep(3)  # cooldown before next poll iteration
 
-    time.sleep(3)  # cooldown
+
+def _is_alive(pid: int) -> bool:
+    try:
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if h:
+            ctypes.windll.kernel32.CloseHandle(h)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _acquire_singleton() -> bool:
+    if PID_FILE.exists():
+        try:
+            other = int(PID_FILE.read_text().strip())
+            if other != os.getpid() and _is_alive(other):
+                return False
+        except Exception:
+            pass
+    try:
+        PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PID_FILE.write_text(str(os.getpid()))
+    except Exception as e:
+        log(f"PID file write failed: {e}")
+    return True
 
 
 def main() -> None:
+    if not _acquire_singleton():
+        log(f"Another watcher already running (see {PID_FILE}) — exiting.")
+        return
     log(f"Watcher started (pid={os.getpid()}, trigger={TRIGGER_FILE})")
-    while True:
+    try:
+        while True:
+            try:
+                if TRIGGER_FILE.exists():
+                    handle_trigger()
+                time.sleep(POLL_INTERVAL)
+            except KeyboardInterrupt:
+                log("Shutting down (KeyboardInterrupt)")
+                break
+            except Exception as e:
+                log(f"Unexpected error: {e}")
+                time.sleep(1)
+    finally:
         try:
-            if TRIGGER_FILE.exists():
-                handle_trigger()
-            time.sleep(POLL_INTERVAL)
-        except KeyboardInterrupt:
-            log("Shutting down (KeyboardInterrupt)")
-            break
-        except Exception as e:
-            log(f"Unexpected error: {e}")
-            time.sleep(1)
+            if PID_FILE.exists() and int(PID_FILE.read_text().strip()) == os.getpid():
+                PID_FILE.unlink()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

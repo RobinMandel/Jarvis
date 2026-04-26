@@ -82,8 +82,8 @@ async function triggerMCRestart() {
   try {
     const res = await fetch('/api/system/restart', { method: 'POST' });
     const data = await res.json();
-    if (data.status === 'ok') {
-      status.textContent = 'Restart ausgelöst — MC startet in ~3s neu';
+    if (data.ok) {
+      status.textContent = data.message || 'Restart ausgelöst — MC startet in ~3s neu';
       status.style.color = '#4ade80';
     } else {
       status.textContent = 'Fehler: ' + (data.error || 'Unbekannt');

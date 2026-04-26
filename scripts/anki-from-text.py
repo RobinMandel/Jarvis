@@ -39,9 +39,22 @@ REGELN:
 - Deutsche Fachsprache (Kreatinin, nicht creatinine).
 - KEIN Markdown, KEINE Code-Fences. Nur reines JSON.
 
+BILDER (optional pro Karte):
+- Bei Karten wo ein generiertes Bild merkbar zum Verstaendnis beitraegt → Feld
+  "image_prompt" hinzufuegen (englisch, ~25-60 Woerter, klare Szene).
+- Gute Kandidaten: Anatomie/Topographie, Pathophysiologie-Mechanismen, Histologie,
+  raeumliche Konzepte, OP-Techniken, Diagramme/Schemata.
+- Schlechte Kandidaten: reine Definitionen, Zahlen/Werte, Listen, abstrakte Konzepte
+  ohne visuellen Anker — bei diesen Feld weglassen oder null setzen.
+- Maximal die Haelfte der Karten sollte ein Bild bekommen — Sparsamkeit.
+- Image-Prompt-Stil: medizinische Illustration, klare Beschriftung, neutraler
+  Hintergrund. KEIN photorealistic. Z.B. "Anatomical illustration of the human
+  heart cross-section showing the four chambers with labeled vessels, clean
+  textbook style, white background."
+
 AUSGABE (genau dieses Format):
 {{"cards": [
-  {{"type": "cloze", "text": "Karteninhalt mit {{c1::cloze}}", "tags": ["tag1", "tag2"]}},
+  {{"type": "cloze", "text": "Karteninhalt mit {{c1::cloze}}", "tags": ["tag1", "tag2"], "image_prompt": "Anatomical illustration of ..."}},
   {{"type": "basic", "front": "Frage", "back": "Antwort", "tags": ["tag"]}}
 ]}}
 
@@ -85,7 +98,10 @@ def extract_json(text: str) -> dict:
     return json.loads(text)
 
 
-def generate(text: str, deck: str, title: str = "", extra_tags: list = None) -> dict:
+def generate(text: str, deck: str, title: str = "", extra_tags: list = None, cards_only: bool = False) -> dict:
+    """cards_only=True → returnt nur die parsed cards (mit image_prompt etc.) und
+    pusht NICHT direkt in Anki. Caller (z.B. MC-Server) macht dann Image-Gen +
+    Bulk-Sync via existierende Routinen."""
     if not text.strip():
         return {"ok": False, "error": "Leerer Text"}
 
@@ -101,32 +117,36 @@ def generate(text: str, deck: str, title: str = "", extra_tags: list = None) -> 
     if not cards:
         return {"ok": False, "error": "Keine Karten von Claude erhalten", "raw": raw[:500]}
 
+    base_tags = extra_tags or []
+    # Tags pro Karte normalisieren + auto-tag adden
+    for c in cards:
+        c["tags"] = list(set((c.get("tags") or []) + base_tags + ["auto-generated"]))
+
+    if cards_only:
+        return {"ok": True, "cards": cards, "deck": deck, "title": title}
+
     # Deck anlegen (idempotent)
     try:
         create_deck(deck)
     except Exception as e:
         return {"ok": False, "error": f"Deck-Fehler (Anki laeuft?): {e}"}
 
-    base_tags = extra_tags or []
-
     # Karten zu AnkiConnect-Note-Dicts konvertieren und via Batch einfuegen.
-    # Batch = 1 HTTP-Request statt N, mit Retry+Lock aus anki-api.py.
     notes = []
     for c in cards:
-        tags = list(set((c.get("tags") or []) + base_tags + ["auto-generated"]))
         if c.get("type") == "cloze" or "{{c" in c.get("text", ""):
             notes.append({
                 "deckName": deck,
                 "modelName": "Cloze",
                 "fields": {"Text": c.get("text", ""), "Extra": title},
-                "tags": tags,
+                "tags": c["tags"],
             })
         else:
             notes.append({
                 "deckName": deck,
                 "modelName": "Basic",
                 "fields": {"Front": c.get("front", ""), "Back": c.get("back", "")},
-                "tags": tags,
+                "tags": c["tags"],
             })
 
     batch = add_notes_batch(notes)
@@ -146,6 +166,7 @@ def main():
     ap.add_argument("--title", default="")
     ap.add_argument("--file", default=None)
     ap.add_argument("--tags", default="")  # comma-separated
+    ap.add_argument("--cards-only", action="store_true", help="Returnt nur cards JSON, kein Anki-Push (fuer MC-Image-Pass)")
     args = ap.parse_args()
 
     if args.file:
@@ -155,7 +176,7 @@ def main():
         text = sys.stdin.read()
 
     tags = [t.strip() for t in args.tags.split(",") if t.strip()]
-    result = generate(text, args.deck, args.title, tags)
+    result = generate(text, args.deck, args.title, tags, cards_only=args.cards_only)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     sys.exit(0 if result.get("ok") else 1)
 

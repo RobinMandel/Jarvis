@@ -9,6 +9,7 @@ MC.chat = (function() {
   let _pendingSubscribeHistory = false; // true when we're expecting chat.history from our own subscribe_stream
   let _ownResubscribe = false;          // true when we sent subscribe_stream ourselves (buffer replay should reset content)
   let _initialHistoryLoaded = false;    // true after first chat.sessions load — prevents repeated load_history on session-list updates
+  let _lastMsgStats = null;             // cached for topbar updates
 
   // ── STT ───────────────────────────────────────────────────────────────────
   let recognition = null;
@@ -43,6 +44,142 @@ MC.chat = (function() {
   const STORAGE_KEY = 'mc_chat_state';
   const STORAGE_KEY_SESSIONS = 'mc_sessions_list';
   const STORAGE_KEY_SIDEBAR = 'mc_sidebar_open';
+
+  // --- Provider+Model-Picker Helpers (Chat-Refactor 2026-04-23) ---
+  // Value-Encoding im <option>-Tag: "provider||model"
+  //   "claude-cli||"        → claude-cli mit Account-Default (Server: model="")
+  //   "claude-cli||sonnet"  → claude-cli mit Model "sonnet"
+  //   "codex-cli||"         → codex-cli mit ChatGPT-Account-Default
+  // Getrennt an den Server senden — kombiniert nur für die Bedienung.
+
+  function _parsePickerValue(raw) {
+    const str = String(raw || 'claude-cli||');
+    const idx = str.indexOf('||');
+    if (idx === -1) return { provider: 'claude-cli', model: str };
+    return { provider: str.slice(0, idx), model: str.slice(idx + 2) };
+  }
+
+  function _encodePickerValue(provider, model) {
+    return (provider || 'claude-cli') + '||' + (model || '');
+  }
+
+  // Hart kodierte Modell-Kandidaten pro Provider. /api/llm/providers liefert
+  // nur Capability-Flags, nicht die Modell-Liste. Keine Live-Abfrage möglich
+  // ohne provider-spezifischen Endpoint — also hier best-effort defaults.
+  // "" = "Account-Default" (Provider wählt selbst — nützlich für CLI-Provider).
+  // Verifiziert 2026-04-25: codex-cli mit ChatGPT-Login akzeptiert nur `gpt-5.5`
+  // oder den Account-Default (""). gpt-5, gpt-5-codex, o3, o4-mini etc. liefern
+  // "model not supported when using Codex with a ChatGPT account".
+  // gemini-cli: gemini-3.0-pro existiert noch nicht in der API.
+  const _MODEL_CANDIDATES = {
+    'claude-cli':  ['', 'sonnet', 'opus', 'haiku'],
+    'claude-api':  ['claude-sonnet-4-6', 'claude-opus-4-7', 'claude-haiku-4-5-20251001'],
+    'codex-cli':   ['', 'gpt-5.5'],
+    'gemini-cli':  ['', 'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'],
+    'openai':      ['gpt-5.5', 'gpt-5', 'gpt-4o', 'gpt-4o-mini'],
+  };
+
+  const _PROVIDER_LABELS = {
+    'claude-cli':  'Claude (CLI)',
+    'claude-api':  'Claude (API)',
+    'codex-cli':   'GPT via Codex (ChatGPT-Login)',
+    'gemini-cli':  'Gemini (CLI, Google-Login)',
+    'openai':      'OpenAI API',
+  };
+
+  // Kurzform für die Inline-Anzeige im geschlossenen Picker.
+  // Wichtig: der geschlossene <select> zeigt nur option.textContent — nicht
+  // das optgroup.label. Wenn das Option-Label nur "Opus" ist, sieht man nicht
+  // welcher Provider aktiv ist. Darum prefixen wir mit kurzem Provider-Token.
+  const _PROVIDER_SHORT = {
+    'claude-cli':  'Claude',
+    'claude-api':  'Claude API',
+    'codex-cli':   'Codex',
+    'gemini-cli':  'Gemini',
+    'openai':      'OpenAI',
+  };
+
+  // Lockt den Provider-Picker auf claude-cli wenn die aktive Session eine
+  // Jarvis-Orchestrator-Session ist. Sonst: Auswahl frei.
+  function _applyPickerLock() {
+    const sel = document.getElementById('chat-model-select');
+    if (!sel) return;
+    const locked = activeSession === 'jarvis-main' || activeSession === 'jarvis-heartbeat';
+    if (locked) {
+      const want = _encodePickerValue('claude-cli', 'sonnet');
+      if (Array.from(sel.options).some(o => o.value === want)) sel.value = want;
+      sel.disabled = true;
+      sel.title = 'Jarvis laeuft fest auf Claude (CLI) — kein Provider-Wechsel hier.';
+    } else {
+      sel.disabled = false;
+      sel.title = '';
+    }
+  }
+
+  function _getCurrentProviderModel() {
+    // Einzige Wahrheitsquelle für den aktuellen Provider+Model: der Picker.
+    // Bei fehlendem Picker → localStorage → Default claude-cli.
+    const sel = document.getElementById('chat-model-select');
+    if (sel && sel.value) return _parsePickerValue(sel.value);
+    const p = localStorage.getItem('mc_chat_provider') || 'claude-cli';
+    const m = localStorage.getItem('mc_chat_model') || localStorage.getItem('mc_claude_model') || '';
+    return { provider: p, model: m };
+  }
+
+
+  async function _populateProviderPicker(sel) {
+    let providers = [];
+    try {
+      const res = await fetch('/api/llm/providers');
+      const data = await res.json();
+      providers = Array.isArray(data.providers) ? data.providers : [];
+    } catch (e) {
+      console.warn('[Chat] /api/llm/providers unreachable — using fallback picker');
+      return;
+    }
+    if (!providers.length) return;
+
+    // Options neu aufbauen pro Provider als optgroup
+    sel.innerHTML = '';
+    for (const p of providers) {
+      const og = document.createElement('optgroup');
+      og.label = _PROVIDER_LABELS[p.name] || p.name;
+      // Capability-Hints im Label (kompakt)
+      const badges = [];
+      if (!p.streams_incremental_text) badges.push('⏸ blockweise');
+      if (!p.supports_native_tools) badges.push('⚠ keine tools');
+      if (badges.length) og.label += ' · ' + badges.join(' · ');
+
+      const models = _MODEL_CANDIDATES[p.name] || [''];
+      const shortName = _PROVIDER_SHORT[p.name] || p.name;
+      for (const m of models) {
+        // Bei requires_model=true ist "" nicht erlaubt — überspringen
+        if (!m && p.requires_model) continue;
+        const opt = document.createElement('option');
+        opt.value = _encodePickerValue(p.name, m);
+        // Inline-Label mit Provider-Kurzform damit der geschlossene Picker
+        // eindeutig anzeigt, welcher Provider aktiv ist.
+        opt.textContent = shortName + ' · ' + (m || 'Auto');
+        og.appendChild(opt);
+      }
+      sel.appendChild(og);
+    }
+
+    // Gewünschten Wert setzen (aus pending oder localStorage)
+    const pending = window._pendingModelSelection;
+    if (pending) {
+      const want = _encodePickerValue(pending.provider, pending.model);
+      if (Array.from(sel.options).some(o => o.value === want)) {
+        sel.value = want;
+      } else {
+        // Fallback: selben Provider nehmen mit leerem Model, sonst erste Option
+        const fbk = _encodePickerValue(pending.provider, '');
+        sel.value = Array.from(sel.options).some(o => o.value === fbk) ? fbk : sel.options[0].value;
+      }
+      window._pendingModelSelection = null;
+    }
+    console.log('[Chat] provider picker populated:', providers.map(p => p.name).join(', '));
+  }
 
   // ── TTS Rate & Volume ──────────────────────────────────────────────────────
   function getTTSRate() {
@@ -101,12 +238,14 @@ MC.chat = (function() {
           renderSessions(_sessionList);
         }
       }
-      // Restore model selection
-      const savedModel = localStorage.getItem('mc_claude_model');
-      if (savedModel) {
-        const sel = document.getElementById('chat-model-select');
-        if (sel) sel.value = savedModel;
-      }
+      // Restore provider+model selection (Chat-Refactor 2026-04-23).
+      // Getrennt persistiert: mc_chat_provider + mc_chat_model. Legacy-Key
+      // mc_claude_model wird als model-fallback genutzt wenn kein provider gespeichert ist.
+      const savedProvider = localStorage.getItem('mc_chat_provider');
+      const savedModel = localStorage.getItem('mc_chat_model') || localStorage.getItem('mc_claude_model') || '';
+      // Picker-Befüllung erfolgt async via /api/llm/providers — Wert-Setzung wartet,
+      // bis Picker populated ist. _pendingModelSelection merkt sich den Wunsch.
+      window._pendingModelSelection = { provider: savedProvider || 'claude-cli', model: savedModel };
       // Restore sidebar state
       const sidebarOpen = localStorage.getItem(STORAGE_KEY_SIDEBAR);
       const layout = document.querySelector('.chat-layout');
@@ -180,7 +319,17 @@ MC.chat = (function() {
   }
 
   // ── Init ───────────────────────────────────────────────────────────────────
+  let _initialized = false;
+
   function init() {
+    // Guard gegen Doppel-Aufruf — sonst doppeln sich MC.ws.on()-Handler
+    // (z.B. chat.system → zwei System-Messages pro Event).
+    if (_initialized) {
+      console.log('[Chat] init() bereits gelaufen, skip');
+      return;
+    }
+    _initialized = true;
+
     const input = document.getElementById('chat-input');
     const sendBtn = document.getElementById('btn-send');
     const cancelBtn = document.getElementById('btn-cancel');
@@ -202,11 +351,80 @@ MC.chat = (function() {
     const sidebarToggleBtn = document.getElementById('btn-sidebar-toggle');
     if (sidebarToggleBtn) sidebarToggleBtn.addEventListener('click', toggleSidebar);
 
-    // Persist model selection (sonnet/opus/haiku)
+    // Provider+Model-Picker: dynamisch aus /api/llm/providers befüllen
+    // und bei Change getrennte provider/model-Keys persistieren.
     const modelSelectEl = document.getElementById('chat-model-select');
     if (modelSelectEl) {
+      _populateProviderPicker(modelSelectEl)
+        .then(() => _applyPickerLock())
+        .catch(e => console.warn('[Chat] provider picker:', e));
       modelSelectEl.addEventListener('change', () => {
-        localStorage.setItem('mc_claude_model', modelSelectEl.value);
+        const parsed = _parsePickerValue(modelSelectEl.value);
+        localStorage.setItem('mc_chat_provider', parsed.provider);
+        localStorage.setItem('mc_chat_model', parsed.model);
+        // Legacy-Key aktuell halten für alte Code-Pfade
+        localStorage.setItem('mc_claude_model', parsed.model);
+        console.log('[Chat] picker change →', parsed);
+      });
+    }
+
+    // chat.system → Als System-Message im Chat anzeigen (Provider-Switch-Hinweise etc.)
+    if (window.MC && MC.ws) {
+      MC.ws.on('chat.system', (d) => {
+        if (!d.message) return;
+        messages.push({
+          role: 'system',
+          content: d.message,
+          timestamp: new Date().toISOString(),
+          _system: true,
+        });
+        renderMessages();
+        saveToStorage();
+      });
+
+      // chat.image_generated → Bot oder Button hat ein Bild erzeugt und in die
+      // Session-History gepusht. Wir refreshen die History vom Server damit die
+      // neue Bild-Message inline im Chat erscheint.
+      // chat.compressed → Session wurde komprimiert, History neu laden
+      MC.ws.on('chat.compressed', (d) => {
+        if (!d.session_id || d.session_id !== activeSession) return;
+        // Reset local state and reload from server
+        messages = [];
+        sessionTotals = { input_tokens: 0, output_tokens: 0, cost_usd: 0, messages: 0 };
+        _lastMsgStats = null;
+        try { localStorage.removeItem('mc_chat_session_' + activeSession); } catch (_) {}
+        // Show the summary as seed message
+        if (d.summary) {
+          messages.push({
+            role: 'assistant',
+            content: d.summary,
+            timestamp: new Date().toISOformat ? new Date().toISOString() : '',
+            _compressed: true,
+          });
+        }
+        renderMessages();
+        updateTopbarStats(null, true);
+      });
+
+      MC.ws.on('chat.image_generated', (d) => {
+        if (!d.session_id || d.session_id !== activeSession) return;
+        // Direkt als Assistant-Message mit Bild-Markdown einfügen — server hat
+        // das bereits in history gepusht, aber wir wollen es sofort sichtbar.
+        const url = d.url;
+        const prompt = d.prompt || '';
+        const md = `![${prompt.slice(0, 80)}](${url})\n\n*Generiert via ${d.provider}${d.model ? ' (' + d.model + ')' : ''}*`;
+        // Nur pushen wenn Message nicht schon da ist (Dedup via URL)
+        const exists = messages.some(m => (m.content || '').includes(url));
+        if (!exists) {
+          messages.push({
+            role: 'assistant',
+            content: md,
+            timestamp: new Date().toISOString(),
+            _image_url: url,
+          });
+          renderMessages();
+          saveToStorage();
+        }
       });
     }
 
@@ -394,7 +612,9 @@ MC.chat = (function() {
         }
         const msg = 'Server wurde gerade neu gestartet. Bitte fasse kurz zusammen womit du zuletzt beschäftigt warst und führe den Task zu Ende, falls noch offen.';
         appendMessage({ role: 'user', content: msg });
-        MC.ws.send({ type: 'chat.send', session_id: activeSession, message: msg });
+        const pm = _getCurrentProviderModel();
+        MC.ws.send({ type: 'chat.send', session_id: activeSession, message: msg,
+                     provider: pm.provider, model: pm.model });
       }, 1500);
     });
 
@@ -417,7 +637,8 @@ MC.chat = (function() {
       (sessionArr || []).forEach(s => { if (s.topic && s.topic_color) _topicColors[s.topic] = s.topic_color; });
       renderSessions(sessionArr);
       // Auto-subscribe if our active session has a running stream (e.g. after reload/reconnect)
-      if (activeSession && d.active_streams && d.active_streams.includes(activeSession) && !isStreaming) {
+      const activeRunning = activeSession && d.active_streams && d.active_streams.includes(activeSession);
+      if (activeRunning && !isStreaming) {
         console.log('[Chat] Active stream detected for session', activeSession.slice(0,8), '— subscribing');
         isStreaming = true;
         _pendingSubscribeHistory = true;
@@ -432,6 +653,22 @@ MC.chat = (function() {
           renderMessages();
         }
         MC.ws.send({ type: 'chat.subscribe_stream', session_id: activeSession });
+      } else if (activeSession && !activeRunning && (isStreaming || (messages.length && messages[messages.length-1]._streaming))) {
+        // Server sagt: keine aktive Stream fuer uns. Frontend zeigt aber noch
+        // einen Spinner — passiert nach Server-Neustart wenn wir den Stuck-Stream
+        // weggepatcht haben. UI sauber zuruecksetzen + History neu laden.
+        console.log('[Chat] Stale streaming UI for', activeSession.slice(0,8), '— clearing');
+        isStreaming = false;
+        stopThinkingTimer();
+        pendingTools = [];
+        // Streaming-Platzhalter raus
+        if (messages.length && messages[messages.length-1]._streaming) {
+          messages.pop();
+        }
+        updateButtons();
+        renderMessages();
+        _initialHistoryLoaded = true;
+        MC.ws.send({ type: 'chat.load_history', session_id: activeSession });
       } else if (activeSession && !_initialHistoryLoaded) {
         // First load after page reload or reconnect — sync with server once
         _initialHistoryLoaded = true;
@@ -671,17 +908,18 @@ MC.chat = (function() {
         last.content = d.full_text || last.content;
         delete last._streaming;
         if (last.tools) last.tools.forEach(t => t.done = true);
-        if (d.duration_ms || d.input_tokens || d.cost_usd) {
-          last.stats = {
+        if (d.duration_ms || d.input_tokens || d.cost_usd || d.context_pct != null || d.context_used) {
+          last.stats = Object.assign(last.stats || {}, {
             duration_ms: d.duration_ms,
-            input_tokens: d.input_tokens || 0,
-            output_tokens: d.output_tokens || 0,
-            cost_usd: d.cost_usd,
-            context_window: d.context_window || 0,
-            context_used: d.context_used || 0,
-            context_pct: d.context_pct || 0,
-            model: d.model || '',
-          };
+            input_tokens: d.input_tokens || (last.stats?.input_tokens) || 0,
+            output_tokens: d.output_tokens || (last.stats?.output_tokens) || 0,
+            cost_usd: d.cost_usd != null ? d.cost_usd : (last.stats?.cost_usd),
+            context_window: d.context_window || (last.stats?.context_window) || 0,
+            context_used: d.context_used || (last.stats?.context_used) || 0,
+            context_pct: d.context_pct != null ? d.context_pct : (last.stats?.context_pct ?? 0),
+            model: d.model || (last.stats?.model) || '',
+            provider: d.provider || (last.stats?.provider) || '',
+          });
         }
       }
       if (last && last.stats) {
@@ -764,15 +1002,62 @@ MC.chat = (function() {
       }
     });
 
+    MC.ws.on('chat.metadata', (d) => {
+      if (d.session_id && d.session_id !== activeSession) return;
+      const last = messages[messages.length - 1];
+      if (last && last.role === 'assistant') {
+        if (!last.stats) last.stats = {};
+        last.stats.model = d.model;
+        last.stats.provider = d.provider;
+      }
+      updateTopbarStats({ model: d.model, provider: d.provider });
+    });
+
+    // chat.usage — server feuert das fuer jeden UsageEvent waehrend des Streams.
+    // Enthaelt Token-Counts + context_pct/window/used. Die Topbar bekommt das hier
+    // live mit, sonst stehen die Stats erst beim chat.done — und beim neuen
+    // _run_chat-Pfad standen sie gar nicht in chat.done drin (deswegen 0%).
+    MC.ws.on('chat.usage', (d) => {
+      if (d.session_id && d.session_id !== activeSession) return;
+      const stats = {
+        input_tokens: d.input_tokens || 0,
+        output_tokens: d.output_tokens || 0,
+        cache_creation_tokens: d.cache_creation_tokens || 0,
+        cache_read_tokens: d.cache_read_tokens || 0,
+        context_window: d.context_window || 0,
+        context_used: d.context_used || 0,
+        context_pct: d.context_pct || 0,
+      };
+      const last = messages[messages.length - 1];
+      if (last && last.role === 'assistant') {
+        last.stats = Object.assign(last.stats || {}, stats);
+      }
+      updateTopbarStats(stats);
+    });
+
+    // Direct context update — broadcast to all clients, no session filter needed.
+    MC.ws.on('context.update', (d) => {
+      if (d.context_pct != null) {
+        updateTopbarStats({ context_pct: d.context_pct, context_used: d.context_used, context_window: d.context_window });
+      }
+    });
+
     MC.ws.on('chat.error', (d) => {
       isStreaming = false;
       stopThinkingTimer();
       stopAutoSave();
       pendingTools = [];
       ttsStreamBuffer = '';
+      // Session aus dem "streaming"-Tracker entfernen, sonst bleibt serverBusy=true
+      // und sendMessage() wird stumm abgelehnt (Send-Button visuell klickbar, macht aber nichts).
+      const errSid = d && d.session_id;
+      if (errSid) {
+        _activeServerStreams = _activeServerStreams.filter(s => s !== errSid);
+      }
       updateButtons();
       messages.push({ role: 'assistant', content: `**Error:** ${d.error}`, timestamp: new Date().toISOString() });
       renderMessages();
+      renderSessions(_sessionList); // sidebar-streaming-indicator abnehmen
       saveToStorage();
     });
 
@@ -1175,6 +1460,7 @@ MC.chat = (function() {
     renderAttachmentPreviews();
     document.getElementById('btn-send').disabled = true;
 
+    updateTopbarStats(null, true);
     messages.push({ role: 'user', content: text, timestamp: new Date().toISOString(), attachments: attachmentsCopy });
     userScrolledUp = false; // Snap to bottom on send
     const scrollFab = document.getElementById('btn-scroll-bottom');
@@ -1188,7 +1474,10 @@ MC.chat = (function() {
         _activeServerStreams.push(activeSession);
         renderSessions(_sessionList); // show streaming indicator immediately
       }
-      MC.ws.send({ type: 'chat.send', session_id: activeSession, message: text || '(siehe Anhang)', attachments: filenames });
+      const pm = _getCurrentProviderModel();
+      MC.ws.send({ type: 'chat.send', session_id: activeSession,
+                   message: text || '(siehe Anhang)', attachments: filenames,
+                   provider: pm.provider, model: pm.model });
     };
 
     if (!activeSession) {
@@ -1218,8 +1507,7 @@ MC.chat = (function() {
     stopSpeaking();
     localStorage.removeItem(STORAGE_KEY);
     renderMessages();
-    const el = document.getElementById('chat-topbar-stats');
-    if (el) el.innerHTML = '';
+    updateTopbarStats(null, true);
     updateSessionBadge();
     // Open sidebar so the new session appears immediately
     const layout = document.querySelector('.chat-layout');
@@ -1377,16 +1665,48 @@ MC.chat = (function() {
     return sorted;
   }
 
+  // Per-Session Modell-Badge — gleiche Farb-/Label-Logik wie der Topbar-Badge.
+  function _sessionModelBadge(provider, model) {
+    if (!provider && !model) return '';
+    const pShort = {
+      'claude-cli': 'Claude', 'claude-api': 'Claude API',
+      'codex-cli': 'Codex', 'gemini-cli': 'Gemini', 'openai': 'OpenAI',
+    };
+    const m = (model || '').toLowerCase();
+    const c = m.includes('opus') ? '#a855f7'
+      : m.includes('sonnet') ? '#3b82f6'
+      : m.includes('haiku') ? '#22c55e'
+      : m.includes('gemini') ? '#3b82f6'
+      : (m.includes('gpt') || m.includes('codex') || m.startsWith('o3') || m.startsWith('o4')) ? '#10b981'
+      : '#6b7280';
+    const providerName = pShort[provider] || provider || '';
+    const isAuto = !model;
+    const label = isAuto ? (providerName + ' · Auto') : (providerName ? providerName + ' · ' + model : model);
+    return `<span class="session-model-badge" style="color:${c};border-color:${c}55;background:${c}14">${escapeHtml(label)}</span>`;
+  }
+
   function _sessionItemHtml(s, showTopicDot) {
+    const isMain = s.session_id === 'jarvis-main';
+    const isHeartbeat = s.session_id === 'jarvis-heartbeat';
+    const isPinned = isMain || isHeartbeat;
     const active = s.session_id === activeSession ? 'active' : '';
-    const label = escapeHtml(s.title || s.session_id.slice(0, 8));
+    const mainCls = isMain ? 'session-main' : (isHeartbeat ? 'session-heartbeat' : '');
+    const rawLabel = isMain ? 'Jarvis · Main'
+      : isHeartbeat ? 'Jarvis · Heartbeat'
+      : (s.title || s.session_id.slice(0, 8));
+    const label = escapeHtml(rawLabel);
     const time = s.last_message ? new Date(s.last_message).toLocaleTimeString('de', { hour: '2-digit', minute: '2-digit' }) : '';
-    const borderColor = s.topic_color || 'transparent';
-    const topicDot = showTopicDot && s.topic_color ? `<span class="session-topic-dot" style="background:${s.topic_color}"></span>` : '';
+    const borderColor = isMain ? '#f59e0b'
+      : isHeartbeat ? '#a78bfa'
+      : (s.topic_color || 'transparent');
+    const topicDot = !isPinned && showTopicDot && s.topic_color ? `<span class="session-topic-dot" style="background:${s.topic_color}"></span>` : '';
+    const mainBadge = isMain ? '<span class="session-main-badge" title="Interaktive Jarvis-Session — immer aktiv, kann nicht gelöscht werden">ORCHESTRATOR</span>'
+      : isHeartbeat ? '<span class="session-main-badge session-hb-badge" title="Autonome Heartbeat-Ticks — alle 30 Min, kann nicht gelöscht werden">HEARTBEAT</span>'
+      : '';
     const isStreamingNow = _activeServerStreams.includes(s.session_id);
     const isReady = _sessionReadyIndicators.has(s.session_id);
     const _lastActive = s.last_heartbeat || s.last_message;
-    const isDead = _lastActive && !isStreamingNow && (Date.now() - new Date(_lastActive).getTime()) > 300000;
+    const isDead = !isPinned && _lastActive && !isStreamingNow && (Date.now() - new Date(_lastActive).getTime()) > 300000;
     const _deadAge = isDead ? Math.round((Date.now() - new Date(_lastActive).getTime()) / 60000) : 0;
     const statusIndicator = isStreamingNow
       ? '<span class="session-streaming-dot" title="Jarvis arbeitet…"></span>'
@@ -1396,22 +1716,33 @@ MC.chat = (function() {
           ? `<span class="session-dead-dot" title="Inaktiv seit ${_deadAge} Min">&#x25CF;</span>`
           : '';
     const preview = s.last_preview ? `<div class="session-preview">${escapeHtml(s.last_preview)}</div>` : '';
-    return `<div class="session-item ${active}" data-sid="${s.session_id}" draggable="true" style="border-left-color:${borderColor}">
-      <div class="session-title" data-sid="${s.session_id}" title="Doppelklick zum Umbenennen">${topicDot}${label}${statusIndicator}</div>
+    const draggable = isPinned ? 'false' : 'true';
+    const titleAttr = isMain ? 'Jarvis Orchestrator (immer aktiv)'
+      : isHeartbeat ? 'Heartbeat-Tick-Log (immer aktiv)'
+      : 'Doppelklick zum Umbenennen';
+    const topicBtn = isPinned ? '' : `<button class="session-topic-btn" data-sid="${s.session_id}" title="Thema \u00e4ndern">\u2630</button>`;
+    const deleteBtn = isPinned ? '' : `<button class="session-delete" data-sid="${s.session_id}" title="Session loeschen">&times;</button>`;
+    const modelBadge = _sessionModelBadge(s.provider, s.model);
+    return `<div class="session-item ${active} ${mainCls}" data-sid="${s.session_id}" draggable="${draggable}" style="border-left-color:${borderColor}">
+      <div class="session-title" data-sid="${s.session_id}" title="${titleAttr}">${topicDot}${label}${statusIndicator}${mainBadge}</div>
+      ${modelBadge}
       ${preview}
       <div class="session-time">${s.message_count} msg${s.message_count !== 1 ? 's' : ''}${time ? ' \u00B7 ' + time : ''}</div>
-      <button class="session-topic-btn" data-sid="${s.session_id}" title="Thema \u00e4ndern">\u2630</button>
-      <button class="session-delete" data-sid="${s.session_id}" title="Session loeschen">&times;</button>
+      ${topicBtn}
+      ${deleteBtn}
     </div>`;
   }
 
   function _buildGroupedHtml(list, showTopicDot) {
-    const groups = _groupByTopic(list);
+    const main = list.find(s => s.session_id === 'jarvis-main');
+    const heartbeat = list.find(s => s.session_id === 'jarvis-heartbeat');
+    const rest = list.filter(s => s.session_id !== 'jarvis-main' && s.session_id !== 'jarvis-heartbeat');
+    const pinnedHtml = (main ? _sessionItemHtml(main, false) : '') + (heartbeat ? _sessionItemHtml(heartbeat, false) : '');
+    const groups = _groupByTopic(rest);
     if (groups.length === 1 && groups[0][0] === '__none__') {
-      // No topics yet — flat list
-      return list.map(s => _sessionItemHtml(s, showTopicDot)).join('');
+      return pinnedHtml + rest.map(s => _sessionItemHtml(s, showTopicDot)).join('');
     }
-    let html = '';
+    let html = pinnedHtml;
     for (const [topic, data] of groups) {
       const name = topic === '__none__' ? 'Unkategorisiert' : escapeHtml(topic);
       const color = data.color || '#64748b';
@@ -1434,6 +1765,7 @@ MC.chat = (function() {
       if (delBtn) {
         e.stopPropagation(); e.preventDefault();
         const sid = delBtn.dataset.sid;
+        if (sid === 'jarvis-main' || sid === 'jarvis-heartbeat') return;
         if (sid === activeSession) { activeSession = null; messages = []; renderMessages(); updateSessionBadge(); }
         try { localStorage.removeItem('mc_chat_session_' + sid); } catch (_) {}
         MC.ws.send({ type: 'chat.delete_session', session_id: sid });
@@ -1459,6 +1791,7 @@ MC.chat = (function() {
           updateButtons();
         }
         activeSession = item.dataset.sid;
+        _applyPickerLock();
         // Clear ready indicator when switching to this session
         _sessionReadyIndicators.delete(activeSession);
         if (_readyIndicatorTimers[activeSession]) { clearTimeout(_readyIndicatorTimers[activeSession]); delete _readyIndicatorTimers[activeSession]; }
@@ -1683,6 +2016,11 @@ MC.chat = (function() {
 
   function renderSessions(list) {
     _sessionList = list || [];
+    // Jarvis-Main-Orchestrator-Session IMMER ganz oben (Pin) — unabhängig
+    // von Sort-Modus. Sie ist die „Haupt-Bewusstseins"-Session und soll
+    // visuell als Signature-Session erkennbar sein.
+    const _pinRank = sid => sid === 'jarvis-main' ? 0 : sid === 'jarvis-heartbeat' ? 1 : 2;
+    _sessionList.sort((a, b) => _pinRank(a.session_id) - _pinRank(b.session_id));
     // Prune stale entries from _activeServerStreams — remove IDs not in the session list
     if (_sessionList.length) {
       const knownIds = new Set(_sessionList.map(s => s.session_id));
@@ -1738,12 +2076,16 @@ MC.chat = (function() {
   }
 
   function _buildRecentHtml(list, showTopicDot) {
-    const sorted = [...list].sort((a, b) => {
+    const main = list.find(s => s.session_id === 'jarvis-main');
+    const heartbeat = list.find(s => s.session_id === 'jarvis-heartbeat');
+    const rest = list.filter(s => s.session_id !== 'jarvis-main' && s.session_id !== 'jarvis-heartbeat');
+    const sorted = rest.sort((a, b) => {
       const ta = a.last_message || a.created_at || '';
       const tb = b.last_message || b.created_at || '';
       return tb.localeCompare(ta);
     });
-    return sorted.map(s => _sessionItemHtml(s, showTopicDot)).join('');
+    const pinned = (main ? _sessionItemHtml(main, false) : '') + (heartbeat ? _sessionItemHtml(heartbeat, false) : '');
+    return pinned + sorted.map(s => _sessionItemHtml(s, showTopicDot)).join('');
   }
 
   function _syncSortBtns() {
@@ -1898,32 +2240,142 @@ MC.chat = (function() {
   }
 
   // Topbar: session totals + context meter
-  function updateTopbarStats(lastMsgStats) {
+  function updateTopbarStats(lastMsgStats, reset = false) {
     const el = document.getElementById('chat-topbar-stats');
     if (!el) return;
+    
+    if (reset) _lastMsgStats = null;
+
+    // Merge with cached stats if it's a partial update
+    if (lastMsgStats) {
+      if (!_lastMsgStats) _lastMsgStats = {};
+      Object.assign(_lastMsgStats, lastMsgStats);
+    }
     const st = sessionTotals;
+    const stats = _lastMsgStats;
+    
     const totalTokens = st.input_tokens + st.output_tokens;
     const tTotal = totalTokens ? formatTokens(totalTokens) + ' tokens' : '';
     const cost = st.cost_usd ? '$' + st.cost_usd.toFixed(4) : '';
     const parts = [tTotal, cost].filter(Boolean);
     let html = '';
+    
     // Show model badge
-    if (lastMsgStats?.model) {
-      const m = lastMsgStats.model;
-      const colors = { haiku: '#22c55e', sonnet: '#3b82f6', opus: '#a855f7' };
-      const c = colors[m] || '#6b7280';
-      html += `<span class="model-badge" style="color:${c};border-color:${c}40">${m}</span>`;
+    if (stats?.model) {
+      const m = stats.model;
+      const p = stats.provider || '';
+      let display = m;
+      const pShort = { 
+        'claude-cli': 'Claude', 
+        'codex-cli': 'Codex', 
+        'gemini-cli': 'Gemini', 
+        'claude-api': 'Claude API', 
+        'openai': 'OpenAI' 
+      };
+      
+      const isGeneric = (m === '(Auto)' || m === 'default' || !m || m.toLowerCase() === 'auto');
+      const providerName = pShort[p] || p;
+
+      if (isGeneric && providerName) {
+        display = providerName + ' (Auto)';
+      } else if (providerName && !m.toLowerCase().includes(providerName.toLowerCase())) {
+        display = providerName + ' · ' + m;
+      }
+      
+      const colors = { haiku: '#22c55e', sonnet: '#3b82f6', opus: '#a855f7', gemini: '#3b82f6', codex: '#10b981' };
+      const c = colors[m.toLowerCase()] || 
+                (m.toLowerCase().includes('sonnet') ? '#3b82f6' : 
+                 m.toLowerCase().includes('opus') ? '#a855f7' : 
+                 m.toLowerCase().includes('haiku') ? '#22c55e' : 
+                 m.toLowerCase().includes('gemini') ? '#3b82f6' :
+                 m.toLowerCase().includes('gpt-4') ? '#10b981' :
+                 m.toLowerCase().includes('gpt-5') ? '#10b981' :
+                 '#6b7280');
+      html += `<span class="model-badge" style="color:${c};border-color:${c}40">${display}</span>`;
     }
     html += parts.map(p => `<span>${p}</span>`).join('');
-    if (lastMsgStats?.context_pct != null) {
-      const pct = lastMsgStats.context_pct;
+    if (stats?.context_pct != null) {
+      const pct = stats.context_pct;
       const color = pct > 90 ? '#ef4444' : pct > 70 ? '#f59e0b' : '#22c55e';
-      html += `<span class="ctx-meter" title="Context: ${formatTokens(lastMsgStats.context_used || 0)} / ${formatTokens(lastMsgStats.context_window || 0)}"><span class="ctx-bar" style="width:${Math.min(pct, 100)}%;background:${color}"></span>${pct}%</span>`;
+      html += `<span class="ctx-meter" title="Context: ${formatTokens(stats.context_used || 0)} / ${formatTokens(stats.context_window || 0)}"><span class="ctx-bar" style="width:${Math.min(pct, 100)}%;background:${color}"></span>${pct}%</span>`;
       if (pct > 90) {
         html += `<span class="ctx-warn">Neue Session empfohlen</span>`;
       }
+      _updateContextBanner(pct);
     }
+
+    // Message count — always visible
+    const msgCount = sessionTotals.messages;
+    if (msgCount > 0) {
+      const msgColor = msgCount >= 100 ? '#ef4444' : msgCount >= 80 ? '#f59e0b' : '#94a3b8';
+      html += `<span class="ctx-msg-count" style="color:${msgColor}" title="${msgCount} Nachrichten in dieser Session">${msgCount} msg</span>`;
+    }
+
+    // Compress button: >= 80 messages or context >= 75%
+    const ctxHigh = stats?.context_pct != null && stats.context_pct >= 75;
+    if (msgCount >= 80 || ctxHigh) {
+      const urgent = msgCount >= 100 || (stats?.context_pct ?? 0) >= 90;
+      html += `<button class="ctx-compress-btn${urgent ? ' ctx-compress-urgent' : ''}" onclick="MC.chat.compressSession()" title="Kontext komprimieren">⚡ Komprimieren</button>`;
+    }
+
     el.innerHTML = html;
+  }
+
+  async function compressSession() {
+    if (!activeSession) return;
+    if (isStreaming) return;
+    const btn = document.querySelector('.ctx-compress-btn');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Komprimiere...'; }
+    try {
+      const res = await fetch(`/api/chat/session/${activeSession}/compress`, { method: 'POST' });
+      const data = await res.json();
+      if (!data.ok) {
+        console.error('[Compress] Fehler:', data.error);
+        if (btn) { btn.disabled = false; btn.textContent = '⚡ Komprimieren'; }
+      }
+      // UI-Reload kommt via chat.compressed WS event
+    } catch (e) {
+      console.error('[Compress] Netzwerkfehler:', e);
+      if (btn) { btn.disabled = false; btn.textContent = '⚡ Komprimieren'; }
+    }
+  }
+
+  function sendCompact() {
+    _dismissCtxBanner();
+    const input = document.getElementById('chat-input');
+    if (!input || isStreaming) return;
+    input.value = '/compact';
+    sendMessage();
+  }
+
+  let _bannerDismissedAt = 0;
+  function _updateContextBanner(pct) {
+    const banner = document.getElementById('ctx-banner');
+    if (!banner) return;
+    // Don't re-show if dismissed within last 5 messages
+    if (_bannerDismissedAt && (sessionTotals.messages - _bannerDismissedAt) < 5) return;
+    if (pct >= 80) {
+      const isCrit = pct >= 90;
+      banner.className = isCrit ? 'ctx-banner-crit' : 'ctx-banner-warn';
+      const icon = isCrit ? '🔴' : '🟡';
+      const msg = isCrit
+        ? `${icon} Kontext ${pct}% voll — Session läuft bald über.`
+        : `${icon} Kontext ${pct}% voll — /compact empfohlen.`;
+      banner.innerHTML = `
+        <span class="ctx-banner-msg">${msg}</span>
+        <button onclick="MC.chat.sendCompact()">Jetzt komprimieren</button>
+        <button class="ctx-banner-dismiss" onclick="MC.chat._dismissCtxBanner()" title="Schließen">✕</button>
+      `;
+      banner.style.display = 'flex';
+    } else {
+      banner.style.display = 'none';
+    }
+  }
+
+  function _dismissCtxBanner() {
+    _bannerDismissedAt = sessionTotals.messages;
+    const b = document.getElementById('ctx-banner');
+    if (b) b.style.display = 'none';
   }
 
   function formatTokens(n) {
@@ -1950,6 +2402,38 @@ MC.chat = (function() {
       const sameSender = prev && prev.role === m.role;
       const streaming = (i === messages.length - 1 && m.role === 'assistant' && isStreaming);
 
+      // System-Message (Provider-Switch-Hinweis etc.): dezent, mittig, kein Avatar.
+      // Zeigt Timestamp damit historische Banner nicht wie aktuelle Events wirken.
+      if (m.role === 'system') {
+        const sysText = (m.content || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const ts = m.timestamp ? new Date(m.timestamp) : null;
+        const nowMs = Date.now();
+        const age = ts ? nowMs - ts.getTime() : 0;
+        // Jüngster Banner (< 10 s) markanter, ältere dezenter
+        const isRecent = ts && age < 10000;
+        const tsLabel = ts
+          ? (isRecent ? 'jetzt' : ts.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' }))
+          : '';
+        const bg = isRecent ? 'rgba(52,211,153,0.10)' : 'rgba(148,163,184,0.06)';
+        const border = isRecent ? 'rgba(52,211,153,0.35)' : 'rgba(148,163,184,0.15)';
+        const color = isRecent ? '#34d399' : '#64748b';
+        html += `<div class="chat-system-line" style="margin:10px auto;max-width:80%;padding:5px 12px;background:${bg};border:1px solid ${border};border-radius:14px;color:${color};font-size:11px;text-align:center;font-style:italic;display:flex;align-items:center;justify-content:center;gap:8px">`
+              + `<span>${sysText}</span>`
+              + (tsLabel ? `<span style="opacity:0.6;font-size:10px;font-style:normal">· ${tsLabel}</span>` : '')
+              + `</div>`;
+        continue;
+      }
+
+      // sameSender-Lookup: system-Messages überspringen, damit assistant→system→assistant
+      // visuell als zusammenhängender Block gerendert wird (Bubble-Clustering erhalten).
+      let prevReal = prev;
+      let j = i - 1;
+      while (prevReal && prevReal.role === 'system' && j > 0) {
+        j--;
+        prevReal = messages[j];
+      }
+      const sameSenderReal = prevReal && prevReal.role === m.role && prevReal.role !== 'system';
+
       const avatarLetter = m.role === 'assistant' ? 'J' : 'R';
       const senderName = m.role === 'assistant' ? 'Jarvis' : 'Robin';
       const time = formatTime(m.timestamp);
@@ -1959,7 +2443,7 @@ MC.chat = (function() {
       const hasContent = (m.content || '').trim().length > 0;
       const typingHtml = streaming ? `<div class="chat-thinking"><div class="chat-thinking-dots"><span></span><span></span><span></span></div><span class="chat-thinking-timer">thinking... 0s</span><button class="chat-thinking-cancel" onclick="MC.chat.cancelStream()" title="Abbrechen">Abbrechen</button></div>` : '';
       const statsHtml = (!streaming && m.role === 'assistant' && m.stats) ? renderMsgStatsHtml(m.stats) : '';
-      const showMeta = !sameSender;
+      const showMeta = !sameSenderReal;
 
       html += `<div class="chat-msg-row ${m.role}${sameSender ? '' : ' gap-top'}">
         ${showMeta ? `<div class="chat-avatar ${m.role}">${avatarLetter}</div>` : '<div class="chat-avatar-spacer"></div>'}
@@ -2153,6 +2637,7 @@ MC.chat = (function() {
            setSortMode, cancelStream: cancelMessage,
            buildGroupedHtml: _buildGroupedHtml, buildRecentHtml: _buildRecentHtml,
            showTopicMenu: _showTopicMenu,
+           sendCompact, _dismissCtxBanner,
            getSessionList: () => _sessionList,
            get isStreaming() { return isStreaming; },
            get activeSession() { return activeSession; } };

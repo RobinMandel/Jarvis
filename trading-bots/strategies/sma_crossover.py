@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SECRETS = Path("C:/Users/Robin/Jarvis/secrets")
+_STATE_DIR = Path(__file__).parent.parent / "state"
 CRED_FILES = ("alpaca-paper-cred.json", "alpaca-cred.json")
 DATA_BASE = "https://data.alpaca.markets/v2"
 
@@ -90,6 +91,25 @@ class Strategy:
 
         # Letzter SMA-Diff fuer Cross-Detection
         self._prev_diff: float | None = None
+        # Trade-Returns fuer Sortino (in-memory + State)
+        self._entry_price: float | None = None
+        self._returns: list[float] = self._load_returns()
+
+    def _load_returns(self) -> list[float]:
+        p = _STATE_DIR / f"{self.bot_id}.state.json"
+        try:
+            return json.loads(p.read_text(encoding="utf-8")).get("returns", []) if p.exists() else []
+        except Exception:
+            return []
+
+    def _persist_returns(self) -> None:
+        p = _STATE_DIR / f"{self.bot_id}.state.json"
+        try:
+            data = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+        except Exception:
+            data = {}
+        data["returns"] = self._returns
+        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def _fetch_bars(self) -> list[float]:
         """Zieh die letzten N Closes fuer self.symbol."""
@@ -164,6 +184,16 @@ class Strategy:
             "live": self.live,
             "bars": len(closes),
         }
+
+        # Trade-Return Tracking (buy→sell Roundtrip)
+        price = closes[-1]
+        if signal == "buy" and self._entry_price is None:
+            self._entry_price = price
+        elif signal == "sell" and self._entry_price is not None:
+            ret = (price - self._entry_price) / self._entry_price
+            self._returns.append(round(ret, 6))
+            self._entry_price = None
+            self._persist_returns()
 
         if signal in ("buy", "sell") and self.live:
             try:

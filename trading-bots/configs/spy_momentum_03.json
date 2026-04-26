@@ -1,0 +1,12 @@
+{
+  "strategy": "sma_crossover",
+  "params": {
+    "symbol": "SPY",
+    "qty": 1,
+    "short_window": 8,
+    "long_window": 30,
+    "timeframe": "5Min",
+    "live": false
+  },
+  "interval_sec": 300
+}

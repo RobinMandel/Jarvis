@@ -13,7 +13,8 @@ try:
 except AttributeError:
     pass
 
-VAULT_MEMORY = Path(r"C:\Users\Robin\.openclaw\workspace-clean\memory")
+# Memory liegt seit 2026-04-26 echt im Vault (vorher Junction auf .openclaw).
+VAULT_MEMORY = Path(r"E:\OneDrive\AI\Obsidian-Vault\Jarvis-Brain\Jarvis-Memory")
 VAULT_KNOWLEDGE = Path(r"E:\OneDrive\AI\Obsidian-Vault\Jarvis-Brain\Jarvis-Knowledge")
 
 

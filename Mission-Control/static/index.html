@@ -23,7 +23,8 @@
     // Apply saved font before render
     (function(){var f=localStorage.getItem('mc_font');if(f)document.documentElement.style.setProperty('--font-main',f);})();
   </script>
-  <link rel="stylesheet" href="/static/css/styles.css?v=20260418-pwa-fix4-nuke">
+  <link rel="stylesheet" href="/static/css/styles.css?v=20260425-avatar-refs">
+  <link rel="stylesheet" href="/static/css/email.css?v=20260419-v10-fullscreen">
   <style>
     /* ── iOS safe-area fix ─── */
     @media (max-width: 768px) {
@@ -385,6 +386,74 @@
       background: #22c55e;
       animation: pulse-dot 2.4s ease-in-out infinite;
     }
+
+    /* ── Stale Tasks Badge ──────────────────────────────── */
+    .stale-badge {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-family: var(--font-mono);
+      color: #f59e0b;
+      background: rgba(245,158,11,0.1);
+      border: 1px solid rgba(245,158,11,0.3);
+      border-radius: 20px;
+      padding: 4px 12px;
+      cursor: pointer;
+      user-select: none;
+      transition: background 0.2s;
+    }
+    .stale-badge:hover { background: rgba(245,158,11,0.18); }
+    .stale-badge.hidden { display: none; }
+    .stale-badge-count {
+      font-weight: 700;
+    }
+    .stale-dropdown {
+      display: none;
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 0;
+      min-width: 280px;
+      background: var(--bg-card, #1a1f2e);
+      border: 1px solid rgba(245,158,11,0.3);
+      border-radius: 10px;
+      padding: 10px 0;
+      z-index: 9999;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    }
+    .stale-dropdown.open { display: block; }
+    .stale-dropdown-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: #f59e0b;
+      padding: 2px 14px 8px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      border-bottom: 1px solid rgba(245,158,11,0.15);
+      margin-bottom: 4px;
+    }
+    .stale-item {
+      padding: 7px 14px;
+      font-size: 12px;
+      color: var(--text-secondary, #94a3b8);
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+      line-height: 1.4;
+    }
+    .stale-item:last-child { border-bottom: none; }
+    .stale-item-age {
+      font-size: 10px;
+      color: rgba(245,158,11,0.6);
+      margin-top: 2px;
+    }
+    .stale-footer {
+      padding: 8px 14px 2px;
+      font-size: 11px;
+      color: rgba(245,158,11,0.5);
+      cursor: pointer;
+      text-align: center;
+    }
+    .stale-footer:hover { color: #f59e0b; }
 
     /* ── Main Content ─────────────────────────────────────── */
     #main-content {
@@ -1022,6 +1091,104 @@
     }
     .session-item:hover .session-delete { display: flex; }
     .session-delete:hover { color: #ef4444; background: rgba(239,68,68,0.1); }
+
+    /* ── Jarvis Main (Orchestrator) — pinned, undeletable, signature look ── */
+    .session-item.session-main {
+      background: linear-gradient(135deg, rgba(245,158,11,0.10) 0%, rgba(245,158,11,0.04) 100%);
+      border-left: 3px solid #f59e0b !important;
+      box-shadow: inset 0 0 0 1px rgba(245,158,11,0.20), 0 0 12px rgba(245,158,11,0.08);
+      position: relative;
+      cursor: pointer;
+      margin-bottom: 10px;
+    }
+    .session-item.session-main::after {
+      content: '';
+      position: absolute;
+      left: 0; right: 0; bottom: -6px;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(245,158,11,0.35), transparent);
+    }
+    .session-item.session-main:hover {
+      background: linear-gradient(135deg, rgba(245,158,11,0.16) 0%, rgba(245,158,11,0.06) 100%);
+      box-shadow: inset 0 0 0 1px rgba(245,158,11,0.35), 0 0 16px rgba(245,158,11,0.18);
+    }
+    .session-item.session-main.active {
+      background: linear-gradient(135deg, rgba(245,158,11,0.22) 0%, rgba(245,158,11,0.10) 100%);
+      color: #fde68a;
+      box-shadow: inset 0 0 0 1px rgba(245,158,11,0.55), 0 0 18px rgba(245,158,11,0.25);
+    }
+    .session-item.session-main .session-title {
+      color: #fbbf24;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    .session-main-badge {
+      display: inline-block;
+      margin-left: 6px;
+      padding: 1px 6px;
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      color: #f59e0b;
+      background: rgba(245,158,11,0.12);
+      border: 1px solid rgba(245,158,11,0.35);
+      border-radius: 4px;
+      vertical-align: middle;
+      text-transform: uppercase;
+    }
+
+    /* Heartbeat-Twin: gleiche Geometrie wie session-main, aber Violet statt Gold */
+    .session-item.session-heartbeat {
+      background: linear-gradient(135deg, rgba(167,139,250,0.10) 0%, rgba(167,139,250,0.04) 100%);
+      border-left: 3px solid #a78bfa !important;
+      box-shadow: inset 0 0 0 1px rgba(167,139,250,0.20), 0 0 12px rgba(167,139,250,0.08);
+      position: relative;
+      cursor: pointer;
+      margin-bottom: 14px;
+    }
+    .session-item.session-heartbeat::after {
+      content: '';
+      position: absolute;
+      left: 0; right: 0; bottom: -8px;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(148,163,184,0.35), transparent);
+    }
+    .session-item.session-heartbeat:hover {
+      background: linear-gradient(135deg, rgba(167,139,250,0.16) 0%, rgba(167,139,250,0.06) 100%);
+      box-shadow: inset 0 0 0 1px rgba(167,139,250,0.35), 0 0 16px rgba(167,139,250,0.18);
+    }
+    .session-item.session-heartbeat.active {
+      background: linear-gradient(135deg, rgba(167,139,250,0.22) 0%, rgba(167,139,250,0.10) 100%);
+      color: #ddd6fe;
+      box-shadow: inset 0 0 0 1px rgba(167,139,250,0.55), 0 0 18px rgba(167,139,250,0.25);
+    }
+    .session-item.session-heartbeat .session-title {
+      color: #c4b5fd;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    .session-main-badge.session-hb-badge {
+      color: #a78bfa;
+      background: rgba(167,139,250,0.12);
+      border-color: rgba(167,139,250,0.35);
+    }
+
+    /* Per-Session Modell-Badge (zeigt Provider+Modell der Session, wie Topbar) */
+    .session-model-badge {
+      display: inline-block;
+      margin: 4px 0 0 0;
+      padding: 1px 7px;
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      border: 1px solid;
+      border-radius: 4px;
+      font-family: var(--font-mono, monospace);
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
 
     /* Topic button (hamburger icon) */
     .session-topic-btn {
@@ -2653,6 +2820,29 @@
       opacity: 1 !important;
       font-weight: 600;
     }
+    #ctx-banner {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      font-size: 12px;
+      border-top: 1px solid rgba(255,255,255,0.06);
+    }
+    #ctx-banner.ctx-banner-warn  { background: rgba(245,158,11,0.12); color: #f59e0b; }
+    #ctx-banner.ctx-banner-crit  { background: rgba(239,68,68,0.12);  color: #ef4444; }
+    #ctx-banner span.ctx-banner-msg { flex: 1; }
+    #ctx-banner button {
+      padding: 2px 10px;
+      border-radius: 4px;
+      border: 1px solid currentColor;
+      background: transparent;
+      color: inherit;
+      font-size: 11px;
+      cursor: pointer;
+      opacity: 0.85;
+    }
+    #ctx-banner button:hover { opacity: 1; }
+    #ctx-banner .ctx-banner-dismiss { border: none; opacity: 0.5; font-size: 14px; padding: 0 4px; }
     @keyframes toolSpin { to { transform: rotate(360deg); } }
 
     /* Rate Slider */
@@ -2824,7 +3014,7 @@
       max-width: min(720px, 92vw);
       min-width: 260px;
       padding: 10px 18px;
-      background: rgba(17,24,39,0.92);
+      background: #111827;
       color: #e5e7eb;
       border: 1px solid rgba(34,197,94,0.35);
       border-radius: 12px;
@@ -2835,8 +3025,6 @@
       opacity: 0;
       pointer-events: none;
       transition: opacity 0.18s ease, transform 0.18s ease;
-      backdrop-filter: blur(6px);
-      -webkit-backdrop-filter: blur(6px);
     }
     #vl-overlay.vl-overlay-visible {
       opacity: 1;
@@ -2856,7 +3044,7 @@
       vertical-align: middle;
     }
     #vl-overlay .vl-overlay-text { vertical-align: middle; }
-    html.light #vl-overlay { background: rgba(255,255,255,0.96); color: #111827; border-color: rgba(34,197,94,0.45); }
+    html.light #vl-overlay { background: #ffffff; color: #111827; border-color: rgba(34,197,94,0.45); }
     .vl-history-label {
       padding: 8px 14px 4px;
       font-size: 10px;
@@ -3008,6 +3196,10 @@
         Multi-Chat
         <span class="nav-badge" id="nav-badge-multichat"></span>
       </button>
+      <button class="nav-item" data-view="imagelab">
+        <svg class="nav-icon-svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10.5" r="1.5"/><path d="M21 15l-4.2-4.2a1.5 1.5 0 00-2.1 0L9 16.5"/><path d="M13 14l-1.2-1.2a1.5 1.5 0 00-2.1 0L3 19"/></svg>
+        Image Lab
+      </button>
       <button class="nav-item" data-view="diss">
         <svg class="nav-icon-svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 014 4v14a3 3 0 00-3-3H2z"/><path d="M22 3h-6a4 4 0 00-4 4v14a3 3 0 013-3h7z"/></svg>
         Dissertation
@@ -3027,6 +3219,10 @@
       <button class="nav-item" data-view="email">
         <svg class="nav-icon-svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22 6 12 13 2 6"/></svg>
         Email
+      </button>
+      <button class="nav-item" data-view="documents">
+        <svg class="nav-icon-svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+        Dokumente
       </button>
       <button class="nav-item" data-view="calendar">
         <svg class="nav-icon-svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
@@ -3066,6 +3262,11 @@
       <button class="nav-item" data-view="skills">
         <svg class="nav-icon-svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
         Skills
+      </button>
+      <button class="nav-item" data-view="heartbeat">
+        <svg class="nav-icon-svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+        Heartbeat
+        <span class="nav-badge" id="nav-badge-heartbeat"></span>
       </button>
       <button class="nav-item" data-view="transcriber">
         <svg class="nav-icon-svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/><polygon points="10 7 15 10 10 13 10 7"/></svg>
@@ -3158,6 +3359,10 @@
           <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="9" height="13" rx="2"/><rect x="13" y="3" width="9" height="13" rx="2"/><path d="M6 16v2M18 16v2M4 21h5M15 21h5"/></svg>
           <span>Multi-Chat</span>
         </button>
+        <button class="md-item" data-view="imagelab">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10.5" r="1.5"/><path d="M21 15l-4.2-4.2a1.5 1.5 0 00-2.1 0L9 16.5"/><path d="M13 14l-1.2-1.2a1.5 1.5 0 00-2.1 0L3 19"/></svg>
+          <span>Image Lab</span>
+        </button>
         <button class="md-item" data-view="bots">
           <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M9 11V7a3 3 0 016 0v4"/><circle cx="12" cy="4" r="1" fill="currentColor" stroke="none"/><line x1="9" y1="16" x2="9" y2="16" stroke-linecap="round" stroke-width="2.5"/><line x1="12" y1="16" x2="12" y2="16" stroke-linecap="round" stroke-width="2.5"/><line x1="15" y1="16" x2="15" y2="16" stroke-linecap="round" stroke-width="2.5"/></svg>
           <span>Bots</span>
@@ -3233,6 +3438,16 @@
       </div>
       <div id="vl-overlay" aria-live="polite">
         <span class="vl-overlay-label">Live</span><span class="vl-overlay-text" id="vl-overlay-text"></span>
+      </div>
+      <!-- Stale Tasks Badge -->
+      <div class="stale-badge hidden" id="staleBadge" title="Aufgegebene / hängende Aufgaben">
+        <span>&#9889;</span>
+        <span><span class="stale-badge-count" id="staleCount">0</span> hängen</span>
+        <div class="stale-dropdown" id="staleDropdown">
+          <div class="stale-dropdown-title">Hängende Aufgaben</div>
+          <div id="staleList"></div>
+          <div class="stale-footer" id="staleFooter">→ Alle Tasks öffnen</div>
+        </div>
       </div>
       <span class="gateway-badge" id="gatewayBadge">
         <span class="gw-dot"></span>
@@ -3339,6 +3554,42 @@
         </div>
       </div>
 
+      <!-- Diss-Gliederung -->
+      <div class="panel" id="diss-structure-panel">
+        <div class="panel-header">
+          <h2>&#128203; Gliederung</h2>
+          <span style="font-size:12px;color:var(--text-muted)">Kapitelstruktur &mdash; Diss &amp; Paper</span>
+        </div>
+        <div class="panel-body">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start">
+            <!-- Left: Kapitel-Liste -->
+            <div>
+              <div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Kapitel</div>
+              <div id="structure-chapter-list"></div>
+              <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap">
+                <input type="text" id="structure-new-chapter" placeholder="Neues Kapitel..."
+                  style="flex:1;min-width:140px;background:var(--surface2,#1e2535);border:1px solid var(--border,#1e2535);border-radius:4px;padding:6px 8px;color:var(--text,#e2e8f0);font-size:13px;outline:none">
+                <button id="structure-add-btn"
+                  style="padding:6px 12px;background:var(--surface2,#1e2535);border:1px solid var(--border,#1e2535);border-radius:4px;color:var(--text-muted);cursor:pointer;font-size:13px;white-space:nowrap">+ Add</button>
+                <button id="structure-save-btn"
+                  style="padding:6px 12px;background:var(--accent,#3b82f6);border:none;border-radius:4px;color:#fff;cursor:pointer;font-size:13px;white-space:nowrap">Speichern</button>
+              </div>
+              <div id="structure-save-status" style="font-size:11px;color:var(--text-muted);margin-top:6px;min-height:16px"></div>
+            </div>
+            <!-- Right: KI-Vorschlag -->
+            <div>
+              <div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">KI-Gliederungsvorschlag</div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+                <button id="structure-suggest-diss-btn" class="diss-funnel-btn" style="flex:1;min-width:120px">&#127891; Diss (DE)</button>
+                <button id="structure-suggest-paper-btn" class="diss-funnel-btn" style="flex:1;min-width:120px;background:var(--teal,#14b8a6)">&#128196; Paper (EN)</button>
+              </div>
+              <div id="structure-suggest-status" style="font-size:12px;color:var(--text-muted);margin-bottom:8px;min-height:18px"></div>
+              <div id="structure-suggest-result" style="display:none;font-size:13px;line-height:1.6;color:var(--text,#e2e8f0);background:var(--surface2,#1e2535);border-radius:6px;padding:12px;border-left:3px solid var(--accent,#3b82f6);white-space:pre-wrap;max-height:320px;overflow-y:auto"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="panel">
         <div class="panel-header"><h2>&#128202; Analyse-Fortschritt</h2></div>
         <div class="panel-body" id="diss-progress"></div>
@@ -3350,6 +3601,55 @@
       <div class="panel">
         <div class="panel-header"><h2>&#127769; Nacht-Recherche</h2></div>
         <div class="panel-body" id="diss-research"></div>
+      </div>
+
+      <!-- Prism-Analyse -->
+      <div class="panel">
+        <div class="panel-header">
+          <h2>&#128200; Prism-Analyse</h2>
+          <span style="font-size:12px;color:var(--text-muted)">CSV / Statistik &rarr; Diss-Textbaustein</span>
+        </div>
+        <div class="panel-body">
+          <select class="diss-funnel-type" id="prism-context">
+            <option value="correlation">Korrelation (ELISA + klinisch)</option>
+            <option value="group-comparison">Gruppenvergleich (AKI vs. Non-AKI)</option>
+            <option value="timecourse">Zeitverlauf (Biomarker-Kinetik)</option>
+            <option value="flow">Flow-Zytometrie (CD10 / CD16)</option>
+            <option value="custom">Freier Kontext</option>
+          </select>
+          <textarea class="diss-funnel-textarea" id="prism-custom-ctx" style="display:none;margin-top:8px;height:60px" placeholder="Kontext beschreiben..."></textarea>
+          <div style="display:flex;align-items:center;gap:8px;margin-top:8px;margin-bottom:4px;flex-wrap:wrap">
+            <label id="prism-csv-label" style="font-size:11px;padding:4px 10px;border-radius:4px;border:1px solid var(--border);background:var(--surface2);color:var(--text-muted);cursor:pointer;white-space:nowrap">
+              &#128194; CSV(s) laden
+              <input type="file" id="prism-csv-file" accept=".csv,.txt" multiple style="display:none">
+            </label>
+            <span id="prism-csv-name" style="font-size:11px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1"></span>
+            <label style="font-size:11px;color:var(--text-muted);display:flex;align-items:center;gap:4px;cursor:pointer">
+              <input type="checkbox" id="prism-auto" checked style="cursor:pointer"> Auto-Analyse
+            </label>
+          </div>
+          <textarea class="diss-funnel-textarea" id="prism-data" placeholder="Prism-CSV einfügen — oder CSV-Datei(en) oben laden — oder Rohdaten, p-Werte, Statistiken..."></textarea>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="diss-funnel-btn" id="prism-analyse-btn">Analysieren &rarr; Results-Text</button>
+            <button class="diss-funnel-btn" id="prism-figure-btn" style="background:var(--teal,#14b8a6)">&#43; Figure-Legende</button>
+          </div>
+          <div class="diss-funnel-status" id="prism-status"></div>
+          <div id="prism-result" style="display:none;margin-top:14px;padding:12px;background:var(--surface2,#1e2535);border-radius:8px;border-left:3px solid var(--accent,#3b82f6)">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+              <span style="font-size:11px;font-weight:600;color:var(--accent);text-transform:uppercase;letter-spacing:.05em">Diss-Textbaustein</span>
+              <div style="display:flex;gap:6px">
+                <button id="prism-copy-btn" style="font-size:11px;padding:3px 10px;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer">Kopieren</button>
+                <button id="prism-to-word-btn" style="font-size:11px;padding:3px 10px;border-radius:4px;border:1px solid var(--teal,#14b8a6);background:transparent;color:var(--teal,#14b8a6);cursor:pointer">&rarr; Word</button>
+              </div>
+            </div>
+            <div id="prism-result-text" style="font-size:13px;line-height:1.7;color:var(--text);white-space:pre-wrap"></div>
+          </div>
+          <!-- History -->
+          <div id="prism-history" style="margin-top:16px;display:none">
+            <div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Gespeicherte Analysen</div>
+            <div id="prism-history-list"></div>
+          </div>
+        </div>
       </div>
 
       <!-- Wissens-Trichter -->
@@ -3369,6 +3669,34 @@
           <button class="diss-funnel-btn" id="diss-ingest-btn">Ingestieren</button>
           <div class="diss-funnel-status" id="diss-ingest-status"></div>
           <div id="diss-wiki-log" style="margin-top:14px"></div>
+        </div>
+      </div>
+
+      <!-- Word Online -->
+      <div class="panel" id="diss-word-panel">
+        <div class="panel-header">
+          <h2>&#128196; Dokument (Word Online)</h2>
+          <span style="font-size:12px;color:var(--text-muted)">OneDrive-Link einbinden &mdash; Betreuer k&ouml;nnen mitlesen</span>
+        </div>
+        <div class="panel-body">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+            <input type="url" id="word-url-input" placeholder="OneDrive-Link einf&uuml;gen (Edit- oder Share-URL)..."
+              style="flex:1;min-width:200px;padding:7px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;outline:none">
+            <button id="word-url-load-btn" style="padding:7px 14px;background:var(--accent,#3b82f6);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap">Einbinden</button>
+          </div>
+          <div id="word-url-actions" style="display:none;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+            <button id="word-share-copy-btn" style="font-size:12px;padding:4px 12px;border-radius:5px;border:1px solid var(--teal,#14b8a6);background:transparent;color:var(--teal,#14b8a6);cursor:pointer">Betreuer-Link kopieren</button>
+            <a id="word-open-link" href="#" target="_blank" style="font-size:12px;padding:4px 12px;border-radius:5px;border:1px solid var(--border);color:var(--text-muted);text-decoration:none">Im Browser &ouml;ffnen &#8599;</a>
+            <span id="word-url-status" style="font-size:11px;color:var(--text-muted)"></span>
+          </div>
+          <div id="word-iframe-wrap" style="display:none;border:1px solid var(--border);border-radius:8px;overflow:hidden;background:#fff">
+            <iframe id="word-iframe" src="" width="100%" height="680" frameborder="0"
+              style="display:block" allowfullscreen></iframe>
+          </div>
+          <div id="word-placeholder" style="padding:32px;text-align:center;color:var(--text-muted);font-size:13px;border:1px dashed var(--border);border-radius:8px">
+            OneDrive-Link einf&uuml;gen, um das Dokument hier einzubinden.<br>
+            <span style="font-size:11px;opacity:.6">Tipp: Teilen &rarr; Link kopieren &rarr; hier einf&uuml;gen</span>
+          </div>
         </div>
       </div>
 
@@ -3416,61 +3744,103 @@
             </div>
           </div>
         </div>
-        <div class="diss-live-badge" style="background:#a78bfa20;color:#a78bfa;border-color:#a78bfa40">
-          <span class="diss-live-dot" style="background:#a78bfa"></span> Medizin
+        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px">
+          <div class="diss-live-badge" style="background:#a78bfa20;color:#a78bfa;border-color:#a78bfa40">
+            <span class="diss-live-dot" style="background:#a78bfa"></span> Medizin
+          </div>
+          <div id="dlr-amboss-status-chip"></div>
+          <div id="dlr-thieme-status-chip"></div>
+          <a href="/static/card-mockup.html" target="_blank"
+             style="display:inline-flex;align-items:center;gap:5px;padding:4px 10px;
+                    border-radius:6px;background:#a78bfa20;border:1px solid #a78bfa40;
+                    color:#a78bfa;font-size:12px;text-decoration:none;cursor:pointer;
+                    transition:background .15s"
+             onmouseover="this.style.background='#a78bfa30'"
+             onmouseout="this.style.background='#a78bfa20'">
+            🎨 Karten-Design
+          </a>
         </div>
       </div>
 
-      <!-- Wissens-Trichter -->
+      <!-- Material hochladen (EINE Upload-Zone mit Bild-Extraktion) -->
       <div class="panel">
         <div class="panel-header">
-          <h2>📥 Wissens-Trichter</h2>
-          <span style="font-size:12px;color:var(--text-muted)" id="med-log-count"></span>
+          <h2>📥 Material hochladen</h2>
+          <span style="font-size:12px;color:var(--text-muted)">PDF · PPT · GoodNotes · Anki (.apkg) · Bilder</span>
         </div>
         <div class="panel-body">
-          <div id="med-dropzone" style="border:2px dashed var(--border-medium);border-radius:8px;padding:18px;text-align:center;color:var(--text-muted);font-size:13px;margin-bottom:12px;cursor:default;transition:border-color .15s,background .15s">
-            Dateien hier hinziehen (PDF, GoodNotes-Export, Bilder) — oder Text unten einfügen
+          <div id="dlr-dropzone"
+               style="border:2px dashed var(--border-medium);border-radius:8px;padding:32px;text-align:center;
+                      color:var(--text-muted);font-size:13px;margin-bottom:12px;cursor:pointer;
+                      transition:border-color .15s,background .15s">
+            Folien, PDFs, GoodNotes, Screenshots hier hinziehen — oder klicken zum Auswählen
           </div>
-          <input type="text" id="med-ingest-title" style="width:100%;box-sizing:border-box;background:var(--surface1,#151f32);border:1px solid var(--border-subtle,#1e2d45);border-radius:6px;padding:8px 12px;color:var(--text,#e2e8f0);font-size:13px;margin-bottom:8px" placeholder="Titel / Thema (z. B. Herzinsuffizienz Folie 3)">
-          <select class="diss-funnel-type" id="med-ingest-type">
-            <option value="vorlesung">Vorlesung / Folie</option>
-            <option value="goodnotes">GoodNotes PDF</option>
-            <option value="notizen">Eigene Notizen</option>
-            <option value="kommilitone">Notizen Kommilitone</option>
-            <option value="skript">Skript</option>
-            <option value="paper">Paper / Abstract</option>
-            <option value="sonstiges">Sonstiges</option>
-          </select>
-          <textarea class="diss-funnel-textarea" id="med-ingest-text" placeholder="Text, Notizen, Transkripte einfügen — Jarvis analysiert, extrahiert Kernpunkte und speichert im Obsidian-Vault (Jarvis-Brain/Medizin/)..."></textarea>
+          <input type="file" id="dlr-file-input" multiple
+                 accept=".pdf,.pptx,.ppt,.png,.jpg,.jpeg,.gif,.md,.txt,.apkg" style="display:none">
+
+          <!-- Amboss-Screenshot Schnell-Drop -->
+          <div id="dlr-amboss-dropzone"
+               style="border:2px dashed #16a34a;border-radius:8px;padding:14px 20px;
+                      display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px;
+                      color:#4ade80;font-size:12px;transition:border-color .15s,background .15s">
+            <span style="font-size:18px">🟢</span>
+            <span><strong>Amboss-Screenshots</strong> hier droppen — Provider &amp; Typ werden automatisch gesetzt</span>
+          </div>
+          <input type="file" id="dlr-amboss-file-input" multiple
+                 accept=".png,.jpg,.jpeg,.gif,.webp" style="display:none">
+
+          <div id="dlr-file-list" style="margin-bottom:10px"></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
+            <input type="text" id="dlr-subject"
+                   placeholder="Fach (z.B. Pharmakologie)"
+                   style="flex:1;min-width:140px;background:var(--surface1,#151f32);border:1px solid var(--border-subtle,#1e2d45);border-radius:6px;padding:8px 12px;color:var(--text,#e2e8f0);font-size:13px">
+            <select id="dlr-type"
+                    style="background:var(--surface1,#151f32);border:1px solid var(--border-subtle,#1e2d45);border-radius:6px;padding:8px 12px;color:var(--text,#e2e8f0);font-size:13px">
+              <option value="vorlesung">Vorlesung</option>
+              <option value="seminar">Seminar</option>
+              <option value="goodnotes">GoodNotes</option>
+              <option value="anki">Anki</option>
+              <option value="screenshot">Screenshot</option>
+              <option value="sonstiges">Sonstiges</option>
+            </select>
+            <select id="dlr-provider"
+                    title="Quelle der Dateien"
+                    style="background:var(--surface1,#151f32);border:1px solid var(--border-subtle,#1e2d45);border-radius:6px;padding:8px 12px;color:var(--text,#e2e8f0);font-size:13px">
+              <option value="folie">📄 Folie</option>
+              <option value="amboss">🟢 Amboss</option>
+              <option value="thieme">🔵 Thieme</option>
+            </select>
+            <input type="text" id="dlr-topics"
+                   placeholder="Wichtige Themen (kommagetrennt, optional)"
+                   style="flex:2;min-width:180px;background:var(--surface1,#151f32);border:1px solid var(--border-subtle,#1e2d45);border-radius:6px;padding:8px 12px;color:var(--text,#e2e8f0);font-size:13px">
+          </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
-            <button class="diss-funnel-btn" id="med-ingest-btn" style="background:#a78bfa">Ingestieren</button>
-            <button class="diss-funnel-btn" id="med-anki-btn" style="background:#d8b36a;color:#111" title="Claude analysiert den Text und erstellt Anki-Karten via AnkiConnect">🎴 Anki-Karten erzeugen</button>
-            <input type="text" id="med-anki-deck" value="Medizin::Sem8::Auto" style="flex:1;min-width:180px;background:var(--surface1,#151f32);border:1px solid var(--border-subtle,#1e2d45);border-radius:6px;padding:6px 10px;color:var(--text,#e2e8f0);font-size:12px" placeholder="Deck (z.B. Medizin::Sem8::Auto)">
+            <button class="diss-funnel-btn" id="dlr-upload-btn"
+                    style="background:#a78bfa;color:#0f172a">
+              Hochladen &amp; Ingestieren
+            </button>
           </div>
-          <div class="diss-funnel-status" id="med-ingest-status"></div>
+          <div id="dlr-status" style="margin-top:10px;font-size:12px;color:var(--text-muted)"></div>
         </div>
       </div>
 
-      <!-- Lernplan-Generator -->
+      <!-- Karten generieren (amkiphil-Style mit Bildern) -->
+      <div id="dlr-generate-section"></div>
+
+      <!-- Amboss-Login (nur sichtbar wenn kein Token gecacht) -->
+      <div id="dlr-amboss-login-panel"></div>
+
+      <!-- Thieme-Login (nur sichtbar wenn keine Cookies gecacht) -->
+      <div id="dlr-thieme-login-panel"></div>
+
+      <!-- Frühere Anki-Decks: alle generierten Decks aus learn_history.json -->
       <div class="panel">
         <div class="panel-header">
-          <h2>🗓️ Lernplan-Generator <span style="font-size:11px;color:var(--text-muted);font-weight:400;margin-left:8px">Spaced Repetition → iCloud</span></h2>
+          <h2>📦 Frühere Anki-Decks</h2>
+          <span style="font-size:12px;color:var(--text-muted)">Vorschau im Browser · .apkg jederzeit neu herunterladen</span>
         </div>
         <div class="panel-body">
-          <div style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:8px;margin-bottom:8px">
-            <input type="text" id="lp-topic" placeholder="Thema (z.B. Kardiologie — Herzinsuffizienz)" style="background:var(--surface1,#151f32);border:1px solid var(--border-subtle,#1e2d45);border-radius:6px;padding:8px 12px;color:var(--text,#e2e8f0);font-size:13px">
-            <input type="date" id="lp-exam" style="background:var(--surface1,#151f32);border:1px solid var(--border-subtle,#1e2d45);border-radius:6px;padding:8px 12px;color:var(--text,#e2e8f0);font-size:13px" title="Prüfungsdatum">
-            <input type="time" id="lp-time" value="18:00" style="background:var(--surface1,#151f32);border:1px solid var(--border-subtle,#1e2d45);border-radius:6px;padding:8px 12px;color:var(--text,#e2e8f0);font-size:13px" title="Uhrzeit der Sessions">
-          </div>
-          <input type="text" id="lp-subtopics" placeholder="Subthemen, Komma-getrennt (optional, z.B. Patho, Diagnostik, Therapie)" style="width:100%;box-sizing:border-box;background:var(--surface1,#151f32);border:1px solid var(--border-subtle,#1e2d45);border-radius:6px;padding:8px 12px;color:var(--text,#e2e8f0);font-size:13px;margin-bottom:8px">
-          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-            <input type="number" id="lp-duration" value="45" min="15" max="180" style="width:80px;background:var(--surface1,#151f32);border:1px solid var(--border-subtle,#1e2d45);border-radius:6px;padding:6px 10px;color:var(--text,#e2e8f0);font-size:12px" title="Dauer in Minuten">
-            <input type="text" id="lp-calendar" value="Kalender" style="width:140px;background:var(--surface1,#151f32);border:1px solid var(--border-subtle,#1e2d45);border-radius:6px;padding:6px 10px;color:var(--text,#e2e8f0);font-size:12px" title="iCloud-Kalender-Name">
-            <button class="diss-funnel-btn" id="lp-preview-btn" style="background:#475569">👁️ Vorschau</button>
-            <button class="diss-funnel-btn" id="lp-create-btn" style="background:#a78bfa">📅 In Kalender schreiben</button>
-          </div>
-          <div id="lp-status" style="margin-top:10px;font-size:12px;color:var(--text-muted)"></div>
-          <div id="lp-preview" style="margin-top:10px;font-size:12px;font-family:var(--font-mono,monospace);background:var(--surface1,#151f32);border:1px solid var(--border-subtle,#1e2d45);border-radius:6px;padding:10px;max-height:280px;overflow-y:auto;white-space:pre-wrap;display:none"></div>
+          <div id="dlr-deck-history" style="font-size:13px"></div>
         </div>
       </div>
 
@@ -3482,6 +3852,16 @@
         </div>
         <div class="panel-body">
           <div id="med-log" style="max-height:360px;overflow-y:auto"></div>
+        </div>
+      </div>
+
+      <!-- Ingestiertes Material (aus Upload-Zone) -->
+      <div class="panel">
+        <div class="panel-header">
+          <h2>📦 Ingestiertes Material</h2>
+        </div>
+        <div class="panel-body">
+          <div id="dlr-log" style="max-height:320px;overflow-y:auto"></div>
         </div>
       </div>
 
@@ -3501,6 +3881,8 @@
       </div>
 
     </div>
+
+    <!-- Lernraum + DeltaLernraum: gelöscht, alles jetzt im Medizin-Tab. -->
 
     <!-- Trading View -->
     <div id="view-trading" class="view">
@@ -3591,6 +3973,23 @@
           </div>
         </div>
       </div>
+
+      <!-- Trading Bots Section -->
+      <div class="trading-bots-section">
+        <div class="panel" style="margin:0">
+          <div class="panel-header" style="display:flex;align-items:center;gap:8px">
+            <h2>Trading Bots</h2>
+            <span id="trading-bots-count" style="font-size:11px;color:var(--text-muted);background:var(--bg-tertiary);padding:2px 8px;border-radius:10px">—</span>
+            <span style="margin-left:auto;display:flex;gap:6px">
+              <button onclick="window.loadTradingBots&&loadTradingBots()" class="btn-icon" title="Bots neu laden">&#8635;</button>
+              <button onclick="window.showCreateBotModal&&showCreateBotModal()" style="background:rgba(34,197,94,0.12);border:1px solid rgba(34,197,94,0.3);color:#22c55e;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;font-weight:600;">+ Neuer Bot</button>
+            </span>
+          </div>
+          <div class="panel-body" style="padding:12px">
+            <div id="trading-bots-list" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px"></div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- Chat View -->
@@ -3621,12 +4020,48 @@
               <button id="btn-sidebar-toggle" class="btn-sidebar-toggle" title="Sessions">
                 <svg width="15" height="15" viewBox="0 0 15 15" fill="none"><rect x="1" y="1" width="5" height="13" rx="1.2" fill="currentColor" opacity=".5"/><rect x="8" y="4" width="6" height="1.5" rx=".75" fill="currentColor"/><rect x="8" y="7" width="6" height="1.5" rx=".75" fill="currentColor"/><rect x="8" y="10" width="4" height="1.5" rx=".75" fill="currentColor"/></svg>
               </button>
-              <select id="chat-model-select" class="chat-model-select">
-                <option value="sonnet">Sonnet</option>
-                <option value="opus">Opus</option>
-                <option value="haiku">Haiku</option>
+              <!-- Provider+Model-Picker (Chat-Refactor 2026-04-23).
+                   Visuell kombiniert, im State und im WS-Payload getrennt.
+                   Optionen werden beim Init dynamisch aus /api/llm/providers
+                   befüllt; der statische Fallback unten greift nur wenn der
+                   Endpoint unerreichbar ist. Value-Encoding: "provider||model"
+                   (doppel-Pipe, damit Modellnamen mit "/" sicher sind). -->
+              <select id="chat-model-select" class="chat-model-select" title="LLM Provider + Model">
+                <optgroup label="Claude (CLI)">
+                  <option value="claude-cli||">Auto (Default)</option>
+                  <option value="claude-cli||sonnet">Sonnet</option>
+                  <option value="claude-cli||opus">Opus</option>
+                  <option value="claude-cli||haiku">Haiku</option>
+                </optgroup>
               </select>
-              <button id="btn-model-toggle" onclick="window.MC&&MC.chat&&MC.chat.toggleModel()" style="font-size:12px;font-weight:500;padding:5px 10px;border-radius:10px;border:1px solid rgba(167,139,250,0.3);background:rgba(167,139,250,0.08);color:#a78bfa;cursor:pointer;font-family:var(--font-main);">⚡ Gemini</button>
+              <!-- Vault-Context-Picker (Geminis #2). Popover mit Checkboxes für
+                   VAULT_CONTEXT_BUNDLES. Aktive Bundles werden als Badge angezeigt. -->
+              <div id="vault-context-wrap" style="position:relative;display:inline-block">
+                <button id="btn-vault-context" class="chat-model-select"
+                        style="cursor:pointer;padding:5px 10px;font-size:12px;white-space:nowrap"
+                        title="Vault-Bereiche als Kontext mitschicken">
+                  📁 <span id="vault-context-label">kein Context</span>
+                </button>
+                <div id="vault-context-popup"
+                     style="display:none;position:absolute;top:calc(100% + 4px);left:0;z-index:1000;
+                            min-width:260px;padding:10px;background:var(--bg-secondary,#0a0c12);
+                            border:1px solid var(--border-subtle,rgba(255,255,255,.1));
+                            border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.4)">
+                  <div style="font-size:11px;color:#94a3b8;margin-bottom:8px;font-weight:700;letter-spacing:.05em;text-transform:uppercase">Vault-Kontext</div>
+                  <div id="vault-bundles-list" style="display:flex;flex-direction:column;gap:5px"></div>
+                  <div style="display:flex;gap:6px;margin-top:10px">
+                    <button id="btn-vault-apply" style="flex:1;padding:6px 10px;background:#a78bfa;color:#0f172a;border:none;border-radius:5px;font-size:12px;font-weight:700;cursor:pointer">Anwenden</button>
+                    <button id="btn-vault-clear" style="padding:6px 10px;background:transparent;color:#94a3b8;border:1px solid rgba(255,255,255,.1);border-radius:5px;font-size:12px;cursor:pointer">×</button>
+                  </div>
+                </div>
+              </div>
+              <!-- Medical-Agent Quick-Button (Geminis #3). Öffnet Modal für
+                   Amboss+ViaMedici+Vault-synthesierte Fachantworten. -->
+              <button id="btn-medical-agent" class="chat-model-select"
+                      style="cursor:pointer;padding:5px 10px;font-size:12px;white-space:nowrap"
+                      title="Medical Reasoning: kombiniert Amboss + Thieme + Vault">
+                🩺 Med
+              </button>
               <select id="chat-voice-select" class="chat-model-select" style="display:none">
                 <option value="seraphina">Seraphina (Sweet)</option>
                 <option value="amala">Amala (Warm)</option>
@@ -3684,6 +4119,8 @@
           </div>
           <!-- Fallback Banner (inline, no separate row) -->
           <div id="fallback-banner" style="display:none;background:#7c3aed;color:#fff;font-size:11px;padding:2px 8px;text-align:center;"></div>
+          <!-- Context Warning Banner -->
+          <div id="ctx-banner" style="display:none"></div>
           <!-- Input Section -->
           <div class="chat-input-section">
             <div class="chat-attachments" id="chat-attachments"></div>
@@ -3936,30 +4373,28 @@
       </div>
     </div>
 
-    <!-- Email View -->
+    <!-- Email View (v2 — 3-Pane, mehrere Konten, Ordnerbaum, lokaler Cache) -->
     <div id="view-email" class="view">
-      <div class="panel">
+      <div class="panel email-panel-v2">
         <div class="panel-header">
           <h2>Email</h2>
           <div style="display:flex;gap:8px;align-items:center">
-            <button class="btn-icon" id="btn-compose-email" title="Neue Mail">&#9993;</button>
-            <button class="btn-icon" id="btn-refresh-email" title="Aktualisieren">&#8635;</button>
+            <span id="email-sync-status" style="color:var(--text-muted);font-size:12px"></span>
+            <button class="btn-icon" id="btn-email-sync-all" title="Alle Konten synchronisieren">&#8635;</button>
           </div>
         </div>
-        <div id="email-compose" style="display:none;padding:12px 16px;border-bottom:1px solid var(--border);background:var(--bg-subtle)">
-          <div style="display:grid;gap:8px">
-            <input id="compose-to" type="text" placeholder="An (kommagetrennt)" style="width:100%;padding:6px 8px" />
-            <input id="compose-subject" type="text" placeholder="Betreff" style="width:100%;padding:6px 8px" />
-            <textarea id="compose-body" rows="8" placeholder="Nachricht..." style="width:100%;padding:6px 8px;font-family:inherit"></textarea>
-            <div style="display:flex;gap:8px;align-items:center">
-              <button id="btn-send-email" class="btn-primary">Senden</button>
-              <button id="btn-cancel-email">Abbrechen</button>
-              <span id="compose-status" style="color:var(--text-muted);font-size:12px"></span>
-            </div>
-          </div>
-        </div>
-        <div class="panel-body" id="email-panel">
-          <div class="empty-state">Lade Emails...</div>
+        <div id="email-v2-root" class="email-v2-root">
+          <!-- left: account + folder tree -->
+          <aside class="email-v2-tree"><div class="empty-state">Lade …</div></aside>
+          <!-- middle: message list -->
+          <section class="email-v2-list">
+            <div class="email-v2-list-header"><span id="email-list-title">Ordner wählen</span></div>
+            <div class="email-v2-list-body"><div class="empty-state">Wähle links einen Ordner</div></div>
+          </section>
+          <!-- right: message detail + reply chat (reply chat = Phase 2) -->
+          <section class="email-v2-detail">
+            <div class="empty-state">Wähle eine Mail</div>
+          </section>
         </div>
       </div>
     </div>
@@ -3999,6 +4434,7 @@
 
     <!-- Tanzania View -->
     <div id="view-tanzania" class="view"></div>
+    <div id="view-documents" class="view"></div>
 
     <!-- Graph View (merged into Memory → Brain) -->
     <div id="view-graph" class="view">
@@ -4089,6 +4525,84 @@
         </div>
         <!-- Room View -->
         <div id="arena-room-view" style="flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;"></div>
+      </div>
+    </div>
+
+    <!-- ── Heartbeat / Jarvis-Main-Orchestrator ────────────────── -->
+    <div id="view-heartbeat" class="view">
+      <div style="padding:20px;max-width:1100px;margin:0 auto;display:flex;flex-direction:column;gap:18px">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+          <div>
+            <h1 style="margin:0;font-size:22px;font-weight:700;color:var(--text-primary,#e2e8f0)">💓 Heartbeat</h1>
+            <div style="font-size:12px;color:#94a3b8;margin-top:4px">Autonomer Jarvis-Main-Orchestrator · wacht alle N Minuten auf</div>
+          </div>
+          <div style="display:flex;gap:8px">
+            <button id="hb-trigger-btn" style="padding:7px 14px;background:#a78bfa;color:#0f172a;border:none;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer">▶ Jetzt triggern</button>
+            <button id="hb-refresh-btn" style="padding:7px 14px;background:transparent;color:#94a3b8;border:1px solid rgba(255,255,255,.1);border-radius:6px;font-size:12px;cursor:pointer">↻</button>
+          </div>
+        </div>
+
+        <!-- Status + Settings Grid -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px" id="hb-grid">
+          <!-- Live-Status -->
+          <div class="panel" style="padding:14px;background:var(--bg-secondary,#0a0c12);border:1px solid rgba(255,255,255,.06);border-radius:10px">
+            <h2 style="margin:0 0 10px;font-size:13px;font-weight:700;color:#cbd5e1;letter-spacing:.05em;text-transform:uppercase">Status</h2>
+            <div id="hb-status-content" style="font-size:12px;color:#94a3b8;line-height:1.7">Lädt…</div>
+          </div>
+          <!-- Settings -->
+          <div class="panel" style="padding:14px;background:var(--bg-secondary,#0a0c12);border:1px solid rgba(255,255,255,.06);border-radius:10px">
+            <h2 style="margin:0 0 10px;font-size:13px;font-weight:700;color:#cbd5e1;letter-spacing:.05em;text-transform:uppercase">Einstellungen</h2>
+            <div style="display:flex;flex-direction:column;gap:10px;font-size:12px;color:#cbd5e1">
+              <label style="display:flex;align-items:center;gap:8px">
+                <input type="checkbox" id="hb-enabled" />
+                <span>Heartbeat aktiv</span>
+              </label>
+              <div>
+                <label style="color:#94a3b8;font-size:11px">Intervall (Minuten)</label>
+                <input type="number" id="hb-interval" min="1" max="1440" style="width:100%;padding:5px 8px;background:#070a13;border:1px solid rgba(255,255,255,.08);border-radius:5px;color:#e2e8f0;font-size:12px;margin-top:3px" />
+              </div>
+              <div>
+                <label style="color:#94a3b8;font-size:11px">Autonomy</label>
+                <select id="hb-autonomy" style="width:100%;padding:5px 8px;background:#070a13;border:1px solid rgba(255,255,255,.08);border-radius:5px;color:#e2e8f0;font-size:12px;margin-top:3px">
+                  <option value="read-only">read-only (nur lesen + loggen)</option>
+                  <option value="notify">notify (+ Push senden)</option>
+                  <option value="high">high (+ Files/Memory/Skills ändern)</option>
+                </select>
+              </div>
+              <div style="display:flex;gap:8px">
+                <div style="flex:1">
+                  <label style="color:#94a3b8;font-size:11px">Provider</label>
+                  <input type="text" id="hb-provider" style="width:100%;padding:5px 8px;background:#070a13;border:1px solid rgba(255,255,255,.08);border-radius:5px;color:#e2e8f0;font-size:12px;margin-top:3px" placeholder="claude-cli" />
+                </div>
+                <div style="flex:1">
+                  <label style="color:#94a3b8;font-size:11px">Model</label>
+                  <input type="text" id="hb-model" style="width:100%;padding:5px 8px;background:#070a13;border:1px solid rgba(255,255,255,.08);border-radius:5px;color:#e2e8f0;font-size:12px;margin-top:3px" placeholder="sonnet" />
+                </div>
+              </div>
+              <label style="display:flex;align-items:center;gap:8px">
+                <input type="checkbox" id="hb-push-enabled" />
+                <span>Push-Notifications erlaubt</span>
+              </label>
+              <button id="hb-save-btn" style="padding:7px 14px;background:#16a34a;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;margin-top:4px">Speichern</button>
+              <div id="hb-save-msg" style="font-size:11px;color:#64748b;min-height:14px"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Cron-Jobs -->
+        <div class="panel" style="padding:14px;background:var(--bg-secondary,#0a0c12);border:1px solid rgba(255,255,255,.06);border-radius:10px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+            <h2 style="margin:0;font-size:13px;font-weight:700;color:#cbd5e1;letter-spacing:.05em;text-transform:uppercase">Cron-Jobs</h2>
+            <button id="hb-cron-add" style="padding:4px 10px;background:#a78bfa18;color:#a78bfa;border:1px solid #a78bfa44;border-radius:5px;font-size:11px;cursor:pointer">+ Neu</button>
+          </div>
+          <div id="hb-cron-list" style="display:flex;flex-direction:column;gap:8px"></div>
+        </div>
+
+        <!-- Tick History -->
+        <div class="panel" style="padding:14px;background:var(--bg-secondary,#0a0c12);border:1px solid rgba(255,255,255,.06);border-radius:10px">
+          <h2 style="margin:0 0 10px;font-size:13px;font-weight:700;color:#cbd5e1;letter-spacing:.05em;text-transform:uppercase">Letzte Ticks</h2>
+          <div id="hb-history" style="display:flex;flex-direction:column;gap:8px;font-size:12px;color:#cbd5e1">Keine Ticks bisher.</div>
+        </div>
       </div>
     </div>
 
@@ -4222,6 +4736,244 @@
           </div>
           <div id="tr-history-list" style="flex:1;overflow-y:auto;padding:6px 16px 10px;display:flex;flex-direction:column;gap:6px;">
             <span style="color:var(--text-muted);font-size:12px;">Noch keine Transkriptionen gespeichert.</span>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Image Lab View — Nano Banana Studio (1:1 Port vom alten OpenClaw MC) -->
+    <div id="view-imagelab" class="view">
+      <div class="nbs-app">
+
+        <!-- HEADER -->
+        <header class="nbs-header">
+          <div class="nbs-header-left">
+            <div class="nbs-logo">
+              <div class="nbs-logo-icon">🍌</div>
+              <div>
+                <div class="nbs-logo-text">Nano <span>Banana</span> Studio</div>
+                <div class="nbs-logo-sub">Powered by Gemini Image Generation</div>
+              </div>
+            </div>
+            <div class="nbs-header-divider"></div>
+            <span id="image-lab-provider-chip" class="nbs-provider-chip">Provider …</span>
+          </div>
+          <div class="nbs-stats-counter">
+            <div id="image-lab-cost-widget" class="nbs-cost-group" style="display:none;">
+              <div class="nbs-stat-pill">
+                <span class="nbs-stat-pill-icon">📅</span>
+                <span id="image-lab-cost-month">–</span>
+                <span class="nbs-stat-pill-label">Monat</span>
+              </div>
+              <div class="nbs-stat-pill nbs-pill-today">
+                <span class="nbs-stat-pill-icon">☀️</span>
+                <span id="image-lab-cost-today">–</span>
+                <span class="nbs-stat-pill-label">Heute</span>
+              </div>
+              <div class="nbs-stat-pill nbs-pill-next">
+                <span class="nbs-stat-pill-icon">⚡</span>
+                <span id="image-lab-cost-next">–</span>
+                <span class="nbs-stat-pill-label">nächstes</span>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <!-- MAIN: 2-panel grid -->
+        <div class="nbs-main">
+
+          <!-- LEFT: GENERATION PANEL -->
+          <div class="nbs-gen-panel">
+
+            <!-- Prompt Card -->
+            <div class="nbs-glass-card">
+              <div class="nbs-section-label">Dein Prompt</div>
+              <div class="nbs-prompt-wrap">
+                <textarea
+                  id="image-lab-prompt"
+                  class="nbs-prompt-textarea"
+                  placeholder="Beschreib dein Bild… z.B. 'Cinematic Portrait eines futuristischen Arztes in neon-beleuchtetem Tokio'"
+                  maxlength="1000"
+                ></textarea>
+                <div class="nbs-prompt-char-count"><span id="nbs-char-count">0</span>/1000</div>
+              </div>
+
+              <!-- Preset Chips — schreiben ins Prompt-Feld -->
+              <div style="margin-top:12px;">
+                <div class="nbs-section-label">Quick Prompts</div>
+                <div class="nbs-preset-chips">
+                  <div class="nbs-chip" data-preset="Cinematic Portrait einer Person, dramatisches Licht, 8K Fotografie, ultra realistisch">🎬 Cinematic</div>
+                  <div class="nbs-chip" data-preset="Abstract digital art, vibrant colors, flowing shapes, professional artwork, trending on artstation">🎨 Abstract</div>
+                  <div class="nbs-chip" data-preset="Detailed medical illustration, anatomical diagram, professional scientific artwork, clean white background">🫀 Medizin</div>
+                  <div class="nbs-chip" data-preset="Dark fantasy landscape, gothic architecture, dramatic storm clouds, epic scale, concept art, dark and moody">🌑 Dark Fantasy</div>
+                  <div class="nbs-chip" data-preset="Sci-fi landscape, alien planet, bioluminescent flora, twin moons, epic vista, cinematic composition">🚀 Sci-Fi</div>
+                  <div class="nbs-chip" data-preset="Watercolor painting, soft pastel colors, loose brushstrokes, artistic, serene nature scene">🖌️ Watercolor</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Model Card -->
+            <div class="nbs-glass-card" id="image-lab-model-wrap" style="display:none;">
+              <div class="nbs-section-label">Modell</div>
+              <div class="nbs-resolution-toggle" id="nbs-model-toggle"></div>
+              <!-- Hidden select für Backend-Kompatibilität -->
+              <select id="image-lab-model" style="display:none;"></select>
+              <div id="nbs-model-desc" class="nbs-res-desc">–</div>
+            </div>
+
+            <!-- Format Card -->
+            <div class="nbs-glass-card">
+              <div class="nbs-section-label">Format</div>
+              <div class="nbs-resolution-toggle" id="nbs-format-toggle">
+                <button type="button" class="nbs-res-btn active" data-value="1024x1024">1:1</button>
+                <button type="button" class="nbs-res-btn" data-value="1024x1792">9:16</button>
+                <button type="button" class="nbs-res-btn" data-value="1792x1024">16:9</button>
+              </div>
+              <select id="image-lab-size" style="display:none;">
+                <option value="1024x1024">1024x1024</option>
+                <option value="1024x1792">1024x1792</option>
+                <option value="1792x1024">1792x1024</option>
+              </select>
+              <div class="nbs-res-desc">Quadrat 1:1 · 1024×1024</div>
+            </div>
+
+            <!-- Provider + Style Card (kompakt) -->
+            <div class="nbs-glass-card">
+              <div class="nbs-section-label">Provider &amp; Stil</div>
+              <div class="nbs-inline-selects">
+                <label>
+                  <span>Provider</span>
+                  <select id="image-lab-provider"></select>
+                </label>
+                <label>
+                  <span>Stil</span>
+                  <select id="image-lab-style">
+                    <option value="">Pur</option>
+                    <option value="medical">Medizinisch</option>
+                    <option value="diagram">Diagramm</option>
+                    <option value="product">Produkt-Mockup</option>
+                    <option value="cinematic">Cinematic</option>
+                  </select>
+                </label>
+              </div>
+              <div class="nbs-toggles-row">
+                <label class="nbs-check"><input id="image-lab-free-first" type="checkbox" checked> Kostenlos bevorzugen</label>
+                <label class="nbs-check"><input id="image-lab-enhance-prompt" type="checkbox" checked title="Schreibt deinen Prompt vor Generation in einen optimierten Image-Gen-Prompt um (~3s extra)"> Auto-Enhance Prompt</label>
+                <label class="nbs-check"><input id="image-lab-post-chat" type="checkbox"> In Chat posten</label>
+              </div>
+            </div>
+
+            <!-- Generate Button -->
+            <div style="display:flex;flex-direction:column;gap:10px;">
+              <button id="image-lab-generate" class="nbs-generate-btn">
+                <span class="nbs-btn-icon">🍌</span>
+                <span class="nbs-btn-text">Generate Image</span>
+                <div class="nbs-spinner"></div>
+              </button>
+              <div class="nbs-progress-bar-wrap" id="nbs-progress-bar">
+                <div class="nbs-progress-bar"></div>
+              </div>
+              <div id="image-lab-status" class="nbs-gen-status"></div>
+            </div>
+
+            <!-- How it works -->
+            <div class="nbs-glass-card" style="font-size:11.5px;color:var(--nbs-muted);line-height:1.7;">
+              <div style="font-weight:600;color:var(--nbs-text);margin-bottom:6px;">So funktioniert's</div>
+              <div>🔌 Generiert via Gemini API (Nano Banana Modelle)</div>
+              <div>💰 Kosten siehst du live im Header oben</div>
+              <div>🖼️ Fertige Bilder landen rechts in der Galerie</div>
+              <div>💾 Galerie ist lokal im Browser gespeichert</div>
+            </div>
+
+            <!-- Hidden buttons für Backend-Kompatibilität -->
+            <button type="button" class="image-lab-import-codex" style="display:none;">Codex</button>
+            <button id="image-lab-clear" style="display:none;">Clear</button>
+
+          </div><!-- /gen-panel -->
+
+          <!-- RIGHT: GALLERY (3 Tabs: Aktuell / Library / Avatare) -->
+          <div class="nbs-gallery-panel">
+            <div class="nbs-gallery-header">
+              <div class="nbs-tab-bar" id="nbs-tab-bar">
+                <button type="button" class="nbs-tab active" data-tab="recent">🍌 Aktuell</button>
+                <button type="button" class="nbs-tab" data-tab="library">🗂️ Library</button>
+                <button type="button" class="nbs-tab" data-tab="avatars">👥 Avatare</button>
+              </div>
+              <div style="display:flex;align-items:center;gap:10px;">
+                <div class="nbs-gallery-meta" id="nbs-gallery-meta">Noch keine Bilder</div>
+                <button id="image-lab-clear-gallery" class="nbs-clear-btn" style="display:none;">Session-Cache leeren</button>
+              </div>
+            </div>
+
+            <!-- Tab: Aktuell (Session-Gallery wie bisher) -->
+            <div class="nbs-tab-pane active" data-pane="recent">
+              <div id="image-lab-current" class="nbs-featured">
+                <div class="nbs-empty-state">
+                  <div class="nbs-empty-icon">🍌</div>
+                  <div class="nbs-empty-title">Noch keine Bilder</div>
+                  <div class="nbs-empty-sub">Beschreib deine Vision links und klick auf Generate um das erste Bild zu machen.</div>
+                </div>
+              </div>
+              <div class="nbs-image-grid" id="image-lab-gallery"></div>
+            </div>
+
+            <!-- Tab: Library (persistent, gruppiert nach Tag, mit Folders) -->
+            <div class="nbs-tab-pane" data-pane="library">
+              <div class="nbs-lib-layout">
+                <aside class="nbs-lib-sidebar">
+                  <div class="nbs-lib-sidebar-header">
+                    <span>Folders</span>
+                    <button type="button" class="nbs-lib-new-folder" id="nbs-lib-new-folder" title="Neuer Folder">+</button>
+                  </div>
+                  <div id="nbs-lib-folders" class="nbs-lib-folder-list"></div>
+                </aside>
+                <div class="nbs-lib-main">
+                  <div class="nbs-lib-toolbar">
+                    <div class="nbs-lib-current-folder" id="nbs-lib-current-folder">Alle Bilder</div>
+                    <div class="nbs-lib-folder-actions" id="nbs-lib-folder-actions" style="display:none;">
+                      <button type="button" class="nbs-lib-folder-action" data-action="rename">✎ Umbenennen</button>
+                      <button type="button" class="nbs-lib-folder-action danger" data-action="delete">🗑 Folder löschen</button>
+                    </div>
+                  </div>
+                  <div id="nbs-lib-content" class="nbs-lib-content">
+                    <div class="nbs-empty-state">
+                      <div class="nbs-empty-icon">🗂️</div>
+                      <div class="nbs-empty-title">Library lädt …</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Tab: Avatare -->
+            <div class="nbs-tab-pane" data-pane="avatars">
+              <div id="nbs-avatars-list" class="nbs-avatars-list">
+                <div class="nbs-empty-state">
+                  <div class="nbs-empty-icon">👥</div>
+                  <div class="nbs-empty-title">Avatare laden …</div>
+                </div>
+              </div>
+              <div id="nbs-avatar-detail" class="nbs-avatar-detail" style="display:none;"></div>
+            </div>
+
+          </div><!-- /gallery-panel -->
+
+        </div><!-- /main -->
+
+        <!-- Lightbox: Bild links, Prompt-Sidebar rechts -->
+        <div class="nbs-lightbox" id="nbs-lightbox">
+          <button class="nbs-lightbox-close" id="nbs-lightbox-close">✕</button>
+          <div class="nbs-lightbox-grid">
+            <div class="nbs-lightbox-img-wrap">
+              <img class="nbs-lightbox-img" id="nbs-lightbox-img" src="" alt="">
+            </div>
+            <aside class="nbs-lightbox-info" id="nbs-lightbox-info">
+              <div class="nbs-empty-state" style="padding:30px 10px;">
+                <div class="nbs-empty-icon">📝</div>
+                <div class="nbs-empty-sub">Keine Prompt-Infos zu diesem Bild gespeichert.</div>
+              </div>
+            </aside>
           </div>
         </div>
 
@@ -4389,23 +5141,25 @@
 
   <!-- ── Sidebar Clock ────────────────────────────────────── -->
   <!-- ── App Scripts ──────────────────────────────────────── -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
   <script src="/static/js/config.js?v=20260418-wss-fix"></script>
   <script src="/static/js/ws.js"></script>
   <script src="/static/js/restart-banner.js?v=20260417a"></script>
-  <script src="/static/js/chat.js?v=20260418a"></script>
+  <script src="/static/js/chat.js?v=20260425a"></script>
   <script src="/static/js/rag.js"></script>
   <script src="/static/js/memory.js"></script>
   <script src="/static/js/tasks.js"></script>
   <script src="/static/js/timeline.js"></script>
-  <script src="/static/js/email.js"></script>
+  <script src="/static/js/email.js?v=20260419-v9-autoselect"></script>
   <script src="/static/js/calendar.js"></script>
   <script src="/static/js/system.js"></script>
   <script src="/static/js/home.js"></script>
   <script src="/static/js/diss.js"></script>
-  <script src="/static/js/medizin.js"></script>
+  <script src="/static/js/medizin.js?v=20260425-genfix"></script>
   <script src="/static/js/funnel.js"></script>
   <script src="/static/js/trading.js"></script>
   <script src="/static/js/tanzania.js"></script>
+  <script src="/static/js/documents.js"></script>
   <script src="/static/js/knowledge-graph.js"></script>
   <script src="/static/js/smart-tasks.js"></script>
   <script src="/static/js/world-monitor.js"></script>
@@ -4415,9 +5169,10 @@
   <script src="/static/js/arena.js"></script>
   <script src="/static/js/skills.js?v=20260415a"></script>
   <script src="/static/js/transcriber.js?v=20260417a"></script>
+  <script src="/static/js/image-lab.js?v=20260424f"></script>
   <script src="/static/js/quick-action.js?v=20260417a"></script>
   <script src="/static/js/undo-hint.js?v=20260417a"></script>
-  <script src="/static/js/app.js"></script>
+  <script src="/static/js/app.js?v=20260424-image-lab"></script>
   <div id="toast-container"></div>
   <script>
     // PWA service worker — enables iOS "Add to Home Screen" as a proper app.
@@ -4433,6 +5188,395 @@
           .catch(() => {});
       });
     }
+  </script>
+
+  <!-- Medical Agent Modal (Geminis #3) — kombiniert Amboss + ViaMedici + Vault -->
+  <div id="medical-modal" style="display:none;position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.6);align-items:center;justify-content:center;padding:20px">
+    <div style="background:var(--bg-secondary,#0a0c12);border:1px solid rgba(255,255,255,.1);border-radius:12px;width:100%;max-width:700px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden">
+      <div style="padding:14px 18px;border-bottom:1px solid rgba(255,255,255,.05);display:flex;align-items:center;justify-content:space-between">
+        <div style="font-size:14px;font-weight:700;color:#e2e8f0">🩺 Medical Reasoning</div>
+        <button id="btn-med-close" style="background:transparent;border:none;color:#64748b;font-size:20px;cursor:pointer;padding:0 6px">×</button>
+      </div>
+      <div style="padding:14px 18px;display:flex;flex-direction:column;gap:10px;overflow-y:auto">
+        <textarea id="med-query" rows="3" placeholder="Medizinische Frage (z.B. „Klinische Zeichen der Aortenstenose?")"
+                  style="width:100%;padding:10px;background:#070a13;border:1px solid rgba(255,255,255,.08);border-radius:6px;color:#e2e8f0;font-size:13px;font-family:inherit;resize:vertical"></textarea>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <label style="font-size:11px;color:#94a3b8">Quellen:</label>
+          <label style="font-size:11px;color:#cbd5e1"><input type="checkbox" id="med-src-amboss" checked> Amboss</label>
+          <label style="font-size:11px;color:#cbd5e1"><input type="checkbox" id="med-src-viamedici" checked> ViaMedici</label>
+          <label style="font-size:11px;color:#cbd5e1"><input type="checkbox" id="med-src-rag" checked> Vault (RAG)</label>
+          <span style="flex:1"></span>
+          <button id="btn-med-submit" style="padding:7px 16px;background:#a78bfa;color:#0f172a;border:none;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer">Synthesize</button>
+        </div>
+        <div id="med-status" style="font-size:11px;color:#64748b;min-height:14px"></div>
+        <div id="med-result" style="padding:10px;background:#070a13;border:1px solid rgba(255,255,255,.05);border-radius:6px;color:#cbd5e1;font-size:13px;line-height:1.55;white-space:pre-wrap;min-height:60px;max-height:50vh;overflow-y:auto"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  // --- Vault-Context-Picker + Medical-Agent Modal ---
+  (function() {
+    let _vaultBundles = [];  // aus /api/vault/bundles
+    let _activeBundles = []; // aktuelle Session-Auswahl
+
+    async function _loadVaultBundles() {
+      try {
+        const r = await fetch('/api/vault/bundles');
+        const d = await r.json();
+        _vaultBundles = d.bundles || [];
+      } catch (e) { console.warn('[Vault] bundles unreachable:', e); }
+    }
+
+    function _renderBundleList() {
+      const host = document.getElementById('vault-bundles-list');
+      if (!host) return;
+      if (!_vaultBundles.length) {
+        host.innerHTML = '<div style="font-size:11px;color:#64748b">Keine Bundles geladen.</div>';
+        return;
+      }
+      host.innerHTML = _vaultBundles.map(b => {
+        const checked = _activeBundles.includes(b.name) ? 'checked' : '';
+        return `<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:#cbd5e1;cursor:pointer">
+          <input type="checkbox" data-bundle="${b.name}" ${checked}>
+          <span style="flex:1">${b.name}</span>
+          <span style="font-size:10px;color:#64748b">${b.file_count} file${b.file_count === 1 ? '' : 's'}</span>
+        </label>`;
+      }).join('');
+    }
+
+    function _updateLabel() {
+      const el = document.getElementById('vault-context-label');
+      if (!el) return;
+      if (!_activeBundles.length) el.textContent = 'kein Context';
+      else if (_activeBundles.length === 1) el.textContent = _activeBundles[0];
+      else el.textContent = _activeBundles.length + ' Bundles';
+    }
+
+    async function _applyBundles() {
+      const sid = window.MC?.chat?._activeSession?.() || localStorage.getItem('mc_active_session_id');
+      if (!sid) {
+        alert('Keine aktive Session — sende erst eine Nachricht.');
+        return;
+      }
+      const checked = Array.from(document.querySelectorAll('#vault-bundles-list input:checked'))
+        .map(i => i.getAttribute('data-bundle'));
+      try {
+        const r = await fetch(`/api/chat/session/${sid}/context`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bundles: checked }),
+        });
+        const d = await r.json();
+        if (d.ok) {
+          _activeBundles = d.context_bundles || [];
+          _updateLabel();
+          document.getElementById('vault-context-popup').style.display = 'none';
+        } else {
+          alert(d.error || 'Fehler');
+        }
+      } catch (e) { alert('Netzwerk: ' + e.message); }
+    }
+
+    // Init nach DOM ready
+    function init() {
+      const btn = document.getElementById('btn-vault-context');
+      const popup = document.getElementById('vault-context-popup');
+      const apply = document.getElementById('btn-vault-apply');
+      const clear = document.getElementById('btn-vault-clear');
+      if (!btn || !popup) return;
+
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (popup.style.display === 'none') {
+          if (!_vaultBundles.length) await _loadVaultBundles();
+          _renderBundleList();
+          popup.style.display = 'block';
+        } else {
+          popup.style.display = 'none';
+        }
+      });
+      if (apply) apply.addEventListener('click', _applyBundles);
+      if (clear) clear.addEventListener('click', () => {
+        document.querySelectorAll('#vault-bundles-list input').forEach(i => i.checked = false);
+        _applyBundles();
+      });
+      // Außenklick schließt Popup
+      document.addEventListener('click', (e) => {
+        if (popup.style.display === 'block' && !e.target.closest('#vault-context-wrap')) {
+          popup.style.display = 'none';
+        }
+      });
+
+      _updateLabel();
+    }
+
+    // --- Medical Agent Modal ---
+    const medModal = document.getElementById('medical-modal');
+    const medBtn = document.getElementById('btn-medical-agent');
+    const medClose = document.getElementById('btn-med-close');
+    const medSubmit = document.getElementById('btn-med-submit');
+
+    if (medBtn && medModal) {
+      medBtn.addEventListener('click', () => {
+        medModal.style.display = 'flex';
+        setTimeout(() => document.getElementById('med-query')?.focus(), 50);
+      });
+    }
+    if (medClose) medClose.addEventListener('click', () => { medModal.style.display = 'none'; });
+    medModal?.addEventListener('click', (e) => {
+      if (e.target === medModal) medModal.style.display = 'none';
+    });
+
+    if (medSubmit) medSubmit.addEventListener('click', async () => {
+      const q = document.getElementById('med-query').value.trim();
+      const status = document.getElementById('med-status');
+      const result = document.getElementById('med-result');
+
+      if (!q || q.length < 5) {
+        status.innerHTML = '<span style="color:#f59e0b">⚠️ Bitte gib eine Frage mit mindestens 5 Zeichen ein.</span>';
+        return;
+      }
+
+      const sources = [];
+      if (document.getElementById('med-src-amboss').checked) sources.push('amboss');
+      if (document.getElementById('med-src-viamedici').checked) sources.push('viamedici');
+      if (document.getElementById('med-src-rag').checked) sources.push('rag');
+
+      medSubmit.disabled = true;
+      medSubmit.style.opacity = '0.7';
+      medSubmit.style.cursor = 'not-allowed';
+      medSubmit.textContent = '⏳ Suche…';
+      status.textContent = 'Sammle Quellen + synthesiere Antwort …';
+      result.textContent = '';
+
+      try {
+        // Picker-Wert für Provider nutzen
+        const pickerSel = document.getElementById('chat-model-select');
+        const pick = pickerSel && pickerSel.value ? pickerSel.value.split('||') : ['claude-cli', ''];
+        const t0 = Date.now();
+        const r = await fetch('/api/medical/reason', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: q, provider: pick[0], model: pick[1], include_sources: sources }),
+        });
+        const d = await r.json();
+        const dt = Date.now() - t0;
+        if (!d.ok) {
+          status.innerHTML = `<span style="color:#ef4444">✗ ${d.error || 'Fehler'}</span>`;
+        } else {
+          const s = d.sources || {};
+          const srcSummary = [
+            s.amboss?.length ? `Amboss:${s.amboss.length}` : '',
+            s.viamedici?.length ? `Thieme:${s.viamedici.length}` : '',
+            s.rag_chunks ? `Vault:${s.rag_chunks}` : '',
+          ].filter(Boolean).join(' · ');
+          status.innerHTML = `<span style="color:#34d399">✓ ${srcSummary} · ${dt}ms · ${d.provider}/${d.model}</span>`;
+          result.textContent = d.answer || '(leere Antwort)';
+        }
+      } catch (e) {
+        status.innerHTML = `<span style="color:#ef4444">✗ ${e.message}</span>`;
+      } finally {
+        medSubmit.disabled = false;
+        medSubmit.style.opacity = '1';
+        medSubmit.style.cursor = 'pointer';
+        medSubmit.textContent = 'Synthesize';
+      }
+    });
+
+    // Enter-Key support für Medical Modal
+    document.getElementById('med-query')?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        medSubmit?.click();
+      }
+    });
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', init);
+    } else {
+      init();
+    }
+
+    // --- Heartbeat View ---
+    (function() {
+      const $ = (id) => document.getElementById(id);
+      let _hbStatus = null;
+
+      function renderStatus(s) {
+        _hbStatus = s;
+        const lines = [];
+        lines.push(`Läuft: ${s.running ? '<span style="color:#34d399">✓ aktiv</span>' : '<span style="color:#f59e0b">○ pausiert</span>'}`);
+        lines.push(`Intervall: ${s.interval_minutes} min`);
+        lines.push(`Autonomy: <b>${s.autonomy}</b>`);
+        lines.push(`Provider: ${s.provider}/${s.model || 'default'}`);
+        if (s.last_tick) {
+          const ago = Math.round((Date.now() - new Date(s.last_tick)) / 60000);
+          lines.push(`Letzter Tick: vor ${ago} min`);
+        } else {
+          lines.push('Letzter Tick: —');
+        }
+        if (s.next_tick_eta) {
+          const eta = Math.round((new Date(s.next_tick_eta) - Date.now()) / 60000);
+          lines.push(`Nächster Tick: in ~${Math.max(0,eta)} min`);
+        }
+        lines.push(`Push: ${s.push_enabled ? 'ja' : 'nein'}`);
+        lines.push(`Cron-Jobs: ${s.cron_jobs.length}`);
+        $('hb-status-content').innerHTML = lines.join('<br>');
+
+        // Settings-Inputs synchronisieren
+        $('hb-enabled').checked = !!s.enabled;
+        $('hb-interval').value = s.interval_minutes;
+        $('hb-autonomy').value = s.autonomy;
+        $('hb-provider').value = s.provider || '';
+        $('hb-model').value = s.model || '';
+        $('hb-push-enabled').checked = !!s.push_enabled;
+
+        // Cron-Liste
+        const cronHost = $('hb-cron-list');
+        cronHost.innerHTML = '';
+        (s.cron_jobs || []).forEach((job, idx) => {
+          const row = document.createElement('div');
+          row.style.cssText = 'display:grid;grid-template-columns:120px 60px 1fr 30px;gap:8px;align-items:center;padding:6px;background:#070a13;border-radius:5px;border:1px solid rgba(255,255,255,.04)';
+          row.innerHTML = `
+            <input type="text" value="${(job.name||'').replace(/"/g,'&quot;')}" placeholder="Name" data-idx="${idx}" data-field="name" style="padding:4px 6px;background:#0a0c12;border:1px solid rgba(255,255,255,.06);border-radius:3px;color:#e2e8f0;font-size:11px" />
+            <input type="text" value="${(job.time||'').replace(/"/g,'&quot;')}" placeholder="HH:MM" data-idx="${idx}" data-field="time" style="padding:4px 6px;background:#0a0c12;border:1px solid rgba(255,255,255,.06);border-radius:3px;color:#e2e8f0;font-size:11px" />
+            <input type="text" value="${(job.prompt||'').replace(/"/g,'&quot;')}" placeholder="Prompt für diesen Cron-Tick" data-idx="${idx}" data-field="prompt" style="padding:4px 6px;background:#0a0c12;border:1px solid rgba(255,255,255,.06);border-radius:3px;color:#e2e8f0;font-size:11px" />
+            <button data-idx="${idx}" data-cron-del style="padding:4px 8px;background:#ef444418;color:#f87171;border:1px solid #ef444444;border-radius:3px;font-size:11px;cursor:pointer">×</button>
+          `;
+          cronHost.appendChild(row);
+        });
+
+        // History
+        const hist = s.tick_history || [];
+        const histHost = $('hb-history');
+        if (!hist.length) {
+          histHost.textContent = 'Noch keine Ticks.';
+        } else {
+          histHost.innerHTML = hist.slice().reverse().map(t => {
+            const ts = new Date(t.ts).toLocaleTimeString('de-DE', {hour:'2-digit', minute:'2-digit'});
+            const date = new Date(t.ts).toLocaleDateString('de-DE', {month:'short', day:'numeric'});
+            const reasonBadge = `<span style="background:#a78bfa18;color:#a78bfa;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:700">${t.reason}</span>`;
+            const err = t.error ? `<div style="color:#ef4444;font-size:11px;margin-top:4px">⚠ ${t.error.slice(0,200)}</div>` : '';
+            const answer = t.answer ? `<div style="color:#cbd5e1;font-size:12px;margin-top:4px;white-space:pre-wrap">${t.answer.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>` : '';
+            return `<div style="padding:10px;background:#070a13;border:1px solid rgba(255,255,255,.04);border-radius:6px">
+              <div style="display:flex;gap:8px;align-items:center;color:#64748b;font-size:11px"><span>${date} ${ts}</span>${reasonBadge}<span style="margin-left:auto">${t.duration_ms}ms</span></div>
+              ${err}${answer}
+            </div>`;
+          }).join('');
+        }
+      }
+
+      async function loadStatus() {
+        try {
+          const r = await fetch('/api/heartbeat/status');
+          const d = await r.json();
+          if (d.ok) renderStatus(d);
+          else $('hb-status-content').textContent = d.error || 'nicht verfügbar';
+        } catch(e) {
+          $('hb-status-content').textContent = 'Fehler: ' + e.message;
+        }
+      }
+
+      function collectCronJobs() {
+        const jobs = [];
+        document.querySelectorAll('#hb-cron-list > div').forEach(row => {
+          const get = (f) => row.querySelector(`[data-field="${f}"]`)?.value.trim() || '';
+          const name = get('name'), time = get('time'), prompt = get('prompt');
+          if (name && time) jobs.push({name, time, prompt});
+        });
+        return jobs;
+      }
+
+      async function saveConfig() {
+        const patch = {
+          enabled: $('hb-enabled').checked,
+          interval_minutes: parseInt($('hb-interval').value, 10) || 30,
+          autonomy: $('hb-autonomy').value,
+          provider: $('hb-provider').value.trim() || 'claude-cli',
+          model: $('hb-model').value.trim(),
+          push_enabled: $('hb-push-enabled').checked,
+          cron_jobs: collectCronJobs(),
+        };
+        const msg = $('hb-save-msg');
+        msg.innerHTML = '<span style="color:#94a3b8">Speichere…</span>';
+        try {
+          const r = await fetch('/api/heartbeat/config', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify(patch),
+          });
+          const d = await r.json();
+          if (d.ok) {
+            msg.innerHTML = '<span style="color:#34d399">✓ Gespeichert · wirkt ab nächstem Tick</span>';
+            await loadStatus();
+          } else {
+            msg.innerHTML = `<span style="color:#ef4444">✗ ${d.error}</span>`;
+          }
+        } catch(e) {
+          msg.innerHTML = `<span style="color:#ef4444">✗ ${e.message}</span>`;
+        }
+      }
+
+      async function triggerNow() {
+        const btn = $('hb-trigger-btn');
+        btn.disabled = true; btn.textContent = '⏳ Läuft…';
+        try {
+          const r = await fetch('/api/heartbeat/trigger', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({reason: 'manual'}),
+          });
+          await r.json();
+          await loadStatus();
+        } catch(e) {
+          alert('Fehler: ' + e.message);
+        } finally {
+          btn.disabled = false; btn.textContent = '▶ Jetzt triggern';
+        }
+      }
+
+      function addCron() {
+        const list = $('hb-cron-list');
+        const idx = list.children.length;
+        const row = document.createElement('div');
+        row.style.cssText = 'display:grid;grid-template-columns:120px 60px 1fr 30px;gap:8px;align-items:center;padding:6px;background:#070a13;border-radius:5px;border:1px solid rgba(255,255,255,.04)';
+        row.innerHTML = `
+          <input type="text" placeholder="Name" data-idx="${idx}" data-field="name" style="padding:4px 6px;background:#0a0c12;border:1px solid rgba(255,255,255,.06);border-radius:3px;color:#e2e8f0;font-size:11px" />
+          <input type="text" placeholder="HH:MM" data-idx="${idx}" data-field="time" style="padding:4px 6px;background:#0a0c12;border:1px solid rgba(255,255,255,.06);border-radius:3px;color:#e2e8f0;font-size:11px" />
+          <input type="text" placeholder="Prompt" data-idx="${idx}" data-field="prompt" style="padding:4px 6px;background:#0a0c12;border:1px solid rgba(255,255,255,.06);border-radius:3px;color:#e2e8f0;font-size:11px" />
+          <button data-idx="${idx}" data-cron-del style="padding:4px 8px;background:#ef444418;color:#f87171;border:1px solid #ef444444;border-radius:3px;font-size:11px;cursor:pointer">×</button>
+        `;
+        list.appendChild(row);
+      }
+
+      function init() {
+        if (!$('hb-refresh-btn')) return;  // View nicht im DOM
+        $('hb-refresh-btn').addEventListener('click', loadStatus);
+        $('hb-trigger-btn').addEventListener('click', triggerNow);
+        $('hb-save-btn').addEventListener('click', saveConfig);
+        $('hb-cron-add').addEventListener('click', addCron);
+        $('hb-cron-list').addEventListener('click', (e) => {
+          if (e.target.dataset.cronDel !== undefined) e.target.closest('div').remove();
+        });
+        // Initial laden und alle 30s refreshen wenn View aktiv
+        loadStatus();
+        setInterval(() => {
+          if ($('view-heartbeat')?.classList.contains('active')) loadStatus();
+        }, 30000);
+
+        // Live-Tick-Events auf WS empfangen
+        if (window.MC && MC.ws) {
+          MC.ws.on('heartbeat.tick', () => {
+            if ($('view-heartbeat')?.classList.contains('active')) loadStatus();
+          });
+        }
+      }
+
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+      } else {
+        init();
+      }
+    })();
+
+  })();
   </script>
 </body>
 </html>

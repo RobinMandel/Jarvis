@@ -16,6 +16,7 @@
   let _pageVisible = true;
   let _notifiedRooms = new Set();
   let _spokenMessageIds = new Set(); // Track which messages have been spoken aloud
+  let _alphaDesignShown = new Map(); // roomId -> highest threshold shown (2 or 3)
 
   // ── Visibility & Notifications ────────────────────────────────────────
   if ('Notification' in window && Notification.permission === 'default') {
@@ -111,8 +112,24 @@
       <span style="margin-left:auto;font-size:16px;color:#10b981;opacity:0.7;">→</span>
     </div>`;
 
+    // Multi-Model Trialog: 3 Bots mit Claude / GPT / Gemini
+    const trialogCard = `<div onclick="MC.arena.startTrialog()" style="
+      padding:10px 13px;border:1.5px solid rgba(167,139,250,0.4);border-radius:8px;
+      margin-bottom:10px;cursor:pointer;background:rgba(167,139,250,0.06);
+      transition:all 0.15s;display:flex;align-items:center;gap:9px;
+      box-shadow:0 0 8px rgba(167,139,250,0.12);"
+      onmouseover="this.style.background='rgba(167,139,250,0.12)';this.style.borderColor='rgba(167,139,250,0.7)'"
+      onmouseout="this.style.background='rgba(167,139,250,0.06)';this.style.borderColor='rgba(167,139,250,0.4)'">
+      <span style="font-size:18px;flex-shrink:0;">🤖🤖🤖</span>
+      <div>
+        <div style="font-weight:700;font-size:12px;color:#a78bfa;">Multi-Model-Trialog</div>
+        <div style="font-size:10px;color:var(--text-muted);margin-top:1px;">Claude + GPT + Gemini reden miteinander</div>
+      </div>
+      <span style="margin-left:auto;font-size:16px;color:#a78bfa;opacity:0.7;">→</span>
+    </div>`;
+
     if (rooms.length === 0) {
-      container.innerHTML = meetingCard + `<div style="padding:24px;text-align:center;color:var(--text-muted);font-size:13px;">
+      container.innerHTML = meetingCard + trialogCard + `<div style="padding:24px;text-align:center;color:var(--text-muted);font-size:13px;">
         Noch keine Raeume.<br>Erstelle einen neuen Raum um loszulegen.
       </div>`;
       return;
@@ -135,7 +152,7 @@
       grouped[cat].push(r);
     });
 
-    let html = meetingCard;
+    let html = meetingCard + trialogCard;
     for (const [catId, catRooms] of Object.entries(grouped)) {
       const cat = getCat(catId);
       html += `<div style="margin-bottom:12px;">
@@ -153,6 +170,7 @@
           <div style="display:flex;align-items:center;gap:6px;margin-bottom:3px;">
             <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${dotColor};flex-shrink:0;${isRunning ? 'box-shadow:0 0 6px ' + dotColor + '88;animation:pulse-dot 2s infinite' : ''}"></span>
             <span style="font-weight:600;font-size:12px;color:var(--text-primary);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escHtml(r.title)}</span>
+            ${r.paused_reason === 'server_restart' ? '<span title="Pausiert nach MC-Neustart" style="font-size:11px;color:#fbbf24;">⚠</span>' : ''}
             <span style="font-size:10px;color:var(--text-muted);">${msgCount}</span>
           </div>
           <div style="font-size:10px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
@@ -197,15 +215,27 @@
         <div style="padding:10px 16px;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:8px;flex-shrink:0;">
           <span style="font-size:14px;">${cat.icon}</span>
           <div style="flex:1;min-width:0;">
-            <div style="font-weight:700;font-size:14px;color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escHtml(room.title)}</div>
-            <div style="font-size:10px;color:var(--text-muted);margin-top:1px;">${escHtml(room.topic || 'Kein Thema')} · ${(room.messages || []).length} Nachrichten</div>
+            <div style="font-weight:700;font-size:14px;color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escHtml(room.title)}${actionStatusPill(room)}</div>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:1px;">${escHtml(room.topic || 'Kein Thema')} · ${(room.messages || []).length} Nachrichten${(() => {
+              const marks = room.consensus_marks || [];
+              if (!marks.length) return '';
+              const tip = marks.slice(-5).map(m => `Turn ${m.turn} (${(m.at || '').slice(11,16)}): ${(m.summary || '').slice(0,80)}`).join('\n');
+              return ` · <span onclick="MC.arena.toggleMarksPanel('${room.id}')" style="color:#10b981;font-weight:600;cursor:pointer;text-decoration:underline dotted;" title="${escHtml(tip)}\n\n(klicken zum Verwalten)">✓ ${marks.length} Konsens${marks.length === 1 ? '' : '-Marken'}</span>`;
+            })()}${(() => {
+              const allActs = collectAllActionsFromMessages(room);
+              if (!allActs.length) return '';
+              const reviewed = allActs.filter(a => _collectActionReviewers(room, a.text, a.bot).length > 0).length;
+              if (!reviewed) return '';
+              const botNames = [...new Set(allActs.flatMap(a => _collectActionReviewers(room, a.text, a.bot).map(r => r.name)))].join(', ');
+              return ` · <span onclick="MC.arena.toggleOrchestrator()" style="color:#ec4899;font-weight:600;cursor:pointer;text-decoration:underline dotted;" title="${reviewed} von ${allActs.length} Aktionen geprüft von: ${escHtml(botNames)} — klicken für Fazit">✓ ${reviewed}/${allActs.length} reviewed</span>`;
+            })()}</div>
           </div>
           <div style="display:flex;gap:5px;flex-shrink:0;">
             <button onclick="MC.arena.toggleOrchestrator()" style="background:rgba(168,85,247,0.12);border:1px solid rgba(168,85,247,0.25);color:#a855f7;border-radius:6px;padding:4px 8px;font-size:10px;cursor:pointer;font-weight:600;" title="Orchestrator/Richter">Richter</button>
             <button onclick="MC.arena.toggleResults()" style="background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.25);color:#10b981;border-radius:6px;padding:4px 8px;font-size:10px;cursor:pointer;font-weight:600;" title="Ergebnis-Seite: Fortschritt aller Aktionen">Ergebnisse${countRoomResultsBadge(room)}</button>
-            <button id="arena-sammler-btn" onclick="MC.arena.toggleSammler()" style="background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.3);color:#fbbf24;border-radius:6px;padding:4px 8px;font-size:10px;cursor:pointer;font-weight:600;" title="Aktions-Sammler: Alle Vorschlaege der Bots gebuendelt zur Freigabe">Sammler${countSammlerBadge(room)}</button>
-            <button onclick="MC.arena.requestSummary('${room.id}')" style="background:rgba(168,85,247,0.08);border:1px solid rgba(168,85,247,0.2);color:#a855f7;border-radius:6px;padding:4px 8px;font-size:10px;cursor:pointer;" title="Zusammenfassung anfordern">Fazit</button>
+            <button id="arena-sammler-btn" onclick="MC.arena.toggleSammler()" style="background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.3);color:#fbbf24;border-radius:6px;padding:4px 8px;font-size:10px;cursor:pointer;font-weight:600;" title="Vorschläge der Bots gebuendelt zur Freigabe">Vorschläge${countSammlerBadge(room)}</button>
             <button onclick="MC.arena.editRoom('${room.id}')" style="background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.25);color:#818cf8;border-radius:6px;padding:4px 8px;font-size:10px;cursor:pointer;">Settings</button>
+            <button onclick="MC.arena.saveSnapshot('${room.id}')" style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);color:#10b981;border-radius:6px;padding:4px 8px;font-size:10px;cursor:pointer;font-weight:600;" title="Aktuellen Stand als Snapshot speichern">📌 Stand merken</button>
             ${isRunning
               ? `<button onclick="MC.arena.stopRoom('${room.id}')" style="background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.25);color:#ef4444;border-radius:6px;padding:4px 8px;font-size:10px;cursor:pointer;">Stop</button>`
               : `<button onclick="MC.arena.startRoom('${room.id}')" style="background:rgba(34,197,94,0.12);border:1px solid rgba(34,197,94,0.25);color:#22c55e;border-radius:6px;padding:4px 8px;font-size:10px;cursor:pointer;">Start</button>`
@@ -213,6 +243,15 @@
             <button onclick="MC.arena.deleteRoom('${room.id}')" style="background:rgba(239,68,68,0.06);border:1px solid rgba(239,68,68,0.15);color:#ef4444;border-radius:6px;padding:4px 8px;font-size:10px;cursor:pointer;" title="Loeschen">X</button>
           </div>
         </div>
+
+        <!-- Restart-Pause Banner: persistent until Robin resumes -->
+        ${(room.status === 'paused' && !isRunning) ? `
+        <div id="arena-restart-banner" style="display:flex;align-items:center;gap:8px;padding:7px 14px;background:rgba(251,191,36,0.1);border-bottom:1px solid rgba(251,191,36,0.35);flex-shrink:0;">
+          <span style="font-size:13px;">⚠️</span>
+          <span style="font-size:11px;color:#fbbf24;font-weight:600;">Raum pausiert nach MC-Neustart</span>
+          <span style="font-size:11px;color:var(--text-muted);">— Diskussion steht still bis du fortsetzt</span>
+          <button onclick="MC.arena.startRoom('${room.id}')" style="margin-left:auto;background:rgba(251,191,36,0.2);border:1px solid rgba(251,191,36,0.5);color:#fbbf24;border-radius:5px;padding:3px 10px;font-size:11px;cursor:pointer;font-weight:700;">▶ Resume</button>
+        </div>` : ''}
 
         <!-- Main area: Messages + Orchestrator panel -->
         <div style="flex:1;display:flex;min-height:0;overflow:hidden;">
@@ -259,19 +298,11 @@
               <button id="arena-tts-btn" onclick="MC.arena.toggleTts()"
                 title="Bot-Sprachausgabe: Bots lesen ihre Antworten automatisch vor"
                 style="background:${_ttsAutoEnabled ? 'rgba(245,158,11,0.22)' : 'rgba(245,158,11,0.08)'};border:1px solid ${_ttsAutoEnabled ? 'rgba(245,158,11,0.6)' : 'rgba(245,158,11,0.2)'};color:#f59e0b;border-radius:6px;padding:6px 10px;font-size:11px;cursor:pointer;font-weight:600;white-space:nowrap;">${_ttsAutoEnabled ? '🔊 Ton an' : '🔇 Ton aus'}</button>
-              <button onclick="MC.arena.inject('${room.id}')"
-                style="background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.25);color:#f59e0b;border-radius:6px;padding:6px 12px;font-size:11px;cursor:pointer;font-weight:500;white-space:nowrap;">Einwerfen</button>
-              <button onclick="MC.arena.execute('${room.id}')"
-                style="background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.25);color:#ef4444;border-radius:6px;padding:6px 12px;font-size:11px;cursor:pointer;font-weight:600;white-space:nowrap;" title="Execution-Modus: Bots bekommen Tool-Zugriff (Read/Write/Edit/Bash) und setzen [ACTION]-Punkte aus dem Fazit selbstaendig um. Du bestaetigst jede Aktion einzeln. Stoppt automatisch nach den vorgegebenen Turns.">Umsetzen</button>
-            </div>
-            <!-- Hint text: erklaert was der Umsetzen-Knopf macht -->
-            <div style="padding:2px 14px 6px 14px;font-size:10px;color:var(--text-muted);text-align:right;flex-shrink:0;line-height:1.3;">
-              <span style="color:#ef4444;font-weight:600;">Umsetzen</span> = Bots schalten in Execution-Modus &amp; fuehren [ACTION]-Punkte aus dem Fazit mit Tool-Zugriff aus (du bestaetigst jede).
             </div>
           </div>
 
           <!-- Orchestrator / Fazit Panel (collapsible) -->
-          <div id="arena-orchestrator-panel" style="display:${_orchestratorOpen ? 'flex' : 'none'};width:420px;flex-shrink:0;border-left:1px solid var(--border-subtle);flex-direction:column;background:var(--bg-secondary);">
+          <div id="arena-orchestrator-panel" style="display:${_orchestratorOpen ? 'flex' : 'none'};width:420px;flex-shrink:0;border-left:1px solid var(--border-subtle);flex-direction:column;background:var(--bg-secondary);min-height:0;max-height:100%;overflow:hidden;">
             <div style="padding:10px 14px;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:6px;">
               <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#a855f7;"></span>
               <span style="font-weight:700;font-size:12px;color:#a855f7;flex:1;">Fazit & Richter</span>
@@ -300,7 +331,7 @@
           </div>
 
           <!-- Ergebnis-Seite / Results Panel (collapsible) -->
-          <div id="arena-results-panel" style="display:${_resultsOpen ? 'flex' : 'none'};width:460px;flex-shrink:0;border-left:1px solid var(--border-subtle);flex-direction:column;background:var(--bg-secondary);">
+          <div id="arena-results-panel" style="display:${_resultsOpen ? 'flex' : 'none'};width:460px;flex-shrink:0;border-left:1px solid var(--border-subtle);flex-direction:column;background:var(--bg-secondary);min-height:0;max-height:100%;overflow:hidden;">
             <div style="padding:10px 14px;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:6px;">
               <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;"></span>
               <span style="font-weight:700;font-size:12px;color:#10b981;flex:1;">Ergebnisse &amp; Fortschritt</span>
@@ -312,10 +343,10 @@
           </div>
 
           <!-- Aktions-Sammler Panel (collapsible) -->
-          <div id="arena-sammler-panel" style="display:${_sammlerOpen ? 'flex' : 'none'};width:420px;flex-shrink:0;border-left:1px solid var(--border-subtle);flex-direction:column;background:var(--bg-secondary);">
+          <div id="arena-sammler-panel" style="display:${_sammlerOpen ? 'flex' : 'none'};width:420px;flex-shrink:0;border-left:1px solid var(--border-subtle);flex-direction:column;background:var(--bg-secondary);min-height:0;max-height:100%;overflow:hidden;">
             <div style="padding:10px 14px;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:6px;">
               <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#fbbf24;"></span>
-              <span style="font-weight:700;font-size:12px;color:#fbbf24;flex:1;">Aktions-Sammler</span>
+              <span style="font-weight:700;font-size:12px;color:#fbbf24;flex:1;">Vorschläge</span>
               <button onclick="MC.arena.refreshSammler()" style="background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.25);color:#fbbf24;border-radius:6px;padding:3px 8px;font-size:10px;cursor:pointer;" title="Erneut scannen">Refresh</button>
               <button onclick="MC.arena.toggleSammler()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:14px;padding:2px 4px;">X</button>
             </div>
@@ -362,10 +393,53 @@
       if (captionInput) captionInput.value = '';
       const label = isImage ? 'Bild' : (file.name || 'Datei');
       MC.toast && MC.toast(`${label} eingeworfen`, 'success', 1500);
+      // AlphaDesign-Trigger: nach jedem Bild-Upload prüfen ob Runde gestartet werden soll
+      if (isImage) {
+        await loadRooms();
+        _checkAlphaDesignTrigger(roomId);
+      }
     } catch (e) {
       console.error('[Arena] file inject failed:', e);
       MC.toast && MC.toast('Netzwerkfehler beim Upload', 'error', 3000);
     }
+  }
+
+  // ── AlphaDesign-Trigger: nach 2+ amkiphil-Screenshots Runde starten ──────
+  // Fires at 2 images, and again at 3 if the first banner was dismissed.
+  function _checkAlphaDesignTrigger(roomId) {
+    const room = rooms.find(r => r.id === roomId);
+    if (!room) return;
+    const imgCount = (room.messages || []).filter(m => m.image || (m.attachments || []).some(a => /\.(png|jpg|jpeg|gif|webp)$/i.test(a))).length;
+    const threshold = imgCount >= 3 ? 3 : imgCount >= 2 ? 2 : 0;
+    if (!threshold) return;
+    if ((_alphaDesignShown.get(roomId) || 0) >= threshold) return;
+    _alphaDesignShown.set(roomId, threshold);
+
+    // Banner in Nachrichten-Bereich einblenden
+    const msgEl = el('arena-messages');
+    if (!msgEl) return;
+    const banner = document.createElement('div');
+    banner.id = 'arena-alphadesign-banner';
+    banner.style.cssText = 'position:sticky;bottom:8px;left:0;right:0;margin:8px 0 4px;background:linear-gradient(135deg,rgba(99,102,241,0.18),rgba(168,85,247,0.18));border:1.5px solid rgba(168,85,247,0.4);border-radius:10px;padding:10px 14px;display:flex;align-items:center;gap:10px;z-index:20;backdrop-filter:blur(4px);';
+    banner.innerHTML = `
+      <span style="font-size:18px;flex-shrink:0;">🎨</span>
+      <div style="flex:1;min-width:0;">
+        <div style="font-weight:700;font-size:12px;color:#c084fc;">AlphaDesign-Runde bereit</div>
+        <div style="font-size:10px;color:var(--text-muted);margin-top:1px;">${imgCount} Screenshot${imgCount > 1 ? 's' : ''} erkannt — Bots können jetzt das amkiphil-Design analysieren und einen Claude-Touch-Gegenentwurf entwickeln.</div>
+      </div>
+      <button onclick="MC.arena.startAlphaDesignRound('${roomId}')" style="background:rgba(168,85,247,0.25);border:1px solid rgba(168,85,247,0.5);color:#c084fc;border-radius:7px;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap;flex-shrink:0;">▶ AlphaDesign starten</button>
+      <button onclick="this.parentElement.remove()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:14px;padding:0 2px;flex-shrink:0;">&times;</button>`;
+    msgEl.appendChild(banner);
+    msgEl.scrollTop = msgEl.scrollHeight;
+  }
+
+  async function startAlphaDesignRound(roomId) {
+    const room = rooms.find(r => r.id === roomId);
+    const imgCount = room ? (room.messages || []).filter(m => m.image || (m.attachments || []).some(a => /\.(png|jpg|jpeg|gif|webp)$/i.test(a))).length : '2+';
+    const prompt = `🎨 [AlphaDesign-Runde] Robin hat ${imgCount} amkiphil-Screenshots eingeworfen. Eure Aufgabe: (1) Analysiert das Design-System von amkiphil — Farbpalette, Kartenstruktur, Schrifttypen, Bild-Integration, Mnemonic-Stil, was macht die Karten optisch stark? (2) Entwickelt darauf aufbauend einen konkreten "Claude Touch"-Gegenentwurf: gleiches Lernziel, eigenständiges Design, aber inspiriert von amkiphil. Anforderungen: viele Bilder aus Amboss + Seminarfolien, Amboss Fun Facts als Hilfsbrücken, klare medizinische Struktur. (3) Beschreibt euren Vorschlag als konkretes Design-Konzept: Farbpalette (Hex-Codes), Layout-Schema, Beispiel-Karte in Text-Form, was hebt euren Vorschlag von amkiphil ab? Diskutiert und einigt euch auf EINEN Favoriten-Entwurf für Robin.`;
+    el('arena-alphadesign-banner') && el('arena-alphadesign-banner').remove();
+    await injectText(roomId, prompt);
+    MC.toast && MC.toast('AlphaDesign-Runde gestartet 🎨', 'success', 2000);
   }
 
   // Pick files via hidden <input type="file"> — called from the paperclip button
@@ -462,15 +536,16 @@
     html += `<div style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap;">` +
       `<button onclick="MC.arena.injectText(${rid},'Ja, weiter so.')" style="flex:1;min-width:70px;padding:7px 10px;border-radius:7px;border:1px solid rgba(34,197,94,0.4);background:rgba(34,197,94,0.1);color:#22c55e;font-size:11px;font-weight:700;cursor:pointer;" title="Richtung bestaetigen">Ja-weiter</button>` +
       `<button onclick="(function(){var t=window.prompt('Pivot: neue Richtung?');if(t&&t.trim())MC.arena.injectText(${rid},'Pivot: '+t.trim());})()" style="flex:1;min-width:60px;padding:7px 10px;border-radius:7px;border:1px solid rgba(245,158,11,0.4);background:rgba(245,158,11,0.1);color:#f59e0b;font-size:11px;font-weight:700;cursor:pointer;" title="Neue Richtung vorgeben">Pivot</button>` +
-      `<button onclick="MC.arena.stopRoom(${rid})" style="flex:1;min-width:55px;padding:7px 10px;border-radius:7px;border:1px solid rgba(239,68,68,0.4);background:rgba(239,68,68,0.1);color:#ef4444;font-size:11px;font-weight:700;cursor:pointer;" title="Diskussion stoppen">Stop</button>` +
       `</div>`;
     if (actions.length > 0) {
       const panelMsgId = `panel-actions-${Date.now()}`;
       const checkboxes = actions.map((a, i) => {
         const botBadge = a.bot ? `<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(168,85,247,0.18);color:#c084fc;font-weight:700;flex-shrink:0;margin-right:4px;">${escHtml(a.bot)}</span>` : '';
+        const reviewers = _collectActionReviewers(room, a.text, a.bot);
+        const reviewBadges = _reviewerBadgesHtml(reviewers);
         return `<label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;padding:7px 10px;border-radius:7px;background:rgba(168,85,247,0.06);border:1px solid rgba(168,85,247,0.18);transition:background 0.15s;margin-bottom:5px;">
           <input type="checkbox" checked data-action-idx="${i}" data-action-text="${escHtml(a.text)}" class="arena-panel-action-cb" style="accent-color:#a855f7;margin-top:2px;flex-shrink:0;">
-          <span style="font-size:11px;color:var(--text-primary);line-height:1.4;display:flex;align-items:center;gap:0;flex-wrap:wrap;">${botBadge}${escHtml(a.text)}</span>
+          <span style="font-size:11px;color:var(--text-primary);line-height:1.4;display:flex;align-items:center;gap:2px;flex-wrap:wrap;">${botBadge}<span>${escHtml(a.text)}</span>${reviewBadges}</span>
         </label>`;
       }).join('');
       html += `
@@ -487,6 +562,34 @@
             Startet je angehakter Aktion eine Executor-Session mit Tool-Zugriff. File-Preview zeigt dir vorher, was angefasst wird.
           </div>
         </div>`;
+    }
+    // Persistent action_items panel — shows all tracked actions with offen/erledigt status
+    const allItems = (room && room.action_items) || [];
+    if (allItems.length > 0) {
+      const offenItems = allItems.filter(a => a.status !== 'erledigt');
+      const doneItems = allItems.filter(a => a.status === 'erledigt');
+      const renderItem = (a) => {
+        const isDone = a.status === 'erledigt';
+        const botBadge = a.bot ? `<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(99,102,241,0.15);color:#818cf8;font-weight:700;flex-shrink:0;">${escHtml(a.bot)}</span>` : '';
+        const statusBadge = isDone
+          ? `<span style="font-size:9px;padding:1px 6px;border-radius:10px;background:rgba(34,197,94,0.15);color:#22c55e;font-weight:700;">erledigt</span>`
+          : `<span style="font-size:9px;padding:1px 6px;border-radius:10px;background:rgba(245,158,11,0.15);color:#f59e0b;font-weight:700;">offen</span>`;
+        const deltaBadge = !isDone && a.recovered
+          ? `<span title="Im letzten Fazit vergessen — automatisch wiederhergestellt" style="font-size:9px;padding:1px 6px;border-radius:10px;background:rgba(34,211,238,0.15);color:#22d3ee;font-weight:700;">&#8635; recovered</span>`
+          : !isDone && a.stale
+          ? `<span title="Seit einer Runde ungelöst" style="font-size:9px;padding:1px 6px;border-radius:10px;background:rgba(148,163,184,0.15);color:#94a3b8;font-weight:700;">&#8987; stale</span>`
+          : '';
+        return `<div style="display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:6px;background:${isDone ? 'rgba(34,197,94,0.04)' : a.recovered ? 'rgba(34,211,238,0.04)' : 'rgba(245,158,11,0.05)'};border:1px solid ${isDone ? 'rgba(34,197,94,0.15)' : a.recovered ? 'rgba(34,211,238,0.2)' : 'rgba(245,158,11,0.2)'};margin-bottom:4px;${isDone ? 'opacity:0.65;' : ''}">
+          ${botBadge}
+          <span style="font-size:11px;color:var(--text-primary);flex:1;${isDone ? 'text-decoration:line-through;' : ''}">${escHtml(a.text)}</span>
+          ${deltaBadge}${statusBadge}
+        </div>`;
+      };
+      html += `<div style="margin-top:12px;padding-top:10px;border-top:1px dashed rgba(99,102,241,0.2);">
+        <div style="font-size:9px;color:#818cf8;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:7px;font-weight:700;">Aktions-Tracker (${offenItems.length} offen / ${doneItems.length} erledigt)</div>
+        ${offenItems.map(renderItem).join('')}
+        ${doneItems.map(renderItem).join('')}
+      </div>`;
     }
     return html;
   }
@@ -625,19 +728,60 @@
     return { owner: raw, autoResolved };
   }
 
+  // DeltaAction-Linter: action is vague if it has no file ref and no function/method ref
+  function _isActionVague(text) {
+    const hasFile = /\b\w[\w\-/.]*\.(js|ts|py|html|css|json|md|sh|bat|yml|yaml|txt)\b/i.test(text);
+    const hasFunc = /\b\w+\s*\(|\bdef\s+\w+|\bfunction\s+\w+|\b\w+\.\w+\s*\(/i.test(text);
+    return !hasFile && !hasFunc;
+  }
+
+  // DeltaReview: find bots (other than proposer) whose messages contain key words from this action
+  function _collectActionReviewers(room, actionText, proposerBot) {
+    if (!actionText || actionText.length < 15) return [];
+    const msgs = (room && room.messages) || [];
+    const seen = new Set();
+    const result = [];
+    const words = actionText.toLowerCase().split(/\s+/).filter(w => w.length > 4).slice(0, 8);
+    if (words.length < 2) return [];
+    msgs.forEach(m => {
+      if (!m.content || !m.name) return;
+      if (m.role === 'robin' || m.role === 'approval' || m.role === 'executor') return;
+      if (m.name === proposerBot || seen.has(m.name)) return;
+      const content = m.content.toLowerCase();
+      const hits = words.filter(w => content.includes(w)).length;
+      if (hits >= Math.max(2, Math.ceil(words.length * 0.6))) {
+        seen.add(m.name);
+        result.push({ name: m.name, color: m.color || '#9ca3af' });
+      }
+    });
+    return result;
+  }
+
+  function _reviewerBadgesHtml(reviewers) {
+    if (!reviewers || !reviewers.length) return '';
+    return reviewers.map(r =>
+      `<span title="Geprüft von ${escHtml(r.name)}" style="font-size:9px;padding:1px 5px;border-radius:3px;background:${escHtml(r.color)}22;color:${escHtml(r.color)};border:1px solid ${escHtml(r.color)}44;margin-left:4px;vertical-align:middle;white-space:nowrap;font-weight:700;">✓ ${escHtml(r.name)}</span>`
+    ).join('');
+  }
+
   function collectAllActionsFromMessages(room) {
     const msgs = (room && room.messages) || [];
     const collected = [];
+    const seenTexts = new Set();
     msgs.forEach((m, idx) => {
       if (!m.content || m.role === 'robin' || m.role === 'executor' || m.role === 'approval') return;
       let match;
       const re = /\[ACTION(?::([^\]]*))?\]\s*(.+)/g;
       while ((match = re.exec(m.content)) !== null) {
+        const text = match[2].trim();
+        const dedupeKey = text.toLowerCase();
+        if (seenTexts.has(dedupeKey)) continue;
+        seenTexts.add(dedupeKey);
         const { owner, autoResolved } = _resolveOwner(match[1], m.name);
         collected.push({
           bot: owner,
           autoResolved,
-          text: match[2].trim(),
+          text,
           msgIdx: idx,
           timestamp: m.timestamp,
           color: m.color || '#fbbf24',
@@ -647,22 +791,109 @@
     return collected;
   }
 
+  function actionStatusPill(room) {
+    const sammler = collectAllActionsFromMessages(room).length;
+    const s = collectRoomResults(room);
+    const openCount = (s.pending + s.running) + Math.max(sammler - s.total, 0);
+    const doneCount = s.done;
+    const cp = room.executor_checkpoint || {};
+    const isStale = cp.status === 'stale';
+    const isRecovered = room.paused_reason === 'server_restart';
+    if (openCount === 0 && doneCount === 0 && !isStale && !isRecovered) return '';
+    const parts = [];
+    if (isRecovered) parts.push(`<span style="background:rgba(99,102,241,0.18);color:#818cf8;border-radius:4px;padding:1px 6px;font-size:9px;font-weight:700;" title="Raum nach Server-Neustart wiederhergestellt">↩ recovered</span>`);
+    if (isStale) parts.push(`<span style="background:rgba(239,68,68,0.18);color:#f87171;border-radius:4px;padding:1px 6px;font-size:9px;font-weight:700;" title="Executor hängte >10min — Aktionen als fehlgeschlagen markiert">⚠ stale</span>`);
+    if (openCount > 0) parts.push(`<span style="background:rgba(245,158,11,0.18);color:#f59e0b;border-radius:4px;padding:1px 6px;font-size:9px;font-weight:700;">${openCount} offen</span>`);
+    if (doneCount > 0) parts.push(`<span style="background:rgba(16,185,129,0.18);color:#10b981;border-radius:4px;padding:1px 6px;font-size:9px;font-weight:700;">&#10003; ${doneCount}</span>`);
+    return `<span style="display:inline-flex;gap:3px;margin-left:6px;vertical-align:middle;">${parts.join('')}</span>`;
+  }
+
   function countSammlerBadge(room) {
     const actions = collectAllActionsFromMessages(room);
     if (actions.length === 0) return '';
     return ` <span style="background:rgba(251,191,36,0.25);color:#fbbf24;border-radius:10px;padding:1px 6px;font-size:9px;margin-left:3px;">${actions.length}</span>`;
   }
 
+  async function _pinUnclearAction(roomId, text, bot, msgIdx, msgTimestamp, btn) {
+    try {
+      btn.disabled = true;
+      const res = await fetch(`/api/arena/rooms/${roomId}/unclear`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ text, bot, msgIdx, msgTimestamp }),
+      });
+      const data = await res.json();
+      if (data.dup) { btn.textContent = '📌 Gemerkt'; btn.style.color = '#6b7280'; return; }
+      btn.textContent = '📌 Gemerkt';
+      btn.style.color = '#10b981';
+      // Refresh room so unclear_actions updates
+      const rIdx = rooms.findIndex(r => r.id === roomId);
+      if (rIdx >= 0) {
+        const rr = await fetch(`/api/arena/rooms/${roomId}`).then(r => r.json()).catch(() => null);
+        if (rr) rooms[rIdx] = rr;
+        renderRoomView();
+      }
+    } catch(e) { btn.disabled = false; btn.textContent = '📌 Merken'; }
+  }
+
+  async function _unpinUnclearAction(roomId, text) {
+    await fetch(`/api/arena/rooms/${roomId}/unclear`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ text, remove: true }),
+    });
+    const rIdx = rooms.findIndex(r => r.id === roomId);
+    if (rIdx >= 0) {
+      const rr = await fetch(`/api/arena/rooms/${roomId}`).then(r => r.json()).catch(() => null);
+      if (rr) rooms[rIdx] = rr;
+      renderRoomView();
+    }
+  }
+
   function renderSammlerPanel(room) {
     if (!room) return '';
     const actions = collectAllActionsFromMessages(room);
-    if (actions.length === 0) {
+    const unclearPinned = (room.unclear_actions || []);
+
+    // Pinned unclear actions block (survives reload)
+    let unclearBlock = '';
+    if (unclearPinned.length > 0) {
+      const rows = unclearPinned.map(u => {
+        const refParts = [];
+        if (u.msgIdx != null) refParts.push(`Msg #${u.msgIdx + 1}`);
+        if (u.msgTimestamp) refParts.push(relTime(u.msgTimestamp));
+        const ref = refParts.length
+          ? `<span style="font-size:9px;color:#6b7280;margin-left:6px;" title="Ursprungsposition im Chatverlauf">↩ ${refParts.join(' · ')}</span>`
+          : '';
+        return `
+        <div style="display:flex;align-items:flex-start;gap:8px;padding:6px 10px;border-radius:6px;background:rgba(239,68,68,0.07);border:1px solid rgba(239,68,68,0.22);margin-bottom:4px;">
+          <span style="font-size:13px;flex-shrink:0;margin-top:1px;">⚠️</span>
+          <div style="flex:1;min-width:0;">
+            <div style="display:flex;align-items:center;flex-wrap:wrap;gap:3px;margin-bottom:3px;">
+              ${u.bot ? `<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(239,68,68,0.15);color:#ef4444;">${escHtml(u.bot)}</span>` : ''}
+              ${ref}
+            </div>
+            <span style="font-size:11px;color:var(--text-primary);line-height:1.4;">${escHtml(u.text)}</span>
+          </div>
+          <button onclick="MC.arena._unpinUnclearAction('${escHtml(room.id)}', ${JSON.stringify(u.text)})"
+            style="flex-shrink:0;background:none;border:none;color:#6b7280;font-size:11px;cursor:pointer;padding:2px 5px;border-radius:3px;"
+            title="Aus Klaerungsliste entfernen">✕</button>
+        </div>`;
+      }).join('');
+      unclearBlock = `<div style="margin-bottom:12px;padding:8px 10px;background:rgba(239,68,68,0.05);border:1px solid rgba(239,68,68,0.3);border-radius:7px;">
+        <div style="font-size:10px;color:#ef4444;font-weight:700;margin-bottom:6px;">📌 ${unclearPinned.length} Klaerung(en) offen — persistiert</div>
+        ${rows}
+      </div>`;
+    }
+
+    if (actions.length === 0 && unclearPinned.length === 0) {
       return `<div style="color:var(--text-muted);font-size:12px;padding:20px 4px;text-align:center;">
         Noch keine Aktionsvorschlaege.<br><br>
         Bots markieren Vorschlaege mit <code style="background:rgba(255,255,255,0.06);padding:1px 5px;border-radius:3px;font-size:10px;">[ACTION: BotName] Text</code><br>
         im Diskussionsverlauf. Diese erscheinen hier gebuendelt.
       </div>`;
     }
+    if (actions.length === 0) return unclearBlock;
 
     // Group by bot name
     const byBot = {};
@@ -673,10 +904,13 @@
     });
 
     const sammlerMsgId = `sammler-actions-${Date.now()}`;
-    let html = `<div style="margin-bottom:10px;padding:8px 10px;background:rgba(251,191,36,0.06);border:1px solid rgba(251,191,36,0.2);border-radius:7px;">
+    let html = unclearBlock;
+    html += `<div style="margin-bottom:10px;padding:8px 10px;background:rgba(251,191,36,0.06);border:1px solid rgba(251,191,36,0.2);border-radius:7px;">
       <div style="font-size:10px;color:#fbbf24;font-weight:700;margin-bottom:2px;">${actions.length} Vorschlaege aus dem Verlauf</div>
       <div style="font-size:10px;color:var(--text-muted);">Haken setzen, dann "Freigeben" druecken. Executor setzt die Auswahl um.</div>
     </div>`;
+
+    const pinnedTexts = new Set(unclearPinned.map(u => u.text));
 
     html += `<div id="${sammlerMsgId}" style="display:flex;flex-direction:column;gap:12px;">`;
     Object.entries(byBot).forEach(([botName, group]) => {
@@ -688,9 +922,28 @@
         const autoWarn = a.autoResolved
           ? `<span title="Besitzer auto-zugewiesen (mehrdeutig im Original)" style="font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(239,68,68,0.12);color:#ef4444;border:1px solid rgba(239,68,68,0.25);margin-left:5px;vertical-align:middle;">auto</span>`
           : '';
-        html += `<label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;padding:7px 10px;border-radius:7px;background:rgba(251,191,36,0.05);border:1px solid rgba(251,191,36,0.15);margin-bottom:4px;transition:background 0.15s;">
-          <input type="checkbox" checked class="arena-sammler-cb" data-bot="${escHtml(botName)}" data-text="${escHtml(a.text)}" style="accent-color:#fbbf24;margin-top:2px;flex-shrink:0;">
-          <span style="font-size:11px;color:var(--text-primary);line-height:1.4;"><span style="font-size:9px;padding:1px 5px;border-radius:3px;background:${escHtml(group.color)}18;color:${escHtml(group.color)};border:1px solid ${escHtml(group.color)}33;margin-right:6px;vertical-align:middle;">${escHtml(botName)}</span>${autoWarn}${escHtml(a.text)}</span>
+        const isVague = _isActionVague(a.text);
+        const alreadyPinned = pinnedTexts.has(a.text);
+        const vagueWarn = isVague
+          ? `<span title="Vage Aktion — kein Datei- oder Funktionsbezug erkennbar. Bitte vor Freigabe präzisieren." style="font-size:12px;margin-right:4px;cursor:help;vertical-align:middle;" aria-label="Vage Aktion">⚠️</span>`
+          : '';
+        const pinBtn = isVague
+          ? `<button
+              onclick="event.preventDefault();event.stopPropagation();MC.arena._pinUnclearAction('${escHtml(room.id)}', ${JSON.stringify(a.text)}, ${JSON.stringify(botName)}, ${a.msgIdx != null ? a.msgIdx : 'null'}, ${JSON.stringify(a.timestamp || '')}, this)"
+              style="margin-top:4px;padding:2px 8px;font-size:10px;border-radius:4px;border:1px solid rgba(239,68,68,0.4);background:rgba(239,68,68,0.08);color:${alreadyPinned ? '#6b7280' : '#ef4444'};cursor:pointer;"
+              ${alreadyPinned ? 'disabled' : ''}
+              title="Als offen markieren — bleibt nach Reload sichtbar">${alreadyPinned ? '📌 Gemerkt' : '📌 Merken'}</button>`
+          : '';
+        const unklar = isVague
+          ? `<div style="margin-top:5px;font-size:10px;color:#ef4444;display:flex;align-items:center;gap:5px;padding:3px 6px;background:rgba(239,68,68,0.06);border-radius:5px;border:1px solid rgba(239,68,68,0.2);">⚠️ Unklar — bei <strong style="font-weight:700;">${escHtml(botName)}</strong> nachschärfen${pinBtn}</div>`
+          : '';
+        const reviewers = _collectActionReviewers(room, a.text, botName);
+        const reviewBadges = _reviewerBadgesHtml(reviewers);
+        html += `<label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;padding:7px 10px;border-radius:7px;background:${isVague ? 'rgba(239,68,68,0.04)' : 'rgba(251,191,36,0.05)'};border:1px solid ${isVague ? 'rgba(239,68,68,0.25)' : 'rgba(251,191,36,0.15)'};margin-bottom:4px;transition:background 0.15s;flex-direction:column;">
+          <div style="display:flex;align-items:flex-start;gap:8px;width:100%;">
+            <input type="checkbox" checked class="arena-sammler-cb" data-bot="${escHtml(botName)}" data-text="${escHtml(a.text)}" style="accent-color:#fbbf24;margin-top:2px;flex-shrink:0;">
+            <span style="font-size:11px;color:var(--text-primary);line-height:1.4;flex-wrap:wrap;display:flex;align-items:center;gap:2px;"><span style="font-size:9px;padding:1px 5px;border-radius:3px;background:${escHtml(group.color)}18;color:${escHtml(group.color)};border:1px solid ${escHtml(group.color)}33;margin-right:6px;vertical-align:middle;white-space:nowrap;">${escHtml(botName)}</span>${autoWarn}${vagueWarn}<span>${escHtml(a.text)}</span>${reviewBadges}</span>
+          </div>${unklar}
         </label>`;
       });
       html += `</div>`;
@@ -728,7 +981,7 @@
     const btn = el('arena-sammler-btn');
     if (!btn) return;
     const badge = countSammlerBadge(room);
-    btn.innerHTML = 'Sammler' + badge;
+    btn.innerHTML = 'Vorschläge' + badge;
     if (badge) {
       btn.style.borderColor = 'rgba(251,191,36,0.7)';
       btn.style.boxShadow = '0 0 6px rgba(251,191,36,0.35)';
@@ -807,14 +1060,24 @@
       const displayBot = botMatch ? botMatch[1] : (a.bot || '');
       const displayText = botMatch ? botMatch[2] : (a.text || '');
       const botBadge = displayBot ? `<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(251,191,36,0.12);color:#fbbf24;border:1px solid rgba(251,191,36,0.3);margin-right:6px;vertical-align:middle;">${escHtml(displayBot)}</span>` : '';
+      const reviewerBadge = a.reviewer_bot ? `<span title="Reviewer" style="font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(99,102,241,0.15);color:#a5b4fc;border:1px solid rgba(99,102,241,0.35);">&#128065; ${escHtml(a.reviewer_bot)}</span>` : '';
+      const verdictBadge = (() => {
+        if (!a.review_verdict) return '';
+        const v = String(a.review_verdict).toUpperCase();
+        if (v === 'REIFE') return `<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(16,185,129,0.18);color:#10b981;border:1px solid rgba(16,185,129,0.35);font-weight:600;">&check; REIFE</span>`;
+        if (v === 'NACHBESSERN') return `<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(239,68,68,0.18);color:#ef4444;border:1px solid rgba(239,68,68,0.35);font-weight:600;">&#8635; NACHBESSERN</span>`;
+        return `<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(156,163,175,0.15);color:#9ca3af;">${escHtml(a.review_verdict)}</span>`;
+      })();
+      const reviewRow = (reviewerBadge || verdictBadge) ? `<div class="arena-approval-review" style="display:flex;gap:4px;padding-left:4px;margin-top:2px;">${reviewerBadge}${verdictBadge}</div>` : '';
       return `
-      <div class="arena-approval-action" data-approval-id="${m.approval_id}" data-action-idx="${i}"
+      <div class="arena-approval-action" data-approval-id="${m.approval_id}" data-action-idx="${i}" data-bot="${escHtml(displayBot)}" data-action-text="${escHtml(displayText)}"
         style="display:flex;flex-direction:column;gap:3px;padding:6px 9px;border-radius:6px;background:rgba(245,158,11,0.05);border:1px solid rgba(245,158,11,0.15);margin-bottom:4px;">
         <div style="display:flex;align-items:flex-start;gap:8px;">
           <span class="arena-approval-badge" style="flex-shrink:0;margin-top:1px;">${badgeFor(a.status)}</span>
           <span style="font-size:11px;color:var(--text-primary);line-height:1.4;flex:1;">${botBadge}${escHtml(displayText)}</span>
         </div>
         <div class="arena-approval-result" style="font-size:10px;color:var(--text-muted);line-height:1.4;padding-left:4px;${a.result ? '' : 'display:none;'}">${a.result ? escHtml(a.result) : ''}</div>
+        ${reviewRow}
       </div>
     `; }).join('');
     return `<div style="background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.2);border-radius:8px;padding:8px 12px;">
@@ -829,6 +1092,61 @@
     </div>`;
   }
 
+  // ── Provider-Branding: fixe Farben + Inline-Logos pro LLM-Anbieter ────
+  // Claude = orange (Anthropic-Terracotta), Codex/GPT = grün (OpenAI),
+  // Gemini = blau (Google). Fallback = ursprüngliche m.color.
+  // Inline-SVG-Logos der offiziellen Marken (erkennbare Annäherungen,
+  // nicht die Original-Vector-Files — die Anthropic/OpenAI/Google Logos
+  // sind markenrechtlich geschützt, also vereinfacht nachgebaut).
+  const _CLAUDE_LOGO = `<svg viewBox="0 0 32 32" width="15" height="15" style="flex-shrink:0;" aria-label="Claude">
+    <g fill="#D97757">
+      <path d="M16 3 C16.6 9 17.4 13.5 16 16 C14.6 13.5 15.4 9 16 3 Z"/>
+      <path d="M16 29 C15.4 23 14.6 18.5 16 16 C17.4 18.5 16.6 23 16 29 Z"/>
+      <path d="M3 16 C9 15.4 13.5 14.6 16 16 C13.5 17.4 9 16.6 3 16 Z"/>
+      <path d="M29 16 C23 16.6 18.5 17.4 16 16 C18.5 14.6 23 15.4 29 16 Z"/>
+    </g>
+  </svg>`;
+
+  // OpenAI: charakteristisches Knotengeflecht — 3 rotierte Ellipsen ergeben
+  // die erkennbare 6-petal Silhouette des Originals
+  const _OPENAI_LOGO = `<svg viewBox="0 0 32 32" width="15" height="15" style="flex-shrink:0;" aria-label="OpenAI">
+    <g fill="none" stroke="#10A37F" stroke-width="1.8" stroke-linecap="round">
+      <ellipse cx="16" cy="16" rx="11" ry="4.8" transform="rotate(0 16 16)"/>
+      <ellipse cx="16" cy="16" rx="11" ry="4.8" transform="rotate(60 16 16)"/>
+      <ellipse cx="16" cy="16" rx="11" ry="4.8" transform="rotate(120 16 16)"/>
+    </g>
+  </svg>`;
+
+  // Google Gemini: 4-strahliger Diamond-Stern mit dezentem Farbverlauf
+  // (Blau → Purple) wie im Original-Branding
+  const _GEMINI_LOGO = `<svg viewBox="0 0 32 32" width="15" height="15" style="flex-shrink:0;" aria-label="Gemini">
+    <defs>
+      <linearGradient id="gem-grad" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%" stop-color="#4285F4"/>
+        <stop offset="60%" stop-color="#6B7FEA"/>
+        <stop offset="100%" stop-color="#9B72F0"/>
+      </linearGradient>
+    </defs>
+    <path fill="url(#gem-grad)" d="M16 3 L17.5 12.5 L26 16 L17.5 19.5 L16 29 L14.5 19.5 L6 16 L14.5 12.5 Z"/>
+  </svg>`;
+
+  const _PROVIDER_BRAND = {
+    'claude-cli':  {color: '#D97757', label: 'Claude',   logo: _CLAUDE_LOGO},
+    'claude-api':  {color: '#D97757', label: 'Claude',   logo: _CLAUDE_LOGO},
+    'codex-cli':   {color: '#10A37F', label: 'GPT',      logo: _OPENAI_LOGO},
+    'openai':      {color: '#10A37F', label: 'OpenAI',   logo: _OPENAI_LOGO},
+    'gemini-cli':  {color: '#4285F4', label: 'Gemini',   logo: _GEMINI_LOGO},
+    'openclaw':    {color: '#9B59B6', label: 'OpenClaw',
+      logo: `<svg viewBox="0 0 32 32" width="15" height="15" style="flex-shrink:0;" aria-label="OpenClaw">
+        <circle cx="16" cy="16" r="10" fill="none" stroke="#9B59B6" stroke-width="2"/>
+        <circle cx="16" cy="16" r="3" fill="#9B59B6"/>
+      </svg>`},
+  };
+
+  function _providerBrand(provider) {
+    return _PROVIDER_BRAND[provider] || null;
+  }
+
   function renderMessages(messages) {
     if (!messages || messages.length === 0) {
       return `<div style="text-align:center;color:var(--text-muted);font-size:12px;padding:40px 0;">
@@ -841,13 +1159,39 @@
       if (m.role === 'approval' && m.approval_id) {
         return renderApprovalMessage(m);
       }
+
+      // Renewal divider — prominent banner showing compression happened
+      if (m.is_renewal_divider) {
+        const ts = m.timestamp ? new Date(m.timestamp).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' }) : '';
+        return `<div style="display:flex;align-items:center;gap:8px;margin:10px 0;padding:8px 12px;border-radius:8px;background:rgba(99,102,241,0.08);border:1px solid rgba(99,102,241,0.3);">
+          <span style="font-size:14px;">📦</span>
+          <span style="font-size:11px;color:#a78bfa;flex:1;">${escHtml(m.content || 'Raum komprimiert')}</span>
+          ${ts ? `<span style="font-size:9px;color:var(--text-muted);white-space:nowrap;">${ts}</span>` : ''}
+        </div>`;
+      }
+
+      // Renewal seed — subtle top note so Robin knows it's a fresh context
+      if (m.is_renewal_seed) {
+        const ts = m.timestamp ? new Date(m.timestamp).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' }) : '';
+        return `<div style="display:flex;align-items:center;gap:8px;margin:4px 0 8px;padding:7px 12px;border-radius:8px;background:rgba(168,85,247,0.07);border:1px dashed rgba(168,85,247,0.3);">
+          <span style="font-size:12px;">🔁</span>
+          <span style="font-size:10px;color:#c084fc;flex:1;">${escHtml(m.content || 'Kontext-Seed — Bots haben neuen Start')}</span>
+          ${ts ? `<span style="font-size:9px;color:var(--text-muted);white-space:nowrap;">${ts}</span>` : ''}
+        </div>`;
+      }
       const isRobin = m.role === 'robin';
       const isOrch = m.role === 'orchestrator';
       const isExec = m.mode === 'execute';
       const isExecutor = m.role === 'executor';
-      const bgColor = isExecutor ? 'rgba(16,185,129,0.08)' : isOrch ? 'rgba(168,85,247,0.08)' : isRobin ? 'rgba(245,158,11,0.08)' : isExec ? 'rgba(239,68,68,0.06)' : `${m.color || '#6366f1'}0a`;
-      const borderColor = isExecutor ? 'rgba(16,185,129,0.25)' : isOrch ? 'rgba(168,85,247,0.25)' : isRobin ? 'rgba(245,158,11,0.2)' : isExec ? 'rgba(239,68,68,0.25)' : `${m.color || '#6366f1'}20`;
-      const nameColor = m.color || (isRobin ? '#f59e0b' : isOrch ? '#a855f7' : isExecutor ? '#10b981' : '#6366f1');
+
+      // Provider-Branding: überschreibt m.color wenn m.provider bekannt ist.
+      // Gilt für Trialog-Räume und alle Messages die explizit provider tragen.
+      const brand = (!isRobin && !isOrch && !isExecutor) ? _providerBrand(m.provider) : null;
+      const effectiveColor = brand ? brand.color : (m.color || '#6366f1');
+
+      const bgColor = isExecutor ? 'rgba(16,185,129,0.08)' : isOrch ? 'rgba(168,85,247,0.08)' : isRobin ? 'rgba(245,158,11,0.08)' : isExec ? 'rgba(239,68,68,0.06)' : `${effectiveColor}0a`;
+      const borderColor = isExecutor ? 'rgba(16,185,129,0.25)' : isOrch ? 'rgba(168,85,247,0.25)' : isRobin ? 'rgba(245,158,11,0.2)' : isExec ? 'rgba(239,68,68,0.25)' : `${effectiveColor}20`;
+      const nameColor = isRobin ? '#f59e0b' : isOrch ? '#a855f7' : isExecutor ? '#10b981' : effectiveColor;
       const modelBadge = m.model ? `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:rgba(255,255,255,0.05);color:var(--text-muted);margin-left:4px;">${m.model}</span>` : '';
       const execBadge = isExec ? `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:rgba(239,68,68,0.15);color:#ef4444;margin-left:3px;font-weight:600;">EXEC</span>` : '';
       const executorBadge = isExecutor ? `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:rgba(16,185,129,0.15);color:#10b981;margin-left:3px;font-weight:600;">UMSETZUNG</span>` : '';
@@ -855,6 +1199,31 @@
       const turnBadge = m.turn !== undefined ? `<span style="font-size:8px;color:var(--text-muted);margin-left:auto;">#${m.turn + 1}</span>` : '';
 
       let content = formatMarkdown(m.content);
+
+      // GammaURTEIL: extract URTEIL: line from content and render as prominent badge
+      let urteilBanner = '';
+      if (m.content) {
+        const urteilM = m.content.match(/URTEIL:\s*(REIFE|NACHBESSERN)((?:\s*#\d+(?:,\s*#?\d+)*)?)/i);
+        if (urteilM) {
+          const v = urteilM[1].toUpperCase();
+          const rawNums = (urteilM[2] || '').trim();
+          const actionNums = rawNums ? rawNums.replace(/\s/g, '').replace(/#/g, '') : '';
+          const isReife = v === 'REIFE';
+          const bannerColor = isReife ? '#10b981' : '#ef4444';
+          const bannerBg = isReife ? 'rgba(16,185,129,0.12)' : 'rgba(239,68,68,0.12)';
+          const bannerBorder = isReife ? 'rgba(16,185,129,0.35)' : 'rgba(239,68,68,0.35)';
+          const bannerIcon = isReife ? '✓' : '↻';
+          const actionBadge = actionNums ? `<span style="font-size:9px;padding:1px 6px;border-radius:3px;background:rgba(239,68,68,0.15);color:#ef4444;border:1px solid rgba(239,68,68,0.3);font-weight:700;">Aktion #${actionNums}</span>` : '';
+          urteilBanner = `<div style="margin-top:7px;display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:6px;background:${bannerBg};border:1px solid ${bannerBorder};">
+            <span style="font-size:14px;font-weight:700;color:${bannerColor};">${bannerIcon}</span>
+            <span style="font-size:11px;font-weight:700;color:${bannerColor};letter-spacing:0.5px;">URTEIL: ${v}</span>
+            ${actionBadge}
+            <span style="font-size:9px;color:var(--text-muted);margin-left:auto;">von ${escHtml(m.name || '')}</span>
+          </div>`;
+          // Strip the URTEIL line from displayed content
+          content = content.replace(/URTEIL:\s*(REIFE|NACHBESSERN)((?:\s*#\d+(?:,\s*#?\d+)*)?)/gi, '').replace(/<br>\s*$/, '');
+        }
+      }
 
       // Image attachment (drag & drop upload)
       if (m.image) {
@@ -890,30 +1259,28 @@
         const actions = [];
         let match;
         while ((match = actionRegex.exec(m.content)) !== null) {
-          actions.push({ bot: (match[1] || '').trim(), text: match[2].trim() });
+          actions.push({ bot: (match[1] || m.name || '').trim(), text: match[2].trim() });
         }
         if (actions.length > 0) {
           const msgId = `orch-actions-${idx}-${Date.now()}`;
           const checkboxes = actions.map((a, i) => {
             const botBadge = a.bot ? `<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(168,85,247,0.18);color:#c084fc;font-weight:700;flex-shrink:0;margin-right:4px;">${escHtml(a.bot)}</span>` : '';
-            return `<label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;padding:5px 8px;border-radius:6px;background:rgba(168,85,247,0.04);border:1px solid rgba(168,85,247,0.12);transition:background 0.15s;">
+            const isVagueOrch = _isActionVague(a.text);
+            const vagueWarn = isVagueOrch
+              ? `<span title="Vage Aktion — kein Datei- oder Funktionsbezug erkennbar. Bitte vor Freigabe präzisieren." style="font-size:12px;margin-right:4px;cursor:help;vertical-align:middle;" aria-label="Vage Aktion">⚠️</span>`
+              : '';
+            const unklar = isVagueOrch && a.bot
+              ? `<span style="font-size:10px;color:#ef4444;margin-left:4px;padding:1px 5px;border-radius:3px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);">Unklar — bei ${escHtml(a.bot)} nachschärfen</span>`
+              : '';
+            return `<label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;padding:5px 8px;border-radius:6px;background:${isVagueOrch ? 'rgba(239,68,68,0.04)' : 'rgba(168,85,247,0.04)'};border:1px solid ${isVagueOrch ? 'rgba(239,68,68,0.2)' : 'rgba(168,85,247,0.12)'};transition:background 0.15s;">
               <input type="checkbox" checked data-action-idx="${i}" data-action-text="${escHtml(a.text)}" class="arena-action-cb" data-msg-id="${msgId}" style="accent-color:#a855f7;margin-top:2px;flex-shrink:0;">
-              <span style="font-size:11px;color:var(--text-primary);line-height:1.4;display:flex;align-items:center;gap:0;flex-wrap:wrap;">${botBadge}${escHtml(a.text)}</span>
+              <span style="font-size:11px;color:var(--text-primary);line-height:1.4;display:flex;align-items:center;gap:0;flex-wrap:wrap;">${botBadge}${vagueWarn}${escHtml(a.text)}${unklar}</span>
             </label>`;
           }).join('');
           actionBlock = `
             <div id="${msgId}" style="margin-top:8px;display:flex;flex-direction:column;gap:4px;">
-              <div style="font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px;">Aktionsvorschlaege — waehle aus:</div>
+              <div style="font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px;">Aktionsvorschlaege — zur Freigabe</div>
               ${checkboxes}
-              <button onclick="MC.arena.approveActions('${msgId}')"
-                title="Gibt die angehakten [ACTION]-Punkte zur Ausfuehrung frei. Executor-Bot bekommt Tool-Zugriff (Read/Write/Edit/Bash) und setzt sie als eigene Claude-Sessions um. Preview-Dialog zeigt vorher betroffene Dateien."
-                style="margin-top:6px;align-self:flex-start;padding:6px 16px;border-radius:6px;border:1px solid rgba(16,185,129,0.4);background:rgba(16,185,129,0.12);color:#10b981;font-size:11px;font-weight:600;cursor:pointer;transition:all 0.15s;"
-                onmouseover="this.style.background='rgba(16,185,129,0.25)'"
-                onmouseout="this.style.background='rgba(16,185,129,0.12)'"
-              >Gruenes Licht — Ausgewaehlte umsetzen</button>
-              <div style="margin-top:4px;font-size:10px;color:var(--text-muted);line-height:1.35;">
-                Gibt die Haken frei &amp; startet je Aktion eine Executor-Session mit Tool-Zugriff.
-              </div>
             </div>`;
           // Remove [ACTION] lines from the main content since we render them as checkboxes
           content = content.replace(/\[ACTION(?::[^\]]*)?\]\s*.+?(<br>|$)/g, '');
@@ -922,15 +1289,43 @@
 
       const leftBorder = isOrch ? 'border-left:3px solid #a855f7;' : isExecutor ? 'border-left:3px solid #10b981;' : '';
 
+      // Read receipts: collect bots that replied after this Robin message
+      let gelesenHtml = '';
+      if (isRobin) {
+        const seen = new Map();
+        for (let j = idx + 1; j < messages.length; j++) {
+          const nx = messages[j];
+          if (nx.role === 'robin') break;
+          if (nx.name && nx.role !== 'approval' && nx.role !== 'executor' && !seen.has(nx.name)) {
+            seen.set(nx.name, nx.color || '#9ca3af');
+          }
+        }
+        if (seen.size > 0) {
+          const badges = [...seen.entries()].map(([name, color]) =>
+            `<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:${color}18;color:${color};border:1px solid ${color}33;font-weight:600;">✓ ${escHtml(name)}</span>`
+          ).join(' ');
+          gelesenHtml = `<div style="margin-top:5px;display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
+            <span style="font-size:9px;color:var(--text-muted);">✓ gelesen von</span>${badges}
+          </div>`;
+        }
+      }
+
+      // Provider-Logo wenn vorhanden, sonst der klassische farbige Dot
+      const nameAdornment = brand
+        ? brand.logo
+        : `<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${nameColor};flex-shrink:0;"></span>`;
+
       return `<div style="background:${bgColor};border:1px solid ${borderColor};border-radius:8px;padding:8px 12px;${leftBorder}">
-        <div style="display:flex;align-items:center;gap:5px;margin-bottom:4px;">
-          <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${nameColor};flex-shrink:0;"></span>
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
+          ${nameAdornment}
           <span style="font-weight:600;font-size:11px;color:${nameColor};">${escHtml(m.name)}</span>
           ${modelBadge}${execBadge}${executorBadge}${orchBadge}${turnBadge}
           <span style="font-size:9px;color:var(--text-muted);margin-left:auto;">${relTime(m.timestamp)}</span>
         </div>
-        <div class="arena-msg-body" style="font-size:12px;color:var(--text-primary);line-height:1.45;">${content}</div>
+        <div class="arena-msg-body" style="font-size:12px;color:var(--text-primary);line-height:1.45;word-break:break-word;overflow-wrap:anywhere;">${content}</div>
+        ${urteilBanner}
         ${actionBlock}
+        ${gelesenHtml}
       </div>`;
     }).join('');
   }
@@ -997,7 +1392,7 @@
             </div>
             <div>
               <label style="font-size:10px;color:var(--text-muted);display:block;margin-bottom:3px;" title="Harte Obergrenze: maximal 25 Runden. Jede Runde = 1 Turn pro Bot.">Max Runden <span style="color:#f59e0b;">(Cap 25)</span></label>
-              <input id="arena-new-rounds" type="number" value="10" min="1" max="25" style="width:70px;background:var(--bg-input);border:1px solid var(--border-medium);color:var(--text-primary);border-radius:6px;padding:8px 10px;font-size:12px;outline:none;" title="Echte Rundenzahl (nicht Turns). Jede Runde = 1 Turn pro Bot. Hard-Cap: 25.">
+              <input id="arena-new-rounds" type="number" value="2" min="1" max="25" style="width:70px;background:var(--bg-input);border:1px solid var(--border-medium);color:var(--text-primary);border-radius:6px;padding:8px 10px;font-size:12px;outline:none;" title="Echte Rundenzahl (nicht Turns). Jede Runde = 1 Turn pro Bot. Hard-Cap: 25. Standard: 2 — nach 2 Runden muss jemand wirklich editieren.">
             </div>
             <div>
               <label style="font-size:10px;color:var(--text-muted);display:block;margin-bottom:3px;">Fazit alle</label>
@@ -1028,8 +1423,8 @@
       const title = document.getElementById('arena-new-title').value.trim() || 'Bot Diskussion';
       const topic = document.getElementById('arena-new-topic').value.trim();
       const category = document.getElementById('arena-new-category').value;
-      const maxRoundsRaw = parseInt(document.getElementById('arena-new-rounds').value) || 5;
-      const maxRounds = Math.min(10, Math.max(1, maxRoundsRaw));
+      const maxRoundsRaw = parseInt(document.getElementById('arena-new-rounds').value) || 2;
+      const maxRounds = Math.min(25, Math.max(1, maxRoundsRaw));
       const summarizeEvery = parseInt(document.getElementById('arena-new-summarize').value) || 10;
       const allowRead = document.getElementById('arena-new-read').checked;
 
@@ -1117,7 +1512,35 @@
     const msg = input.value.trim();
     if (!msg) return;
     input.value = '';
+
+    // [OK:...] / [NEIN:...] Kürzel — Veto/Approval direkt an Orchestrator
+    const okMatch = msg.match(/^\[OK:(.+)\]$/i);
+    const neinMatch = msg.match(/^\[NEIN:(.+)\]$/i);
+    if (okMatch || neinMatch) {
+      const verdict = okMatch ? 'OK' : 'NEIN';
+      const action = (okMatch || neinMatch)[1].trim();
+      _flashVerdictBadge(verdict);
+      try {
+        await fetch(`/api/arena/rooms/${roomId || activeRoom}/orchestrator`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: `Robin-Veto [${verdict}]: ${action}` }),
+        });
+        if (!_orchestratorOpen) toggleOrchestrator();
+      } catch (e) { console.error('[Arena] verdict failed:', e); }
+      return;
+    }
+
     await injectText(roomId, msg);
+  }
+
+  function _flashVerdictBadge(verdict) {
+    const color = verdict === 'OK' ? '#22c55e' : '#ef4444';
+    const badge = document.createElement('div');
+    badge.textContent = verdict === 'OK' ? '✓ OK' : '✗ NEIN';
+    badge.style.cssText = `position:fixed;top:60px;right:24px;z-index:9999;background:${color};color:#fff;font-weight:700;font-size:13px;padding:6px 16px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.4);transition:opacity 0.5s;`;
+    document.body.appendChild(badge);
+    setTimeout(() => { badge.style.opacity = '0'; setTimeout(() => badge.remove(), 500); }, 1800);
   }
 
   // Direkt Text in einen Raum einwerfen (ohne Input-Feld) — fuer Voice-Listener etc.
@@ -1289,6 +1712,28 @@
         console.error('[Arena] Execute failed:', e);
       }
     };
+  }
+
+  async function saveSnapshot(roomId) {
+    const label = window.prompt('Stand-Name (leer lassen für Zeitstempel):', '') ?? null;
+    if (label === null) return; // user pressed Cancel
+    try {
+      const res = await fetch(`/api/arena/rooms/${roomId}/snapshot`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: label.trim() }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        const name = data.label || data.file;
+        MC.toast(`📌 Stand gespeichert: "${name}" (${data.messages} Nachrichten)`);
+        await loadRooms(); // Badge für consensus_marks sofort aktualisieren
+      } else {
+        MC.toast('Fehler beim Speichern', 'error');
+      }
+    } catch (e) {
+      MC.toast('Snapshot fehlgeschlagen: ' + e.message, 'error');
+    }
   }
 
   async function requestSummary(roomId) {
@@ -1719,6 +2164,44 @@
           },
         });
       }
+    } else if (data.type === 'arena.renewed') {
+      const room = rooms.find(r => r.id === data.room_id);
+      const roomName = (room && room.name) || 'Arena';
+      const isActive = data.room_id === activeRoom && MC.getCurrentView && MC.getCurrentView() === 'arena';
+      if (isActive) {
+        MC.toast && MC.toast(`📦 Raum komprimiert — Kontext wurde erneuert`, 'info', 4000);
+      } else if (MC.completionToast) {
+        MC.completionToast({
+          icon: '📦',
+          label: 'Arena — Raum komprimiert',
+          title: roomName,
+          preview: 'Kontext wurde erneuert, Bots starten frisch weiter',
+          dedupKey: 'arena-renewal:' + data.room_id,
+          onClick: () => {
+            _setActiveRoom(data.room_id);
+            if (MC.switchView) MC.switchView('arena');
+            setTimeout(() => { renderRoomList(); renderRoomView(); }, 100);
+          },
+        });
+      }
+    } else if (data.type === 'arena.executor_stale') {
+      // Watchdog hat einen hängenden Executor nach >10min als stale markiert
+      loadRooms().then(() => { if (activeRoom) renderRoomView(); });
+      MC.toast && MC.toast('Executor-Lauf nach 10min als stale markiert — Aktionen auf "fehlgeschlagen" gesetzt', 'warning', 5000);
+      if (MC.completionToast) {
+        MC.completionToast({
+          icon: '⚠️',
+          label: 'Arena — Executor stale',
+          title: 'Executor hängte',
+          preview: 'Lauf nach 10min ohne Aktivität abgebrochen',
+          dedupKey: 'arena-stale-' + Date.now(),
+          onClick: () => { if (MC.switchView) MC.switchView('arena'); setTimeout(() => { renderRoomList(); renderRoomView(); }, 100); },
+        });
+      }
+    } else if (data.type === 'arena.executor_resumed') {
+      // Auto-Resume nach Server-Neustart
+      loadRooms().then(() => { if (activeRoom) renderRoomView(); });
+      MC.toast && MC.toast(`${data.count || 0} Executor-Lauf/Läufe wiederaufgenommen`, 'info', 3000);
     } else if (data.type === 'arena.executor') {
       if (data.room_id === activeRoom && data.status === 'done') {
         // Collect done/failed summary from approval messages
@@ -1857,6 +2340,9 @@
       MC.ws.on('arena.executor', handleWsEvent);
       MC.ws.on('arena.action.status', handleWsEvent);
       MC.ws.on('arena.needs_decision', handleWsEvent);
+      MC.ws.on('arena.renewed', handleWsEvent);
+      MC.ws.on('arena.executor_stale', handleWsEvent);
+      MC.ws.on('arena.executor_resumed', handleWsEvent);
       // After server restart: re-fetch rooms + refresh active view
       MC.ws.on('_ws_reconnect', () => {
         loadRooms().then(() => {
@@ -2176,6 +2662,19 @@
     });
   }
 
+  // ── Duplicate-action detection (word-overlap similarity) ─────────────
+  function _isDuplicateAction(newText, doneItems) {
+    const normalize = s => s.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(w => w.length > 2);
+    const newWords = new Set(normalize(newText));
+    if (newWords.size === 0) return false;
+    return doneItems.some(done => {
+      const doneWords = normalize(done.text || '');
+      const overlap = doneWords.filter(w => newWords.has(w)).length;
+      const similarity = overlap / Math.max(newWords.size, doneWords.length, 1);
+      return similarity >= 0.7;
+    });
+  }
+
   // ── Approve from Fazit panel (right side) ────────────────────────────
   async function approveFromPanel(panelMsgId) {
     if (!activeRoom) return;
@@ -2184,12 +2683,21 @@
     const checkboxes = container.querySelectorAll('.arena-panel-action-cb');
     const approved = [];
     const rejected = [];
+    const skipped = [];
+    const room = rooms.find(r => r.id === activeRoom);
+    const doneItems = (room && room.action_items || []).filter(a => a.status === 'erledigt');
     checkboxes.forEach(cb => {
       const label = cb.parentElement.querySelector('span');
       if (!label) return;
-      if (cb.checked) approved.push(label.textContent);
-      else rejected.push(label.textContent);
+      const text = label.textContent;
+      if (cb.checked) {
+        if (_isDuplicateAction(text, doneItems)) skipped.push(text);
+        else approved.push(text);
+      } else rejected.push(text);
     });
+    if (skipped.length > 0) {
+      MC.toast && MC.toast(`${skipped.length} Aktion(en) uebersprungen \u2014 bereits erledigt`, 'info', 4000);
+    }
     if (approved.length === 0) {
       MC.toast && MC.toast('Keine Aktionen ausgewaehlt', 'warning', 2000);
       return;
@@ -2240,6 +2748,8 @@
         badge.innerHTML = '<span style="font-size:9px;padding:2px 6px;border-radius:3px;background:rgba(239,68,68,0.2);color:#ef4444;font-weight:700;">&cross; Fehler</span>';
         row.style.background = 'rgba(239,68,68,0.05)';
         row.style.borderColor = 'rgba(239,68,68,0.2)';
+        // Rueck-Inject macht jetzt der Server in _update_approval_action
+        // (vorher feuerten mehrere offene Clients je einen Inject → doppelte Nachricht).
       } else if (status === 'haengend') {
         badge.innerHTML = '<span style="font-size:9px;padding:2px 6px;border-radius:3px;background:rgba(139,92,246,0.2);color:#a78bfa;font-weight:700;">&#8987; haengend</span>';
         row.style.background = 'rgba(139,92,246,0.05)';
@@ -2598,7 +3108,7 @@
       if (injectBar && !_mic.liveEl) {
         const live = document.createElement('div');
         live.id = 'arena-mic-live';
-        live.style.cssText = 'position:absolute;left:14px;right:14px;bottom:100%;margin-bottom:4px;padding:6px 10px;background:rgba(99,102,241,0.10);border:1px dashed rgba(99,102,241,0.35);border-radius:6px;color:#a5b4fc;font-size:12px;font-style:italic;line-height:1.4;pointer-events:none;display:none;z-index:5;';
+        live.style.cssText = 'position:absolute;left:14px;right:14px;bottom:100%;margin-bottom:4px;padding:6px 10px;background:rgba(15,23,42,0.95);border:1px solid rgba(99,102,241,0.45);border-radius:6px;color:#a5b4fc;font-size:12px;font-style:italic;line-height:1.4;pointer-events:none;display:none;z-index:5;';
         if (getComputedStyle(injectBar).position === 'static') {
           injectBar.style.position = 'relative';
         }
@@ -2671,16 +3181,189 @@
     } catch (_) { box.textContent = 'Netzwerkfehler'; }
   }
 
+  function toggleMarksPanel(roomId) {
+    const existing = document.getElementById('arena-marks-panel');
+    if (existing) { existing.remove(); return; }
+    const room = rooms.find(r => r.id === roomId);
+    if (!room) return;
+    const marks = room.consensus_marks || [];
+    const panel = document.createElement('div');
+    panel.id = 'arena-marks-panel';
+    panel.style.cssText = 'position:fixed;top:90px;right:20px;width:380px;max-height:60vh;overflow-y:auto;background:var(--bg-elevated,#1a1a1a);border:1px solid rgba(16,185,129,0.4);border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,0.4);z-index:9999;padding:10px 12px;font-size:11px;';
+    panel.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--border-subtle);padding-bottom:6px;margin-bottom:8px;">
+        <span style="color:#10b981;font-weight:700;flex:1;">✓ Konsens-Marken (${marks.length})</span>
+        <button onclick="MC.arena.toggleMarksPanel('${room.id}')" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:14px;">&#10005;</button>
+      </div>
+      ${marks.length === 0
+        ? '<div style="color:var(--text-muted);padding:8px 2px;">Keine Marken.</div>'
+        : marks.map((m, i) => `
+            <div style="display:flex;gap:8px;align-items:flex-start;padding:6px 4px;border-bottom:1px solid rgba(255,255,255,0.04);">
+              <div style="flex:1;min-width:0;">
+                <div style="color:var(--text-primary);font-weight:600;">Turn ${m.turn || '?'} · <span style="color:var(--text-muted);font-weight:400;">${(m.at || '').slice(0,16).replace('T',' ')}</span></div>
+                <div style="color:var(--text-muted);margin-top:2px;white-space:pre-wrap;word-break:break-word;">${escHtml((m.summary || '').slice(0, 400))}</div>
+              </div>
+              <button onclick="MC.arena.deleteConsensusMark('${room.id}', ${i})" title="Mark löschen (vergifteten Stand entfernen)" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#ef4444;border-radius:5px;padding:2px 7px;font-size:11px;cursor:pointer;flex-shrink:0;">&#10005;</button>
+            </div>`).join('')}
+    `;
+    document.body.appendChild(panel);
+  }
+
+  async function deleteConsensusMark(roomId, idx) {
+    if (!confirm('Diese Konsens-Marke löschen? Sie wird nicht mehr an die Bots übergeben.')) return;
+    try {
+      const res = await fetch(`/api/arena/rooms/${roomId}/consensus_marks/${idx}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!data.ok) { MC.toast('Löschen fehlgeschlagen', 'error'); return; }
+      const r = rooms.find(x => x.id === roomId);
+      if (r && Array.isArray(r.consensus_marks)) r.consensus_marks.splice(idx, 1);
+      MC.toast(`Mark gelöscht (noch ${data.remaining})`);
+      const panel = document.getElementById('arena-marks-panel');
+      if (panel) panel.remove();
+      if (activeRoom === roomId) renderRoomView();
+    } catch (e) {
+      MC.toast('Fehler: ' + e.message, 'error');
+    }
+  }
+
+  // ── Multi-Model Trialog: 3 Bots (Claude / GPT / Gemini) reden miteinander ──
+  async function startTrialog() {
+    // Modal mit Topic + Preset-Bot-Config (editierbar)
+    const existing = document.getElementById('arena-trialog-modal');
+    if (existing) existing.remove();
+    const modal = document.createElement('div');
+    modal.id = 'arena-trialog-modal';
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:10000;display:flex;align-items:center;justify-content:center;padding:20px';
+    modal.innerHTML = `
+      <div style="background:var(--bg-secondary,#0a0c12);border:1px solid rgba(255,255,255,.1);border-radius:12px;width:100%;max-width:720px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden">
+        <div style="padding:14px 18px;border-bottom:1px solid rgba(255,255,255,.05);display:flex;align-items:center;justify-content:space-between">
+          <div style="font-size:14px;font-weight:700;color:#e2e8f0">🤖🤖🤖 Multi-Model-Trialog</div>
+          <button onclick="document.getElementById('arena-trialog-modal').remove()" style="background:transparent;border:none;color:#64748b;font-size:20px;cursor:pointer;padding:0 6px">×</button>
+        </div>
+        <div style="padding:14px 18px;display:flex;flex-direction:column;gap:10px;overflow-y:auto">
+          <label style="font-size:11px;color:#94a3b8">Topic (worüber sollen sie diskutieren?)</label>
+          <textarea id="trialog-topic" rows="2" placeholder="z.B. „Sollte ich meine Doktorarbeit dieses Semester abschließen oder lieber ein Jahr verlängern?"
+                    style="width:100%;padding:10px;background:#070a13;border:1px solid rgba(255,255,255,.08);border-radius:6px;color:#e2e8f0;font-size:13px;font-family:inherit;resize:vertical"></textarea>
+          <div style="display:flex;gap:8px;align-items:center">
+            <label style="font-size:11px;color:#94a3b8">Runden:</label>
+            <input type="number" id="trialog-rounds" min="1" max="10" value="3" style="width:60px;padding:5px 8px;background:#070a13;border:1px solid rgba(255,255,255,.08);border-radius:5px;color:#e2e8f0;font-size:12px" />
+            <span style="margin-left:auto;font-size:10px;color:#64748b">jeder Bot spricht pro Runde einmal</span>
+          </div>
+          <div style="font-size:11px;color:#94a3b8;margin-top:8px;text-transform:uppercase;font-weight:700;letter-spacing:.05em">Bots</div>
+          <div id="trialog-bots" style="display:flex;flex-direction:column;gap:6px"></div>
+          <button id="trialog-add-bot" style="padding:5px 10px;background:transparent;color:#a78bfa;border:1px dashed #a78bfa55;border-radius:5px;font-size:11px;cursor:pointer;align-self:flex-start">+ Bot hinzufügen</button>
+          <div style="display:flex;gap:8px;margin-top:10px">
+            <button id="trialog-start-btn" style="flex:1;padding:9px;background:#a78bfa;color:#0f172a;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">▶ Trialog starten</button>
+            <button onclick="document.getElementById('arena-trialog-modal').remove()" style="padding:9px 14px;background:transparent;color:#94a3b8;border:1px solid rgba(255,255,255,.1);border-radius:6px;font-size:12px;cursor:pointer">Abbrechen</button>
+          </div>
+          <div id="trialog-status" style="font-size:11px;color:#64748b;min-height:14px"></div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+
+    // Default-Bots mit je eigenem Provider
+    const botDefaults = [
+      {name: 'Claude', provider: 'claude-cli', model: 'opus', color: '#d97757',
+       persona: 'Du bist Claude. Präzise, nachdenklich, argumentativ stark. Nimm klare Positionen ein und begründe sie sauber.'},
+      {name: 'GPT', provider: 'codex-cli', model: '', color: '#10a37f',
+       persona: 'Du bist GPT via Codex. Pragmatisch, direkt, breit informiert. Bringe praktische Gegenargumente ein und poke holes in weak reasoning.'},
+      {name: 'Gemini', provider: 'gemini-cli', model: '', color: '#4285f4',
+       persona: 'Du bist Gemini. Multi-perspektivisch, manchmal unorthodox. Bring neue Blickwinkel rein die die anderen übersehen haben.'},
+    ];
+
+    const botHost = modal.querySelector('#trialog-bots');
+    const providerOptions = `
+      <option value="claude-cli">Claude (CLI)</option>
+      <option value="claude-api">Claude (API)</option>
+      <option value="codex-cli">GPT via Codex</option>
+      <option value="gemini-cli">Gemini (CLI)</option>
+      <option value="openai">OpenAI API</option>
+      <option value="openclaw">OpenClaw</option>
+    `;
+
+    function renderBot(bot, idx) {
+      const row = document.createElement('div');
+      row.className = 'trialog-bot-row';
+      row.style.cssText = 'display:grid;grid-template-columns:32px 90px 130px 90px 1fr 30px;gap:6px;align-items:center;padding:6px;background:#070a13;border-radius:5px;border:1px solid rgba(255,255,255,.04)';
+      row.innerHTML = `
+        <input type="color" value="${bot.color}" data-field="color" style="width:32px;height:28px;border:none;border-radius:3px;background:transparent;cursor:pointer" />
+        <input type="text" value="${(bot.name||'').replace(/"/g,'&quot;')}" placeholder="Name" data-field="name" style="padding:4px 6px;background:#0a0c12;border:1px solid rgba(255,255,255,.06);border-radius:3px;color:#e2e8f0;font-size:11px" />
+        <select data-field="provider" style="padding:4px 6px;background:#0a0c12;border:1px solid rgba(255,255,255,.06);border-radius:3px;color:#e2e8f0;font-size:11px">${providerOptions}</select>
+        <input type="text" value="${(bot.model||'').replace(/"/g,'&quot;')}" placeholder="model (optional)" data-field="model" style="padding:4px 6px;background:#0a0c12;border:1px solid rgba(255,255,255,.06);border-radius:3px;color:#e2e8f0;font-size:11px" />
+        <input type="text" value="${(bot.persona||'').replace(/"/g,'&quot;')}" placeholder="Persona" data-field="persona" style="padding:4px 6px;background:#0a0c12;border:1px solid rgba(255,255,255,.06);border-radius:3px;color:#e2e8f0;font-size:11px" />
+        <button data-bot-del="${idx}" style="padding:4px 8px;background:#ef444418;color:#f87171;border:1px solid #ef444444;border-radius:3px;font-size:11px;cursor:pointer">×</button>
+      `;
+      row.querySelector('[data-field="provider"]').value = bot.provider || 'claude-cli';
+      botHost.appendChild(row);
+    }
+    botDefaults.forEach((b, i) => renderBot(b, i));
+
+    modal.querySelector('#trialog-add-bot').addEventListener('click', () => {
+      renderBot({name: 'Bot-' + (botHost.children.length + 1), provider: 'claude-cli',
+                 model: '', color: '#6366f1', persona: 'Diskussionspartner.'},
+                botHost.children.length);
+    });
+
+    botHost.addEventListener('click', (e) => {
+      if (e.target.dataset.botDel !== undefined) e.target.closest('.trialog-bot-row').remove();
+    });
+
+    modal.querySelector('#trialog-start-btn').addEventListener('click', async () => {
+      const topic = modal.querySelector('#trialog-topic').value.trim();
+      if (!topic) {
+        modal.querySelector('#trialog-status').innerHTML = '<span style="color:#ef4444">Topic erforderlich</span>';
+        return;
+      }
+      const rounds = parseInt(modal.querySelector('#trialog-rounds').value, 10) || 3;
+      const bots = Array.from(botHost.children).map(row => {
+        const get = (f) => row.querySelector(`[data-field="${f}"]`)?.value.trim() || '';
+        return {
+          name: get('name') || 'Bot',
+          provider: get('provider') || 'claude-cli',
+          model: get('model'),
+          color: get('color') || '#6366f1',
+          persona: get('persona') || 'Diskussionspartner.',
+        };
+      }).filter(b => b.name);
+      if (bots.length < 2) {
+        modal.querySelector('#trialog-status').innerHTML = '<span style="color:#ef4444">Mindestens 2 Bots erforderlich</span>';
+        return;
+      }
+
+      modal.querySelector('#trialog-status').innerHTML = '<span style="color:#94a3b8">Starte…</span>';
+      try {
+        const r = await fetch('/api/arena/trialog/start', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({topic, max_rounds: rounds, bots}),
+        });
+        const d = await r.json();
+        if (!d.ok) {
+          modal.querySelector('#trialog-status').innerHTML = `<span style="color:#ef4444">✗ ${d.error}</span>`;
+          return;
+        }
+        modal.remove();
+        // Raum-Liste refreshen + direkt öffnen
+        await loadRooms();
+        if (d.room && d.room.id) openRoom(d.room.id);
+      } catch (e) {
+        modal.querySelector('#trialog-status').innerHTML = `<span style="color:#ef4444">✗ ${e.message}</span>`;
+      }
+    });
+  }
+
   // ── Public API ─────────────────────────────────────────────────────────
   window.MC = window.MC || {};
   MC.arena = {
     init, destroy, openRoom, createRoom, deleteRoom,
     startRoom, stopRoom, inject, injectText, getActiveRoomId, execute, editRoom,
-    handleWsEvent, loadRooms, requestSummary,
+    handleWsEvent, loadRooms, requestSummary, saveSnapshot,
     toggleOrchestrator, chatOrchestrator, approveActions,
     approveFromPanel, continueDiscussion, toggleResults,
     toggleSammler, refreshSammler, approveSammlerActions,
+    _pinUnclearAction, _unpinUnclearAction,
     toggleMic, pickAndInject, peekFileInline, toggleTts,
-    startMeetingRoom, toggleMeetingMode,
+    startMeetingRoom, toggleMeetingMode, startAlphaDesignRound, startTrialog,
+    toggleMarksPanel, deleteConsensusMark,
   };
 })();

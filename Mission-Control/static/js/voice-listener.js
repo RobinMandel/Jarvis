@@ -1,10 +1,11 @@
 // Voice Listener — "Jarvis" Wake Word → Chat-Nachricht
-// Kein Auto-Timer. Senden nur per Button-Klick oder "Senden"-Button im Dropdown.
+// Auto-Send nach ~10s Stille: busy = Queue, idle = Send
 MC.voiceListener = (function () {
   'use strict';
 
   const WAKE_WORDS = ['jarvis', 'jervis', 'javis', 'jarwis'];
   const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
+  const AUTO_SEND_DELAY = 10000; // ms Stille bis Auto-Aktion
 
   let recognition = null;
   let isListening = false;
@@ -13,6 +14,7 @@ MC.voiceListener = (function () {
   let skipCurrentUtterance = false;
   let captureBuffer = [];
   let safetyTimeout = null;
+  let autoSendTimer = null;
   let history = [];
 
   // DOM refs
@@ -139,6 +141,22 @@ MC.voiceListener = (function () {
     recognition.onerror  = handleError;
   }
 
+  function resetAutoSendTimer() {
+    if (autoSendTimer) clearTimeout(autoSendTimer);
+    autoSendTimer = setTimeout(() => {
+      autoSendTimer = null;
+      if (!isCapturing || captureBuffer.length === 0) return;
+      const queueMode = !!(MC.chat && MC.chat.isStreaming);
+      console.log('[VL] Auto-send after silence — queueMode:', queueMode);
+      updateUI('sending', queueMode ? 'Auto-Queue...' : 'Auto-Sende...');
+      finishCapture(queueMode);
+    }, AUTO_SEND_DELAY);
+  }
+
+  function clearAutoSendTimer() {
+    if (autoSendTimer) { clearTimeout(autoSendTimer); autoSendTimer = null; }
+  }
+
   function handleResult(event) {
     for (let i = event.resultIndex; i < event.results.length; i++) {
       const result     = event.results[i];
@@ -161,22 +179,26 @@ MC.voiceListener = (function () {
           if (m && m[1].trim().length > 1) {
             captureBuffer.push(m[1].trim());
             showLive(m[1].trim());
+            resetAutoSendTimer();
           }
-          updateUI('capturing', captureBuffer.length + ' Saetze — Klick zum Senden');
+          updateUI('capturing', captureBuffer.length + ' Saetze — Auto-Sende nach ~10s Stille');
         }
 
       } else {
-        // Active capture
+        // Active capture — reset silence timer on any speech activity
         if (result.isFinal) {
           const text = result[0].transcript.trim();
           console.log('[VL] Final:', text, '| buf:', captureBuffer.length);
           if (text.length > 0) {
             captureBuffer.push(text);
             showLive(text);
-            updateUI('capturing', captureBuffer.length + ' Saetze — Klick zum Senden');
+            updateUI('capturing', captureBuffer.length + ' Saetze — Auto-Sende nach ~10s Stille');
+            resetAutoSendTimer();
           }
         } else {
           showLive(result[0].transcript.trim(), true);
+          // Interim = Robin spricht noch → Timer zurücksetzen
+          if (captureBuffer.length > 0) resetAutoSendTimer();
         }
       }
     }
@@ -196,7 +218,7 @@ MC.voiceListener = (function () {
       if (isCapturing && skipCurrentUtterance) {
         console.log('[VL] skipCurrentUtterance stuck — force-reset after 3s');
         skipCurrentUtterance = false;
-        updateUI('capturing', '0 Saetze — Klick zum Senden');
+        updateUI('capturing', '0 Saetze — Auto-Sende nach ~10s Stille');
       }
     }, 3000);
     updateUI('capturing', 'Hoere zu...');
@@ -208,6 +230,7 @@ MC.voiceListener = (function () {
 
   async function finishCapture(queueMode) {
     console.log('[VL] finishCapture — queue:', !!queueMode, 'buffer:', captureBuffer.length, captureBuffer);
+    clearAutoSendTimer();
     isCapturing = false;
     skipCurrentUtterance = false;
     if (safetyTimeout) { clearTimeout(safetyTimeout); safetyTimeout = null; }
@@ -372,6 +395,7 @@ MC.voiceListener = (function () {
   function stopListener() {
     isListening = false;
     isCapturing = false;
+    clearAutoSendTimer();
     if (safetyTimeout) clearTimeout(safetyTimeout);
     try { recognition.stop(); } catch (_) {}
     updateUI('off', 'Aus');
@@ -521,6 +545,7 @@ MC.voiceListener = (function () {
   // so the next wake word starts from a clean state in the new room context.
   function reset() {
     const wasCapturing = isCapturing;
+    clearAutoSendTimer();
     isCapturing = false;
     skipCurrentUtterance = false;
     captureBuffer = [];

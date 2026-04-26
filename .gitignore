@@ -41,3 +41,19 @@ Thumbs.db
 dist/
 build/
 Mission-Control/static/legacy/videos/
+
+# Executor-Muell: Dateinamen die mit Sonderzeichen/Ziffern beginnen
+# (Nebenprodukt fehlgeschlagener Heredoc/Shell-Calls)
+/[`({[]*
+/[0-9]*
+/Math.*
+/Das
+/N
+/toggleMeetingMode*
+/x.id
+/letzter_bot_turn_at*
+/*%
+/(Timeout*
+
+# Outlook OAuth-Token-Caches (do not commit)
+scripts/.outlook-token-*.json

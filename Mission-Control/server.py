@@ -8,8 +8,27 @@ import time
 import uuid
 import os
 import sys
+import faulthandler
 from pathlib import Path
 from datetime import datetime
+
+# faulthandler ASAP so native crashes (Access Violation, segfault, abort)
+# from C-extensions like faiss / whisper / torch leave a Python traceback
+# in stderr instead of just rc=4294967295. This was the missing piece for
+# the 2026-04-25 hard-crash loop where mc_stderr.log had nothing useful.
+# When launched by watchdog.py, sys.stderr is the per-run err logfile,
+# so the dump lands next to the crash automatically.
+try:
+    faulthandler.enable(all_threads=True)
+    _boot_marker = (
+        f"[Boot] faulthandler enabled, pid={os.getpid()}, "
+        f"ts={datetime.now().isoformat(timespec='seconds')}\n"
+    )
+    sys.stderr.write(_boot_marker)
+    sys.stderr.flush()
+except Exception as _e:
+    # Non-fatal — server still starts, we just lose native-crash diagnostics
+    sys.stderr.write(f"[Boot] faulthandler.enable failed: {_e}\n")
 
 import aiohttp
 from aiohttp import web
@@ -45,6 +64,11 @@ if sys.platform == 'win32':
 DATA_DIR = BASE_DIR / "data"
 UPLOADS_DIR = DATA_DIR / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+IMAGE_JOBS_DIR = DATA_DIR / "image_jobs"
+IMAGE_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+IMAGES_LIBRARY_DIR = DATA_DIR / "images-library"
+IMAGES_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+(IMAGES_LIBRARY_DIR / "_inbox").mkdir(parents=True, exist_ok=True)
 TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
 TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -118,6 +142,19 @@ AVATARS_DIR = BASE_DIR / "avatars"
 with open(BASE_DIR / "config.json") as f:
     CONFIG = json.load(f)
 
+# Config-Keys in os.environ propagieren damit Provider-Clients (image_client.py,
+# Anthropic-SDK, OpenAI-SDK) sie ohne Extra-Wiring finden. Wir überschreiben
+# NICHT wenn die Env-Var schon gesetzt ist (Env gewinnt vor Config).
+for _cfg_key, _env_var in [
+    ("gemini_api_key", "GEMINI_API_KEY"),
+    ("openai_api_key", "OPENAI_API_KEY"),
+    ("anthropic_api_key", "ANTHROPIC_API_KEY"),
+    ("openrouter_api_key", "OPENROUTER_API_KEY"),
+]:
+    _v = (CONFIG.get(_cfg_key) or "").strip()
+    if _v and not os.environ.get(_env_var):
+        os.environ[_env_var] = _v
+
 import re
 
 
@@ -142,10 +179,36 @@ class _SafeLock(asyncio.Lock):
 
 
 class ClaudeSession:
-    """Represents a single chat session with Claude CLI."""
+    """Represents a single chat session. Despite the legacy name, this is now
+    the generic provider-agnostic session — see `provider`/`model`/`provider_thread_id`.
+
+    Provider-Switching (hart verworfenes Resume bei Wechsel, siehe Codex-Review 2026-04-23):
+      - provider und model sind getrennt persistiert, kombiniert nur in UI
+      - provider_thread_id ist provider-spezifisch (claude-cli: CLI-Session-UUID,
+        codex-cli: Codex thread_id). Bei Provider-Wechsel wird es hart auf None
+        gesetzt; eine System-Message in history markiert den Kontextbruch.
+    """
 
     def __init__(self, session_id=None):
         self.session_id = session_id or str(uuid.uuid4())
+        # Provider-Konfiguration (neu, 2026-04-23)
+        # Default: claude-cli — schnell, zuverlässig, kein API-Key-Management.
+        # OpenClaw bleibt als EXPLIZITE Picker-Wahl für agentische Tasks (sonst
+        # triggert jeder Quick-Chat unnötig einen vollen Agent-Turn mit Skills+Memory).
+        self.provider = "claude-cli"
+        self.model = ""               # leer = Provider nimmt Account-Default
+        self.provider_thread_id = None  # generisches Resume-Token (ersetzt cli_session_id semantisch)
+        # Global-Context-Bundles für diese Session (Geminis Vorschlag #2, 2026-04-23).
+        # Leere Liste = nur RAG-Semantic-Hits. Liste von Bundle-Namen aus
+        # VAULT_CONTEXT_BUNDLES = alle .md dieser Bereiche werden als Volltext
+        # an den System-Prompt gehängt.
+        self.context_bundles: list[str] = []
+        # Shared Scratchpad (Stufe 3, 2026-04-23) — key→value dict, beide
+        # Provider können darüber Zwischen-Ergebnisse teilen.
+        self.shared_notes: dict[str, str] = {}
+        # Legacy-Feld: bleibt erhalten für Rückwärts-Kompatibilität mit dem
+        # Persistenz-Format. Wert ist synchronisiert mit provider_thread_id
+        # WENN provider == "claude-cli", sonst None.
         self.cli_session_id = None
         self.process = None
         self.locked = False
@@ -196,7 +259,11 @@ class ClaudeSession:
                 break
         return {
             "session_id": self.session_id,
-            "cli_session_id": self.cli_session_id,
+            "provider": self.provider,
+            "model": self.model,
+            "provider_thread_id": self.provider_thread_id,
+            "context_bundles": list(self.context_bundles),
+            "cli_session_id": self.cli_session_id,  # Legacy; gleich provider_thread_id wenn claude-cli
             "created_at": self.created_at,
             "message_count": self.message_count,
             "history": self.history,
@@ -232,9 +299,21 @@ class SessionManager:
                         print(f"[Sessions] Skip dead session {sid[:8]} — invalid data (keys: {list(data.keys()) if isinstance(data, dict) else type(data).__name__})", flush=True)
                         continue
                     s = ClaudeSession(session_id=sid)
-                    # Don't restore cli_session_id — old CLI sessions are unreliable
-                    # after server restart and cause zombie processes with --resume
+                    # Don't restore provider_thread_id/cli_session_id — old
+                    # Provider-Threads sind nach Server-Restart unzuverlässig
+                    # und führen zu Zombie-Prozessen bei --resume.
+                    s.provider_thread_id = None
                     s.cli_session_id = None
+                    # Provider-Config aus JSON (neue Felder). Fallback:
+                    # alte Session ohne provider → "claude-cli" (war der Default).
+                    s.provider = data.get("provider") or "claude-cli"
+                    s.model = data.get("model") or ""
+                    bundles_raw = data.get("context_bundles") or []
+                    if isinstance(bundles_raw, list):
+                        s.context_bundles = [str(b) for b in bundles_raw if b]
+                    notes_raw = data.get("shared_notes") or {}
+                    if isinstance(notes_raw, dict):
+                        s.shared_notes = {str(k): str(v) for k, v in notes_raw.items()}
                     s.created_at = data.get("created_at", s.created_at)
                     s.message_count = data.get("message_count", 0)
                     s.history = data.get("history", [])
@@ -274,8 +353,18 @@ class SessionManager:
         """Save all sessions to disk."""
         data = {}
         for sid, s in self.sessions.items():
+            # Während des Chat-Refactors schreibt der existierende _run_claude auf
+            # cli_session_id, der neue _run_chat auf provider_thread_id. Beide
+                # Pfade schreiben in den gleichen Persistenz-Slot:
+            effective_thread = s.provider_thread_id or s.cli_session_id
             data[sid] = {
-                "cli_session_id": s.cli_session_id,
+                "provider": s.provider,
+                "model": s.model,
+                "provider_thread_id": effective_thread,
+                "context_bundles": list(s.context_bundles),
+                "shared_notes": dict(getattr(s, "shared_notes", {}) or {}),
+                # Legacy-Feld für Backward-Compat; gleicher Wert wenn claude-cli
+                "cli_session_id": effective_thread if s.provider == "claude-cli" else None,
                 "created_at": s.created_at,
                 "message_count": s.message_count,
                 "history": s.history,
@@ -312,6 +401,10 @@ class SessionManager:
 
     def delete_session(self, sid):
         """Delete a session by ID and persist."""
+        # jarvis-main = interactive Jarvis chat, jarvis-heartbeat = background
+        # tick log. Beide always-on, nie loeschbar.
+        if sid in ("jarvis-main", "jarvis-heartbeat"):
+            return
         if sid in self.sessions:
             del self.sessions[sid]
             self.persist()
@@ -415,8 +508,53 @@ else:
 # System Prompt Builder
 # ---------------------------------------------------------------------------
 
+_TOOLS_AND_MEMORY_BRIEF = """\
+--- WERKZEUGE & GEDÄCHTNIS ---
+
+MCP-Tools (über den `jarvis`-MCP-Server):
+  • vault_search(query, n)        → semantische Suche in Robins Obsidian-Vault + Diss-PDFs (bge-m3, 9412 chunks)
+  • vault_read_bundle(name)       → ganzes Themen-Bundle als Volltext (dissertation, medizin, trading, openclaw, famulatur)
+  • vault_list_bundles()          → verfügbare Bundles
+  • memory_list() / memory_read(f)→ MCs interne memory-Files (SOUL.md, projects.md, decisions.md, todos.md, robin.md, …)
+  • skills_list() / skill_get(s)  → 129 Jarvis-Skills (academic-deep-research, algorithmic-art, …)
+  • skill_activate(slug)          → Skill für Claude-CLI dauerhaft aktivieren (Wrapper in ~/.claude/skills/)
+  • anki_list_decks()             → Decks aus laufendem Anki
+  • generate_image(prompt)        → Nano-Banana oder GPT-Image — kann Bilder direkt in den Chat posten
+  • ask_peer(provider, query)     → einen anderen LLM-Provider einmalig befragen (cross-provider second-opinion)
+  • mc_health()                   → MC-Status-Check
+
+WANN welches Tool:
+  • Faktenfrage über Robin/Projekte  → vault_search
+  • Ganzes Thema "atmen"             → vault_read_bundle
+  • Spezialisierter Workflow nötig   → skills_list → skill_get → adoptieren
+  • Medizin-Karte erzeugen           → skill_get("anki") + AnkiConnect
+  • Visualisierung/Diagramm          → generate_image
+  • Zweitmeinung eines anderen LLMs  → ask_peer
+
+MEMORY-PFLEGE (wichtig für Kontinuität):
+  Robins Jarvis-Gedächtnis lebt unter `data/memory/`. Struktur:
+    data/memory/SOUL.md           — Identity, was Jarvis ist
+    data/memory/robin.md          — Fakten über Robin (Person, Rolle, Prioritäten)
+    data/memory/projects.md       — laufende Projekte
+    data/memory/decisions.md      — getroffene Entscheidungen mit Warum
+    data/memory/todos.md          — offene Todos
+    data/memory/YYYY-MM-DD.md     — Tages-Log (was heute geschah, neue Erkenntnisse)
+
+  Wenn du in dieser Session etwas Neues lernst — eine relevante Entscheidung, eine
+  Projekt-Erkenntnis, etwas das Jarvis in 3 Monaten noch wissen sollte — biete
+  am Ende deiner Antwort einen **kurzen Memory-Patch** an im Format:
+
+      MEMORY-UPDATE (zur Bestätigung):
+      Datei: data/memory/{zielfile}.md
+      Anhang: <1-3 Zeilen, knapp, faktenbasiert>
+
+  Robin entscheidet dann ob er das übernimmt. Niemals ungefragt Files schreiben
+  außer der User bittet explizit darum oder du bist im Exec-Mode mit klarem Auftrag.
+"""
+
+
 def _build_system_prompt():
-    """Build full system prompt — identity + memory + context."""
+    """Build full system prompt — identity + memory + tools + context."""
     parts = []
     # SOUL.md — core identity
     soul = MEMORY_DIR / "SOUL.md"
@@ -440,7 +578,182 @@ def _build_system_prompt():
                     parts.append(f"--- Claude Memory: {f.name} ---\n{content}")
             except Exception:
                 pass
+    # Werkzeug-Übersicht + Memory-Pflege-Anleitung (gleicher Inhalt für alle Bots)
+    parts.append(_TOOLS_AND_MEMORY_BRIEF)
     return "\n\n".join(parts)
+
+
+_VAULT_ROOT = Path("E:/OneDrive/AI/Obsidian-Vault/Jarvis-Brain")
+
+
+#: Kuratierte "Themen-Bundles" — jedes Bundle ist eine Liste von Vault-Pfaden
+#: (relativ zu _VAULT_ROOT), die on-demand als Volltext-Context mitgeschickt
+#: werden. Ergänzt das RAG (semantisch getriggert, Chunks): Global-Context lädt
+#: den kompletten Inhalt der Bundle-Pfade — nützlich wenn Robin über längere
+#: Zeit in einem Thema arbeitet und das ganze "Kapitel" greifbar sein soll.
+VAULT_CONTEXT_BUNDLES: dict[str, list[str]] = {
+    "dissertation": [
+        "Dissertation-ITI.md",
+        "Jarvis-Knowledge/Dissertation-ITI",
+    ],
+    "medizin": [
+        "Medizin.md",
+        "OSCE.md",
+        "Anki.md",
+        "Jarvis-Knowledge/Medizin",
+    ],
+    "trading": [
+        "Trading.md",
+        "Jarvis-Knowledge/Trading",
+    ],
+    "openclaw": [
+        "OpenClaw-Tech.md",
+        "Jarvis-Knowledge/OpenClaw",
+    ],
+    "famulatur": [
+        "Famulatur-Tanzania.md",
+    ],
+}
+
+
+def _load_vault_context(
+    bundle_names: list[str],
+    max_total_chars: int = 40000,
+    max_file_chars: int = 12000,
+) -> tuple[str, int, list[str]]:
+    """Lädt alle .md-Dateien aus den angegebenen Bundles konkateniert.
+
+    Returns: (context_text, num_files, loaded_paths). Nicht-existierende Pfade
+    werden still übersprungen.
+    """
+    if not bundle_names:
+        return "", 0, []
+
+    raw_paths: list[str] = []
+    for bn in bundle_names:
+        bundle = VAULT_CONTEXT_BUNDLES.get(bn.lower())
+        if not bundle:
+            continue
+        raw_paths.extend(bundle)
+    if not raw_paths:
+        return "", 0, []
+
+    loaded: list[tuple[str, str]] = []
+    total = 0
+    seen: set[Path] = set()
+
+    for rel in raw_paths:
+        abs_path = _VAULT_ROOT / rel
+        if not abs_path.exists():
+            continue
+        if abs_path.is_file() and abs_path.suffix.lower() == ".md":
+            if abs_path in seen:
+                continue
+            seen.add(abs_path)
+            try:
+                content = abs_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if len(content) > max_file_chars:
+                content = content[:max_file_chars].rsplit("\n", 1)[0] + "\n…[gekürzt]"
+            total += len(content)
+            loaded.append((rel, content))
+            if total >= max_total_chars:
+                break
+        elif abs_path.is_dir():
+            for md_file in sorted(abs_path.rglob("*.md")):
+                if md_file in seen:
+                    continue
+                seen.add(md_file)
+                try:
+                    content = md_file.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                if len(content) > max_file_chars:
+                    content = content[:max_file_chars].rsplit("\n", 1)[0] + "\n…[gekürzt]"
+                rel_to_vault = str(md_file.relative_to(_VAULT_ROOT)).replace("\\", "/")
+                total += len(content)
+                loaded.append((rel_to_vault, content))
+                if total >= max_total_chars:
+                    break
+        if total >= max_total_chars:
+            break
+
+    if not loaded:
+        return "", 0, []
+
+    blocks = [f"### Vault/{p}\n{c}" for p, c in loaded]
+    context = (
+        "\n\n--- GLOBAL VAULT CONTEXT (aktive Themen-Bundles) ---\n"
+        "Robin hat für diese Session folgende Vault-Bereiche als dauerhaften "
+        "Kontext markiert. Nutze sie als Faktenbasis.\n\n"
+        + "\n\n".join(blocks)
+    )
+    return context, len(loaded), [p for p, _ in loaded]
+
+
+async def _build_rag_context(
+    user_message: str,
+    n_results: int = 4,
+    min_score: float = 0.35,
+    max_chars_per_chunk: int = 800,
+) -> tuple[str, int]:
+    """Query the RAG index with the user's message and return top-N chunks as a
+    system-prompt-appendable context block. Works for ALL providers — no tool
+    definitions needed, because it's injected into the system prompt.
+
+    Gemini's "Stufe 1"-Vorschlag (2026-04-23): macht das bestehende ChromaDB +
+    bge-m3 Setup für Claude-CLI/API, Codex-CLI, Gemini-CLI und OpenAI nutzbar
+    ohne dass jeder Provider separat Tool-wiring braucht.
+
+    Returns: (context_block, num_chunks) — context_block ist "" wenn keine
+    Hits über Schwelle. num_chunks zum Loggen/UI.
+    """
+    if not user_message or len(user_message.strip()) < 10:
+        return "", 0
+
+    def _search():
+        try:
+            from rag.search import query as rag_query
+            return rag_query(user_message, n_results)
+        except Exception as e:
+            print(f"[RAG] query failed: {e}")
+            return []
+
+    try:
+        hits = await asyncio.to_thread(_search)
+    except Exception as e:
+        print(f"[RAG] to_thread failed: {e}")
+        return "", 0
+
+    # bge-m3 scores: 0-1 cosine similarity. 0.35 = "topically related",
+    # 0.5+ = "clearly relevant". Threshold bewusst niedrig damit loose matches
+    # auch reinkommen (der Provider entscheidet dann selbst was er nutzt).
+    good = [h for h in (hits or []) if float(h.get("score") or 0) >= min_score]
+    if not good:
+        return "", 0
+
+    blocks: list[str] = []
+    for h in good:
+        src_raw = str(h.get("source") or "unknown")
+        if "Obsidian-Vault" in src_raw:
+            src_short = "Vault/" + src_raw.split("Obsidian-Vault", 1)[-1].lstrip("\\/")
+        else:
+            src_short = src_raw.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+        text = (h.get("text") or "").strip()
+        if len(text) > max_chars_per_chunk:
+            text = text[:max_chars_per_chunk].rsplit(" ", 1)[0] + "…"
+        score = float(h.get("score") or 0)
+        blocks.append(f"### {src_short}  (relevance {score:.2f})\n{text}")
+
+    context = (
+        "\n\n--- JARVIS KNOWLEDGE (via RAG) ---\n"
+        "Folgende Ausschnitte aus Robins Obsidian-Vault und PDF-Dissertation sind "
+        "semantisch ähnlich zur aktuellen Frage. Nutze sie als zusätzlichen Kontext "
+        "wenn sie relevant sind — ignoriere sonst.\n\n"
+        + "\n\n".join(blocks)
+    )
+    return context, len(good)
 
 
 # ---------------------------------------------------------------------------
@@ -552,7 +865,7 @@ JARVIS_DATA = Path("C:/Users/Robin/Jarvis/data")
 async def _run_script(cmd, timeout=20):
     """Run a python script and return stdout."""
     env = {**os.environ, "PYTHONIOENCODING": "utf-8",
-           "MS_CLIENT_ID": "2fbe99b8-e739-4dfa-860f-bc8d2396700a",
+           "MS_CLIENT_ID": "59386692-536e-4afe-9ae2-0f728d617727",
            "MS_TENANT_ID": "common"}
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -834,18 +1147,25 @@ async def api_rag_reload(request):
 
 
 async def api_system_restart(request):
-    """POST /api/system/restart  -  Trigger detached MC restart via watcher.
-
-    Creates data/restart.trigger file. The restart_watcher.py process monitors
-    this file and kills/restarts MC without blocking the chat session.
+    """POST /api/system/restart  -  Sauberer Self-Shutdown, watchdog.py bringt
+    den Server in ~15s wieder hoch. Trigger-File bleibt aus Diagnose-Gruenden,
+    falls jemand spaeter doch noch einen separaten restart_watcher startet.
     """
     try:
-        trigger_file = DATA_DIR / "restart.trigger"
+        trigger_file = DATA_DIR / "restart.v2.trigger"
         trigger_file.write_text(f"restart at {datetime.now().isoformat()}")
-        print(f"[System] Restart triggered via {trigger_file}")
+        print(f"[System] Restart triggered via UI — exiting in 1s, watchdog respawn fast")
+
+        async def _shutdown_soon():
+            await asyncio.sleep(1.0)
+            print("[System] Self-exit for restart")
+            os._exit(0)
+
+        asyncio.create_task(_shutdown_soon())
+
         return web.json_response({
             "ok": True,
-            "message": "Restart triggered. Watcher will restart MC in ~2-3 seconds.",
+            "message": "Restart ausgeloest — Server beendet sich in 1s, watchdog startet neu (~15s).",
             "trigger_file": str(trigger_file),
         })
     except Exception as e:
@@ -1265,6 +1585,7 @@ async def api_smart_tasks_create(request):
         "description": body.get("description", ""),
         "original_request": body.get("original_request", ""),
         "chat_context": body.get("chat_context", ""),
+        "system_prompt": body.get("system_prompt", ""),
         "priority": body.get("priority", "medium"),
         "status": "pending",
         "created": datetime.now().isoformat(),
@@ -1298,9 +1619,12 @@ async def _run_smart_task(task_id: str):
     desc = task.get('description', '') or ''
     original = task.get('original_request', '') or ''
     chat_context = task.get('chat_context', '') or ''
+    system_prompt = task.get('system_prompt', '') or ''
 
     # Build rich prompt with full context
     context_parts = [f"# Aufgabe: {task['title']}"]
+    if system_prompt:
+        context_parts.append(f"\n## Kontext\n{system_prompt}")
     if original:
         context_parts.append(f"\n## Original-Anfrage\n{original}")
     if desc:
@@ -1741,25 +2065,39 @@ async def api_roadmap_suggest(request):
     return web.json_response({"ok": True, "inserted": inserted})
 
 
+DISS_RESEARCH_SESSIONS_FILE = JARVIS_DATA / "diss_research_sessions.json"
+
+
 async def api_diss_research(request):
-    """Get night research results for dissertation."""
+    """GET — list research sessions  |  POST — save a session entry."""
+    if request.method == "POST":
+        try:
+            entry = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+        sessions = safe_read_json(DISS_RESEARCH_SESSIONS_FILE, default=[]) or []
+        sessions.insert(0, entry)
+        atomic_write_text(DISS_RESEARCH_SESSIONS_FILE, json.dumps(sessions[:100], ensure_ascii=False, indent=2))
+        return web.json_response({"ok": True})
+
+    # GET — merge persisted sessions + live night-results files
+    sessions = safe_read_json(DISS_RESEARCH_SESSIONS_FILE, default=[]) or []
     night_dir = JARVIS_DATA / "night-results"
-    results = []
     if night_dir.exists():
         for f in sorted(night_dir.glob("*diss*"), reverse=True)[:5]:
             try:
                 data = json.loads(f.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
-                    results.append({
+                    sessions.append({
                         "date": f.stem.split("-diss")[0],
                         "takeaway": data.get("takeaway", ""),
                         "papers": data.get("papers", []),
                     })
                 else:
-                    results.append({"date": f.stem, "takeaway": str(data)[:200]})
+                    sessions.append({"date": f.stem, "takeaway": str(data)[:200]})
             except Exception:
                 pass
-    return web.json_response({"results": results})
+    return web.json_response({"results": sessions})
 
 
 DISS_WIKI_DIR = Path("E:/OneDrive/Dokumente/Studium/!!Medizin/03 Doktorarbeit/ITI/Jarvis Workspace/wiki")
@@ -1853,12 +2191,16 @@ async def api_anki_generate(request):
     if not script.exists():
         return web.json_response({"ok": False, "error": f"Script fehlt: {script}"}, status=500)
 
+    # Mode A: Skript NUR um cards generieren zu lassen (--cards-only).
+    # Image-Pass + Anki-Sync passieren danach hier im Server, mit der existierenden
+    # Bulk-Sync-Pipeline — die kann Bilder via storeMediaFile pushen.
     try:
         proc = await asyncio.create_subprocess_exec(
             sys.executable, str(script),
             "--deck", deck,
             "--title", title,
             "--tags", ",".join(tags),
+            "--cards-only",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -1868,21 +2210,446 @@ async def api_anki_generate(request):
             timeout=get_action_timeout("anki.generate"),
         )
         out = stdout.decode("utf-8", errors="replace").strip()
-        # Script printet JSON auf stdout
         try:
-            result = json.loads(out)
+            cards_result = json.loads(out)
         except Exception:
-            result = {
+            return web.json_response({
                 "ok": False,
                 "error": "Konnte Script-Output nicht parsen",
                 "stdout": out[:500],
                 "stderr": stderr.decode("utf-8", errors="replace")[:500],
-            }
-        return web.json_response(result)
+            })
+
+        if not cards_result.get("ok"):
+            return web.json_response(cards_result)
+
+        cards = cards_result.get("cards") or []
+        if not cards:
+            return web.json_response({"ok": False, "error": "Keine Karten generiert"})
+
+        # Bild-Pass: parallel Nano Banana 2 fuer Karten mit image_prompt
+        await _enrich_anki_cards_with_images(cards)
+
+        # Anki-Push via existierende Bulk-Sync-Pipeline (storeMediaFile + addNotes).
+        # _bulk_sync_cards rendert per _card_to_anki_note die Bilder mit ein.
+        try:
+            sync_report = await _bulk_sync_cards(cards, deck=deck, subject=title or "Karten")
+        except Exception as e:
+            return web.json_response({
+                "ok": False,
+                "error": f"Anki-Sync fehlgeschlagen: {e}",
+                "cards_generated": len(cards),
+                "images_generated": sum(1 for c in cards if c.get("image")),
+            })
+
+        return web.json_response({
+            "ok": True,
+            "deck": deck,
+            "cards_generated": len(cards),
+            "images_generated": sum(1 for c in cards if c.get("image")),
+            **sync_report,
+        })
     except asyncio.TimeoutError:
         return web.json_response({"ok": False, "error": f"Timeout nach {get_action_timeout('anki.generate')}s"}, status=504)
     except Exception as e:
         return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
+# Limits fuer Anki-Auto-Image-Generation
+_ANKI_IMG_MAX_TOTAL = 8           # max Bilder pro Generate-Call (Cost-Cap)
+_ANKI_IMG_PARALLEL = 4            # Concurrency
+_ANKI_IMG_MODEL = "gemini-3.1-flash-image-preview"  # Nano Banana 2
+
+
+async def _enrich_anki_cards_with_images(cards: list[dict]) -> None:
+    """In-place: Fuer Karten mit image_prompt generiert Nano Banana 2 ein Bild
+    und schreibt absoluten Library-Pfad in card['image']. Karten ohne
+    image_prompt werden uebersprungen. Cap bei _ANKI_IMG_MAX_TOTAL."""
+    from image_client import generate_image, ImageGenError
+    import library as _lib
+
+    candidates = [c for c in cards if c.get("image_prompt") and not c.get("image")]
+    if not candidates:
+        return
+    candidates = candidates[:_ANKI_IMG_MAX_TOTAL]
+
+    sem = asyncio.Semaphore(_ANKI_IMG_PARALLEL)
+
+    async def _one(card: dict) -> None:
+        prompt = (card.get("image_prompt") or "").strip()
+        if not prompt:
+            return
+        async with sem:
+            try:
+                img = await generate_image(
+                    provider="gemini",
+                    prompt=prompt,
+                    uploads_dir=UPLOADS_DIR,
+                    model=_ANKI_IMG_MODEL,
+                    size="1024x1024",
+                )
+                # Bild von uploads → library/_inbox verschieben (wie api_image_generate)
+                inbox = IMAGES_LIBRARY_DIR / "_inbox"
+                inbox.mkdir(parents=True, exist_ok=True)
+                target = inbox / img.path.name
+                if target.exists():
+                    stem, suf = target.stem, target.suffix
+                    i = 2
+                    while (inbox / f"{stem}_{i}{suf}").exists():
+                        i += 1
+                    target = inbox / f"{stem}_{i}{suf}"
+                img.path.rename(target)
+                img.path = target
+                # Sidecar-Meta damit Lightbox auch hier den Prompt zeigt
+                try:
+                    _lib.write_image_meta(target, {
+                        "user_prompt": prompt,
+                        "enhanced_prompt": None,
+                        "final_prompt": prompt,
+                        "provider": "gemini",
+                        "model": _ANKI_IMG_MODEL,
+                        "size": "1024x1024",
+                        "source": "anki-from-text",
+                        "created_at": datetime.now().isoformat(),
+                    })
+                except Exception:
+                    pass
+                # Absoluten Pfad in Card legen — _card_to_anki_note resolved abs paths
+                card["image"] = str(target)
+                print(f"[Anki/Image] generated for card: {prompt[:60]}")
+            except ImageGenError as e:
+                print(f"[Anki/Image] gen failed ({e.code}): {e.message[:120]}")
+            except Exception as e:
+                print(f"[Anki/Image] unexpected: {type(e).__name__}: {e}")
+
+    await asyncio.gather(*(_one(c) for c in candidates), return_exceptions=True)
+
+
+_ANKI_CONNECT_URL = "http://localhost:8765"
+
+
+async def _anki_invoke(action: str, params: dict | None = None, timeout: float = 15.0) -> dict:
+    """Zentraler Helper für AnkiConnect-Calls. Wirft RuntimeError bei Anki-seitigen
+    Fehlern. Erwartet dass Anki läuft mit AnkiConnect-Addon auf localhost:8765.
+    """
+    import urllib.request
+    payload = {"action": action, "version": 6, "params": params or {}}
+
+    def _call() -> dict:
+        req = urllib.request.Request(
+            _ANKI_CONNECT_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    try:
+        result = await asyncio.to_thread(_call)
+    except Exception as e:
+        raise RuntimeError(f"anki_unreachable: {e}") from e
+    if result.get("error"):
+        raise RuntimeError(f"anki_error: {result['error']}")
+    return result
+
+
+async def api_anki_decks(request):
+    """GET /api/anki/decks — Liste aller Deck-Namen aus Anki (via AnkiConnect).
+    Rückgabe: { ok, decks: [str, ...] } oder { ok: false, error }.
+    """
+    try:
+        result = await _anki_invoke("deckNames", timeout=5.0)
+        decks = result.get("result") or []
+        return web.json_response({"ok": True, "decks": sorted(decks)})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e), "decks": []}, status=200)
+
+
+def _card_to_anki_note(card: dict, deck: str) -> tuple[dict, dict[str, Path]]:
+    """Wandelt eine Generator-Card in ein AnkiConnect `note`-Dict um.
+    Gibt (note, images_used) zurück — images_used ist {basename: abs_path} für
+    vorherigen storeMediaFile-Upload. `note` hat allowDuplicate:false mit
+    duplicateScope:"deck" — Anki's eigener Dedup greift pro Deck.
+
+    Logik analog zu api_learn_export_zip: Basic vs. Cloze-Entscheidung,
+    Back-Extra mit Bild/FunFact/Merkhilfe/Footer, Occlusion-Mapping zu Cloze.
+    """
+    import re as _re_sync
+
+    images_used: dict[str, Path] = {}
+
+    def _collect(rel: str) -> str:
+        rel = (rel or "").strip()
+        if not rel:
+            return ""
+        # 1) Absoluter Pfad (z.B. von _enrich_anki_cards_with_images mit Library-Pfad)
+        try:
+            p_abs = Path(rel)
+            if p_abs.is_absolute() and p_abs.is_file():
+                images_used[p_abs.name] = p_abs
+                return p_abs.name
+        except Exception:
+            pass
+        # 2) URL-Prefix abstreifen (Library + Uploads)
+        if rel.startswith("/library/"):
+            sub = rel[len("/library/"):]
+            abs_img = IMAGES_LIBRARY_DIR / sub
+            if abs_img.is_file():
+                images_used[abs_img.name] = abs_img
+                return abs_img.name
+        if rel.startswith("/api/uploads/"):
+            rel = rel[len("/api/uploads/"):]
+        abs_img = UPLOADS_DIR / rel
+        if abs_img.exists():
+            images_used[abs_img.name] = abs_img
+            return abs_img.name
+        return ""
+
+    def _rewrite_imgs(html: str) -> str:
+        def _replace(m):
+            src = m.group(1)
+            if src.startswith(("http://", "https://", "data:")):
+                return m.group(0)
+            basename = _collect(src)
+            return f'<img src="{basename}">' if basename else m.group(0)
+        return _re_sync.sub(r'<img\s+src="([^"]+)"', _replace, html)
+
+    front = _rewrite_imgs(card.get("front") or "")
+    back = _rewrite_imgs(card.get("back") or "")
+
+    # Back-Extra (Bild + FunFact + Merkhilfe + Footer)
+    parts: list[str] = []
+    img_rel = (card.get("image") or "").strip()
+    if img_rel:
+        basename = _collect(img_rel)
+        if basename:
+            parts.append(f'<div style="margin:8px 0"><img src="{basename}" style="max-width:100%"></div>')
+    if card.get("funfact"):
+        parts.append(f'<div style="margin:6px 0;padding:6px 10px;background:#f59e0b15;border-left:3px solid #f59e0b;border-radius:4px"><b>💡 Fun Fact:</b> {card["funfact"]}</div>')
+    if card.get("merkhilfe"):
+        parts.append(f'<div style="margin:6px 0;padding:6px 10px;background:#a78bfa15;border-left:3px solid #a78bfa;border-radius:4px"><b>🧠 Merkhilfe:</b> {card["merkhilfe"]}</div>')
+    footer_bits: list[str] = []
+    if card.get("source"):
+        footer_bits.append(str(card["source"]))
+    if card.get("external_source"):
+        footer_bits.append(f'Ergänzt aus {card["external_source"]}')
+    if footer_bits:
+        parts.append(f'<div style="margin-top:10px;padding-top:6px;border-top:1px solid #1e293b;font-size:10px;color:#64748b">{" · ".join(footer_bits)}</div>')
+    back_extra = "".join(parts)
+
+    # Tags: Generator liefert space- oder comma-separierten String
+    raw_tags = card.get("tags") or ""
+    if isinstance(raw_tags, list):
+        tags = [str(t).strip() for t in raw_tags if str(t).strip()]
+    else:
+        tags = [t.strip() for t in str(raw_tags).replace(",", " ").split() if t.strip()]
+
+    occs = card.get("occlusions") or []
+    has_cloze_syntax = bool(_re_sync.search(r"\{\{c\d+::", front + " " + back))
+
+    if occs and img_rel:
+        # Occlusion → Cloze mit Bild + Labels als {{cN::…}}
+        basename = _collect(img_rel)
+        img_tag = f'<img src="{basename}" style="max-width:100%">' if basename else ""
+        labels_cloze = "; ".join(
+            f"{{{{c{i+1}::{(o.get('label') or '').strip()}}}}}"
+            for i, o in enumerate(occs) if o.get("label")
+        )
+        text = f'{img_tag}<br><br><b>Strukturen im Bild:</b> {labels_cloze}'
+        note = {
+            "deckName": deck,
+            "modelName": "Cloze",
+            "fields": {"Text": text, "Back Extra": back_extra},
+            "tags": tags,
+        }
+    elif has_cloze_syntax:
+        combined = f"{front}<br><br>{back}" if front and back else (front or back)
+        note = {
+            "deckName": deck,
+            "modelName": "Cloze",
+            "fields": {"Text": combined, "Back Extra": back_extra},
+            "tags": tags,
+        }
+    else:
+        full_back = back + (("<br><br>" + back_extra) if back_extra else "")
+        note = {
+            "deckName": deck,
+            "modelName": "Basic",
+            "fields": {"Front": front, "Back": full_back},
+            "tags": tags,
+        }
+
+    note["options"] = {
+        "allowDuplicate": False,
+        "duplicateScope": "deck",
+        "duplicateScopeOptions": {"deckName": deck, "checkChildren": False},
+    }
+    return note, images_used
+
+
+async def _bulk_sync_cards(cards: list[dict], *, deck: str, subject: str = "Karten") -> dict:
+    """Reusable Bulk-Sync: deck anlegen, Bilder hochladen (storeMediaFile), notes
+    batch-adden. Returnt das gleiche Report-Dict wie api_anki_bulk_sync (ohne ok-Key —
+    Caller wrappt). Wirft RuntimeError bei AnkiConnect-Errors.
+    """
+    import base64 as _b64
+
+    await _anki_invoke("createDeck", {"deck": deck}, timeout=5.0)
+
+    notes: list[dict] = []
+    all_images: dict[str, Path] = {}
+    for c in cards:
+        note, imgs = _card_to_anki_note(c, deck)
+        notes.append(note)
+        all_images.update(imgs)
+
+    media_ok = 0
+    media_errors: list[str] = []
+    for basename, abs_path in all_images.items():
+        try:
+            data_b64 = _b64.b64encode(abs_path.read_bytes()).decode("ascii")
+            await _anki_invoke("storeMediaFile", {"filename": basename, "data": data_b64}, timeout=30.0)
+            media_ok += 1
+        except Exception as e:
+            media_errors.append(f"{basename}: {e}")
+            print(f"[Anki/BulkSync] storeMediaFile failed {basename}: {e}")
+
+    result = await _anki_invoke("addNotes", {"notes": notes}, timeout=60.0)
+    ids = result.get("result") or []
+    try:
+        can_add = (await _anki_invoke("canAddNotes", {"notes": notes}, timeout=15.0)).get("result") or []
+    except Exception:
+        can_add = [None] * len(notes)
+
+    added = duplicates = errors = 0
+    card_report = []
+    for i, note_id in enumerate(ids):
+        if note_id is not None:
+            added += 1
+            card_report.append({"index": i, "ok": True, "note_id": note_id})
+        else:
+            is_dup = can_add[i] is False if i < len(can_add) else False
+            if is_dup:
+                duplicates += 1
+                card_report.append({"index": i, "ok": False, "is_duplicate": True})
+            else:
+                errors += 1
+                card_report.append({"index": i, "ok": False, "error": "addNote returned null"})
+
+    print(f"[Anki/BulkSync] deck={deck}: {added} neu · {duplicates} Dup · {errors} Fehler · {media_ok} Bilder")
+    return {
+        "deck": deck,
+        "added": added,
+        "duplicates": duplicates,
+        "errors": errors,
+        "media": media_ok,
+        "media_errors": media_errors,
+        "cards": card_report,
+    }
+
+
+async def api_anki_bulk_sync(request):
+    """POST /api/anki/bulk-sync — Pusht generierte Karten + Bilder direkt in Anki.
+    Body: { subject, deck?, cards: [...] }
+
+    Ablauf:
+      1. Sicherstellen dass Deck existiert (createDeck — idempotent)
+      2. Für jede Card: note-Dict bauen, Bilder einsammeln
+      3. Alle Bilder per storeMediaFile hochladen (base64)
+      4. Batch addNotes → AnkiConnect gibt pro Karte note_id oder null (Dup/Fehler)
+      5. Report pro Karte zurückgeben
+
+    Rückgabe: {
+      ok, deck,
+      added: int, duplicates: int, errors: int, media: int,
+      cards: [{index, ok, note_id?, error?, is_duplicate?}]
+    }
+    """
+    import base64 as _b64
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    cards_in = body.get("cards") or []
+    if not cards_in:
+        return web.json_response({"ok": False, "error": "Keine Karten übergeben"}, status=400)
+
+    subject = (body.get("subject") or "Karten").strip()
+    deck = (body.get("deck") or subject or "Default").strip() or "Default"
+
+    # 1. Deck anlegen (falls nicht vorhanden) — idempotent
+    try:
+        await _anki_invoke("createDeck", {"deck": deck}, timeout=5.0)
+    except Exception as e:
+        return web.json_response({"ok": False, "error": f"Deck anlegen fehlgeschlagen: {e}"}, status=502)
+
+    # 2. Notes bauen + Bilder sammeln
+    notes: list[dict] = []
+    all_images: dict[str, Path] = {}
+    for c in cards_in:
+        note, imgs = _card_to_anki_note(c, deck)
+        notes.append(note)
+        all_images.update(imgs)
+
+    # 3. Bilder hochladen (storeMediaFile akzeptiert base64)
+    media_ok = 0
+    media_errors: list[str] = []
+    for basename, abs_path in all_images.items():
+        try:
+            data_b64 = _b64.b64encode(abs_path.read_bytes()).decode("ascii")
+            await _anki_invoke("storeMediaFile", {"filename": basename, "data": data_b64}, timeout=30.0)
+            media_ok += 1
+        except Exception as e:
+            media_errors.append(f"{basename}: {e}")
+            print(f"[Anki/BulkSync] storeMediaFile failed {basename}: {e}")
+
+    # 4. Batch addNotes — Return ist Liste mit note_id oder null (bei Dup/Fehler)
+    try:
+        result = await _anki_invoke("addNotes", {"notes": notes}, timeout=60.0)
+    except Exception as e:
+        return web.json_response({
+            "ok": False, "error": f"addNotes fehlgeschlagen: {e}",
+            "deck": deck, "media": media_ok,
+        }, status=502)
+
+    ids = result.get("result") or []
+    # Bei canAddNotes-Check fragen wir zusätzlich ab um Dup vs. echter Fehler zu trennen
+    try:
+        can_add = (await _anki_invoke("canAddNotes", {"notes": notes}, timeout=15.0)).get("result") or []
+    except Exception:
+        can_add = [None] * len(notes)
+
+    # 5. Report
+    added = duplicates = errors = 0
+    card_report = []
+    for i, note_id in enumerate(ids):
+        if note_id is not None:
+            added += 1
+            card_report.append({"index": i, "ok": True, "note_id": note_id})
+        else:
+            # null → entweder Dup oder Fehler; canAddNotes false = Dup
+            is_dup = can_add[i] is False if i < len(can_add) else False
+            if is_dup:
+                duplicates += 1
+                card_report.append({"index": i, "ok": False, "is_duplicate": True})
+            else:
+                errors += 1
+                card_report.append({"index": i, "ok": False, "error": "addNote returned null"})
+
+    print(f"[Anki/BulkSync] deck={deck}: {added} neu · {duplicates} Dup · {errors} Fehler · {media_ok} Bilder")
+
+    return web.json_response({
+        "ok": True,
+        "deck": deck,
+        "added": added,
+        "duplicates": duplicates,
+        "errors": errors,
+        "media": media_ok,
+        "media_errors": media_errors,
+        "cards": card_report,
+    })
 
 
 async def api_diss_wiki_index(request):
@@ -1891,6 +2658,277 @@ async def api_diss_wiki_index(request):
     if not index_file.exists():
         return web.json_response({"content": "Wiki-Index nicht gefunden."})
     return web.json_response({"content": index_file.read_text(encoding="utf-8")})
+
+
+async def api_diss_word(request):
+    """GET status / POST upload content to OneDrive Dissertation.docx."""
+    import subprocess
+    script = SCRIPTS_DIR / "onedrive_diss.py"
+    if not script.exists():
+        return web.json_response({"ok": False, "error": "onedrive_diss.py nicht gefunden"}, status=500)
+
+    if request.method == "GET":
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(script), "status",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        out, err = await proc.communicate()
+        try:
+            return web.json_response(json.loads(out.decode("utf-8", errors="replace")))
+        except Exception:
+            return web.json_response({"exists": False, "error": err.decode("utf-8", errors="replace")[:200]})
+
+    # POST — upload content
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+    content = (body.get("content") or "").strip()
+    if not content:
+        return web.json_response({"ok": False, "error": "content required"}, status=400)
+
+    import tempfile, os as _os
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as tf:
+        tf.write(content)
+        tmppath = tf.name
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(script), "upload", f"--content={content}",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        out, err = await proc.communicate()
+    finally:
+        _os.unlink(tmppath)
+    try:
+        return web.json_response(json.loads(out.decode("utf-8", errors="replace")))
+    except Exception:
+        return web.json_response({"ok": False, "error": err.decode("utf-8", errors="replace")[:400]})
+
+
+async def api_diss_word_url(request):
+    """GET/POST — persist the Word Online share/embed URL."""
+    store = DATA_DIR / "diss_word_url.json"
+    if request.method == "GET":
+        if store.exists():
+            try:
+                return web.json_response(json.loads(store.read_text("utf-8")))
+            except Exception:
+                pass
+        return web.json_response({"url": "", "shareUrl": ""})
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+    payload = {"url": body.get("url", ""), "shareUrl": body.get("shareUrl", "")}
+    store.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return web.json_response({"ok": True})
+
+
+async def api_diss_prism_results(request):
+    """GET — list saved Prism analyses  |  POST — save one analysis result."""
+    store = DATA_DIR / "diss_prism_results.json"
+
+    if request.method == "GET":
+        if store.exists():
+            try:
+                return web.json_response(json.loads(store.read_text("utf-8")))
+            except Exception:
+                pass
+        return web.json_response([])
+
+    # POST — save result atomically
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    required = ("context", "mode", "output")
+    if not all(body.get(k) for k in required):
+        return web.json_response({"ok": False, "error": "context, mode, output required"}, status=400)
+
+    results = []
+    if store.exists():
+        try:
+            results = json.loads(store.read_text("utf-8"))
+        except Exception:
+            results = []
+
+    entry = {
+        "id": f"{int(__import__('time').time()*1000)}",
+        "ts": __import__('datetime').datetime.utcnow().isoformat() + "Z",
+        "context": body["context"],
+        "mode": body["mode"],
+        "output": body["output"],
+    }
+    results.insert(0, entry)
+    results = results[:50]  # keep last 50
+
+    tmp = store.with_suffix(".tmp")
+    tmp.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(store)
+
+    return web.json_response({"ok": True, "id": entry["id"]})
+
+
+async def api_diss_prism_analyse(request):
+    """POST — analyse Prism CSV/table data with Claude and persist result."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    csv_text = (body.get("csv") or "").strip()
+    context  = (body.get("context") or "Prism-Daten aus meiner Dissertation (Kardiochirurgie/ITI)").strip()
+    if not csv_text:
+        return web.json_response({"ok": False, "error": "csv required"}, status=400)
+
+    prompt = (
+        f"Du analysierst Prism-Exportdaten für eine medizinische Dissertation (Kardiochirurgie/ITI).\n\n"
+        f"Kontext: {context}\n\n"
+        f"Prism-Daten:\n{csv_text}\n\n"
+        "Erstelle eine präzise, wissenschaftliche Zusammenfassung:\n"
+        "1. Beschreibe die Daten (Gruppen, n, Zeitpunkte falls vorhanden)\n"
+        "2. Zentrale statistische Ergebnisse (Mittelwert±SD/SEM, p-Werte)\n"
+        "3. Klinische Interpretation (1-2 Sätze)\n"
+        "4. Formulierungsvorschlag für den Diss-Text (Methods+Results, deutsch, akademisch)\n\n"
+        "Antworte strukturiert mit Markdown-Überschriften."
+    )
+
+    raw = ""
+    try:
+        import anthropic as _ant
+        _aclient = _ant.AsyncAnthropic()
+        _model = CONFIG.get("claude_model_force") or CONFIG.get("claude_model") or "claude-sonnet-4-6"
+        _resp = await _aclient.messages.create(
+            model=_model, max_tokens=3000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = _resp.content[0].text.strip()
+    except Exception:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude", "-p",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(prompt.encode("utf-8")), timeout=180)
+            raw = stdout.decode("utf-8", errors="replace").strip()
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    if not raw:
+        return web.json_response({"ok": False, "error": "Leere Antwort von Claude"}, status=500)
+
+    # Persist to prism_results store
+    store = DATA_DIR / "diss_prism_results.json"
+    results = []
+    if store.exists():
+        try:
+            results = json.loads(store.read_text("utf-8"))
+        except Exception:
+            pass
+    import time as _time
+    entry = {
+        "id":      str(int(_time.time() * 1000)),
+        "ts":      __import__('datetime').datetime.utcnow().isoformat() + "Z",
+        "context": context,
+        "mode":    "prism-analyse",
+        "output":  raw,
+    }
+    results.insert(0, entry)
+    results = results[:50]
+    tmp = store.with_suffix(".tmp")
+    tmp.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(store)
+
+    return web.json_response({"ok": True, "output": raw, "id": entry["id"]})
+
+
+# ── Diss Delta-Log ─────────────────────────────────────────────────────────────
+DISS_DELTA_FILE = DATA_DIR / "diss_delta_log.json"
+
+async def api_diss_delta(request):
+    """GET — list delta entries  |  POST — append  |  DELETE ?id=... — remove."""
+    if request.method == "GET":
+        if DISS_DELTA_FILE.exists():
+            try:
+                return web.json_response(json.loads(DISS_DELTA_FILE.read_text("utf-8")))
+            except Exception:
+                pass
+        return web.json_response([])
+
+    if request.method == "DELETE":
+        entry_id = request.rel_url.query.get("id", "")
+        if not entry_id:
+            return web.json_response({"ok": False, "error": "id required"}, status=400)
+        entries = []
+        if DISS_DELTA_FILE.exists():
+            try:
+                entries = json.loads(DISS_DELTA_FILE.read_text("utf-8"))
+            except Exception:
+                pass
+        entries = [e for e in entries if e.get("id") != entry_id]
+        tmp = DISS_DELTA_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(DISS_DELTA_FILE)
+        return web.json_response({"ok": True})
+
+    # POST — append
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    text = (body.get("text") or "").strip()
+    if not text:
+        return web.json_response({"ok": False, "error": "text required"}, status=400)
+
+    entries = []
+    if DISS_DELTA_FILE.exists():
+        try:
+            entries = json.loads(DISS_DELTA_FILE.read_text("utf-8"))
+        except Exception:
+            pass
+
+    import time as _time
+    entry = {
+        "id":       str(int(_time.time() * 1000)),
+        "ts":       __import__('datetime').datetime.utcnow().isoformat() + "Z",
+        "category": body.get("category", "finding"),
+        "text":     text,
+        "source":   (body.get("source") or "").strip(),
+    }
+    entries.insert(0, entry)
+    entries = entries[:200]
+
+    tmp = DISS_DELTA_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(DISS_DELTA_FILE)
+    return web.json_response({"ok": True, "id": entry["id"]})
+
+
+# ── Diss Structure ─────────────────────────────────────────────────────────────
+DISS_STRUCTURE_FILE = DATA_DIR / "diss_structure.json"
+
+async def api_diss_structure(request):
+    """GET — load chapter structure  |  POST — save chapter structure."""
+    if request.method == "GET":
+        if DISS_STRUCTURE_FILE.exists():
+            try:
+                return web.json_response(json.loads(DISS_STRUCTURE_FILE.read_text("utf-8")))
+            except Exception:
+                pass
+        return web.json_response({"chapters": []})
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+    chapters = body.get("chapters", [])
+    tmp = DISS_STRUCTURE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"chapters": chapters}, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(DISS_STRUCTURE_FILE)
+    return web.json_response({"ok": True})
 
 
 async def api_medizin_lernplan(request):
@@ -2187,6 +3225,31 @@ async def api_trading_bots_restart(request):
         return web.json_response(result)
     except KeyError:
         raise web.HTTPNotFound(reason="Bot not found")
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def api_trading_bots_rank(request):
+    """GET /api/trading/bots/rank  -  Bots sortiert nach Sortino Ratio."""
+    try:
+        return web.json_response({"bots": _tbm.rank_bots_by_sortino()})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def api_trading_bots_kick_mutate(request):
+    """POST /api/trading/bots/kick-mutate  -  Kickt Verlierer, spawnt 2 Mutanten.
+
+    Body: {loser_id, winner_id}
+    """
+    try:
+        body = await request.json()
+        loser_id = body["loser_id"]
+        winner_id = body["winner_id"]
+        result = _tbm.kick_and_mutate(loser_id, winner_id)
+        return web.json_response(result)
+    except (KeyError, TypeError) as e:
+        return web.json_response({"error": f"bad request: {e}"}, status=400)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
@@ -3243,7 +4306,7 @@ async def api_skills_preview(request):
 # File Upload endpoint
 # ---------------------------------------------------------------------------
 
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MB — hochgesetzt für große GoodNotes/Skript-PDFs
 
 async def api_upload(request):
     """POST /api/upload  -  multipart/form-data, stores file in data/uploads/."""
@@ -3272,7 +4335,7 @@ async def api_upload(request):
                 if size > MAX_UPLOAD_BYTES:
                     f.close()
                     dest.unlink(missing_ok=True)
-                    return web.json_response({"error": "File too large (max 20 MB)"}, status=413)
+                    return web.json_response({"error": "File too large (max 500 MB)"}, status=413)
                 f.write(chunk)
 
         print(f"[Upload] Saved {unique_name} ({size} bytes)")
@@ -3419,6 +4482,1710 @@ async def api_funnel_ingest(request):
     return web.json_response({"ok": True, "task_id": task_id, "log_id": log_id})
 
 
+def _learn_extract_images(file_path: "Path") -> list:
+    """Extract images from PPTX or PDF into UPLOADS_DIR/images/<stem>/. Returns relative paths."""
+    import json as _jcap
+    images = []
+    captions = {}  # rel_path → slide text caption
+    suffix = file_path.suffix.lower()
+    img_dir = UPLOADS_DIR / "images" / file_path.stem
+    try:
+        if suffix == ".pptx":
+            from pptx import Presentation
+            img_dir.mkdir(parents=True, exist_ok=True)
+            prs = Presentation(str(file_path))
+            idx_ref = [0]
+
+            def _slide_text(slide):
+                texts = []
+                for sh in slide.shapes:
+                    try:
+                        if sh.has_text_frame:
+                            t = sh.text_frame.text.strip()
+                            if t:
+                                texts.append(t)
+                    except Exception:
+                        pass
+                return " | ".join(texts[:4])[:200]  # max 200 chars, first 4 text boxes
+
+            def _extract_shapes(shapes, slide_id, caption):
+                for shape in shapes:
+                    if shape.shape_type == 6:  # GROUP — recurse
+                        try:
+                            _extract_shapes(shape.shapes, slide_id, caption)
+                        except Exception:
+                            pass
+                        continue
+                    img_blob = None
+                    ext = "png"
+                    if shape.shape_type == 13:  # PICTURE
+                        try:
+                            img_blob = shape.image.blob
+                            ext = shape.image.ext or "png"
+                        except Exception:
+                            pass
+                    else:
+                        # XML-level fallback for EMF/WMF embedded in non-PICTURE shapes
+                        try:
+                            from pptx.oxml.ns import qn
+                            blip = shape.element.find(".//" + qn("a:blip"))
+                            if blip is not None:
+                                rId = blip.get(qn("r:embed"))
+                                if rId:
+                                    part = shape.part.related_parts.get(rId)
+                                    if part and hasattr(part, "blob"):
+                                        img_blob = part.blob
+                                        ct = getattr(part, "content_type", "")
+                                        ext = "wmf" if "wmf" in ct else ("emf" if "emf" in ct else "png")
+                        except Exception:
+                            pass
+                    if img_blob:
+                        # Convert EMF/WMF to PNG via wand so browsers can render
+                        if ext in ("emf", "wmf"):
+                            try:
+                                from wand.image import Image as WandImage
+                                with WandImage(blob=img_blob) as wimg:
+                                    wimg.format = "png"
+                                    img_blob = wimg.make_blob()
+                                    ext = "png"
+                            except ImportError:
+                                print(f"[Learn] WARN: wand nicht installiert — EMF/WMF-Bild übersprungen (pip install wand). Datei: {file_path.name}")
+                            except Exception as _wand_err:
+                                print(f"[Learn] WARN: EMF/WMF-Konvertierung fehlgeschlagen ({_wand_err}) — Bild übersprungen. Datei: {file_path.name}")
+                        img_name = f"s{slide_id}_{idx_ref[0]}.{ext}"
+                        out = img_dir / img_name
+                        out.write_bytes(img_blob)
+                        rel = f"images/{file_path.stem}/{img_name}"
+                        images.append(rel)
+                        if caption:
+                            captions[rel] = caption
+                        idx_ref[0] += 1
+
+            for slide in prs.slides:
+                cap = _slide_text(slide)
+                _extract_shapes(slide.shapes, slide.slide_id, cap)
+        elif suffix == ".pdf":
+            import fitz  # pymupdf
+            img_dir.mkdir(parents=True, exist_ok=True)
+            doc = fitz.open(str(file_path))
+            idx = 0
+            for pg_num, page in enumerate(doc):
+                page_text = page.get_text("text").strip().replace("\n", " ")[:200]
+                for img_info in page.get_images():
+                    xref = img_info[0]
+                    base = doc.extract_image(xref)
+                    ext = base.get("ext", "png")
+                    img_name = f"p{pg_num}_{idx}.{ext}"
+                    out = img_dir / img_name
+                    out.write_bytes(base["image"])
+                    rel = f"images/{file_path.stem}/{img_name}"
+                    images.append(rel)
+                    if page_text:
+                        captions[rel] = page_text
+                    idx += 1
+            doc.close()
+    except ImportError as e:
+        print(f"[Learn] Image extraction skipped (missing lib): {e}")
+    except Exception as e:
+        print(f"[Learn] Image extraction error for {file_path.name}: {e}")
+    # Save captions alongside images for use during card generation
+    # Always write captions.json — use filename as fallback if no text was extracted
+    if images:
+        try:
+            cap_path = img_dir / "captions.json"
+            img_dir.mkdir(parents=True, exist_ok=True)
+            existing = {}
+            if cap_path.exists():
+                try:
+                    existing = _jcap.loads(cap_path.read_text("utf-8"))
+                except Exception:
+                    pass
+            existing.update(captions)
+            # Fallback: any image without a caption gets its filename as caption
+            for rel in images:
+                if rel not in existing:
+                    stem = Path(rel).stem.replace("_", " ").replace("-", " ")
+                    existing[rel] = stem
+            cap_path.write_text(_jcap.dumps(existing, ensure_ascii=False, indent=2), "utf-8")
+        except Exception as e:
+            print(f"[Learn] Caption save error: {e}")
+    return images
+
+
+async def api_learn_ingest(request):
+    """POST /api/learn/ingest  -  multipart upload for Lernraum.
+    Fields: files[] (multipart), subject (str), type (str).
+    Saves to UPLOADS_DIR, triggers Funnel Ingest + RAG reindex.
+    """
+    try:
+        reader = await request.multipart()
+        saved_files = []
+        subject = ""
+        learn_type = "vorlesung"
+        provider = "folie"
+
+        async for field in reader:
+            if field.name == "subject":
+                subject = (await field.read()).decode("utf-8", errors="replace").strip()
+            elif field.name == "type":
+                learn_type = (await field.read()).decode("utf-8", errors="replace").strip()
+            elif field.name == "provider":
+                provider = (await field.read()).decode("utf-8", errors="replace").strip() or "folie"
+            elif field.name in ("file", "files[]", "files"):
+                original_name = field.filename or "upload"
+                safe_name = "".join(c for c in original_name if c.isalnum() or c in "._- ").strip() or "upload"
+                unique_name = f"{uuid.uuid4().hex[:8]}_{safe_name}"
+                dest = UPLOADS_DIR / unique_name
+                size = 0
+                with dest.open("wb") as f:
+                    while True:
+                        chunk = await field.read_chunk(65536)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > MAX_UPLOAD_BYTES:
+                            dest.unlink(missing_ok=True)
+                            return web.json_response({"error": f"Datei zu groß (max 500 MB): {original_name}"}, status=413)
+                        f.write(chunk)
+                # Extract images from PPTX/PDF in thread pool (CPU-bound)
+                loop = asyncio.get_event_loop()
+                extracted = await loop.run_in_executor(None, _learn_extract_images, dest)
+                saved_files.append({"filename": unique_name, "original": original_name, "size": size, "images": extracted})
+                print(f"[Learn] Saved {unique_name} ({size} bytes), {len(extracted)} images extracted")
+                # Write subject→stem mapping for reliable image lookup during generate
+                # Always write meta — even if no images were extracted (EMF/WMF slides)
+                meta_path = UPLOADS_DIR / "images" / "learn_meta.json"
+                meta_path.parent.mkdir(parents=True, exist_ok=True)
+                import json as _jmeta
+                meta = {}
+                if meta_path.exists():
+                    try:
+                        meta = _jmeta.loads(meta_path.read_text("utf-8"))
+                    except Exception:
+                        meta = {}
+                subj_key = (subject or "medizin").lower()
+                if subj_key not in meta:
+                    meta[subj_key] = []
+                if dest.stem not in meta[subj_key]:
+                    meta[subj_key].append(dest.stem)
+                # Cleanup: remove stale stems (image dir no longer exists)
+                meta[subj_key] = [s for s in meta[subj_key] if (meta_path.parent / s).is_dir() or s == dest.stem]
+                # Remove empty subject keys
+                meta = {k: v for k, v in meta.items() if v}
+                meta_path.write_text(_jmeta.dumps(meta, ensure_ascii=False, indent=2), "utf-8")
+                print(f"[Learn] Meta updated: {subj_key} → {meta[subj_key]}")
+
+        if not saved_files:
+            return web.json_response({"error": "Keine Dateien erhalten"}, status=400)
+
+        subj_label = subject or "Medizin"
+        tags = ["lernraum", learn_type, provider]
+        if subject:
+            tags.append(subject.lower().replace(" ", "-"))
+
+        # Build funnel-style request body and call internal logic directly
+        fake_body = {
+            "type": learn_type,
+            "provider": provider,
+            "tags": tags,
+            "text": f"Lernmaterial für: {subj_label}\nTyp: {learn_type}\nQuelle: {provider}",
+            "files": saved_files,
+        }
+        from aiohttp import web as _web
+        import json as _json
+
+        class _FakeRequest:
+            async def json(self_inner):
+                return fake_body
+            content_length = 1
+
+        resp = await api_funnel_ingest(_FakeRequest())
+        result = _json.loads(resp.body)
+
+        # Trigger RAG reindex in background (don't await — fire and forget)
+        async def _reindex():
+            try:
+                from rag.ingest import build_index
+                import asyncio as _aio
+                loop = _aio.get_event_loop()
+                await loop.run_in_executor(None, lambda: build_index(force=False))
+                print("[Learn] RAG reindex done")
+            except Exception as e:
+                print(f"[Learn] RAG reindex error: {e}")
+        asyncio.create_task(_reindex())
+
+        total_images = sum(len(f.get("images", [])) for f in saved_files)
+        return web.json_response({"ok": True, "files": len(saved_files), "images_extracted": total_images, **result})
+
+    except Exception as e:
+        print(f"[Learn] Ingest error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def api_learn_generate(request):
+    """POST /api/learn/generate
+    Streaming-Wrapper: schreibt alle paar Sekunden ein Whitespace-Byte als
+    Heartbeat, damit Cloudflare's 100s-Proxy-Timeout nicht greift. JSON.parse
+    ignoriert Leerzeichen am Anfang, daher braucht das Frontend keine Anpassung.
+    """
+    resp = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        },
+    )
+    await resp.prepare(request)
+
+    async def _runner():
+        try:
+            return await _learn_generate_impl(request)
+        except Exception as _e:
+            import traceback as _tb
+            _tb.print_exc()
+            return {"ok": False, "error": f"{type(_e).__name__}: {_e}"}
+
+    work_task = asyncio.create_task(_runner())
+    HEARTBEAT_S = 8  # CF Free timeout = 100s, weit darunter bleiben
+    try:
+        while True:
+            try:
+                body = await asyncio.wait_for(asyncio.shield(work_task), timeout=HEARTBEAT_S)
+                break
+            except asyncio.TimeoutError:
+                try:
+                    await resp.write(b" ")
+                except (ConnectionResetError, BrokenPipeError):
+                    work_task.cancel()
+                    return resp
+    except asyncio.CancelledError:
+        work_task.cancel()
+        raise
+
+    import json as _jstream
+    await resp.write(_jstream.dumps(body, ensure_ascii=False).encode("utf-8"))
+    await resp.write_eof()
+    return resp
+
+
+async def _learn_generate_impl(request):
+    """Implementiert die eigentliche Karten-Generierung. Gibt ein Dict zurück
+    (kein web.Response), damit der Streaming-Wrapper das letzte Stück als JSON
+    schreiben kann.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": False, "error": "Invalid JSON"}
+
+    subject = (body.get("subject") or "").strip()
+    topics = body.get("topics") or []
+    if isinstance(topics, str):
+        topics = [t.strip() for t in topics.split(",") if t.strip()]
+    try:
+        _raw_chunks = body.get("n_chunks", 12)
+        n_chunks = int(_raw_chunks) if isinstance(_raw_chunks, (int, str, float)) else 12
+    except (TypeError, ValueError):
+        n_chunks = 12
+    # n_cards: optionaler harter Wert. Wenn nicht gesetzt UND density gesetzt,
+    # entscheidet Claude selbst basierend auf Stoffumfang.
+    _raw_cards = body.get("n_cards")
+    if _raw_cards in (None, "", "auto"):
+        n_cards = None
+    else:
+        try:
+            n_cards = max(3, min(60, int(_raw_cards)))
+        except (TypeError, ValueError):
+            n_cards = None
+    density = (body.get("density") or "").strip().lower()
+    if density not in ("low", "medium", "high"):
+        density = ""
+    # Wenn weder n_cards noch density: Default = medium (sinnvoller als fix 12)
+    if n_cards is None and not density:
+        density = "medium"
+    feedback_new = (body.get("feedback") or "").strip()
+    screenshots_b64 = body.get("screenshots") or []  # list of dataURL strings
+
+    user_rules = body.get("rules") or []
+    if isinstance(user_rules, str):
+        user_rules = [r.strip() for r in user_rules.splitlines() if r.strip()]
+    else:
+        user_rules = [str(r).strip() for r in user_rules if str(r).strip()]
+
+    # source_mode: bestimmt woraus die Karten gebaut werden.
+    # - "lernraum" (default): RAG-Suche im Lernraum + Amboss/ViaMedici als Ergaenzung
+    # - "amboss":  rein aus Amboss-Artikeln + Bildern (kein RAG, kein ViaMedici)
+    # - "thieme":  rein aus ViaMedici/Thieme (kein RAG, kein Amboss)
+    # - "mix":     Amboss + ViaMedici, kein RAG (wenn Robin keine eigenen Folien hat)
+    source_mode = (body.get("source_mode") or "lernraum").strip().lower()
+    if source_mode not in ("lernraum", "amboss", "thieme", "mix"):
+        source_mode = "lernraum"
+    use_rag = source_mode == "lernraum"
+    use_amboss = source_mode in ("lernraum", "amboss", "mix")
+    use_viamedici = source_mode in ("lernraum", "thieme", "mix")
+
+    if not subject and not topics:
+        return {"ok": False, "error": "subject oder topics erforderlich"}
+
+    # Persistiertes Feedback pro Fach laden und mit neuem Feedback kombinieren
+    import json as _jfb
+    _fb_path = UPLOADS_DIR / "learn_feedback.json"
+    try:
+        _fb_store = _jfb.loads(_fb_path.read_text(encoding="utf-8")) if _fb_path.exists() else {}
+    except Exception:
+        _fb_store = {}
+    _subj_key = subject.lower().strip()
+    _persisted_fb = _fb_store.get(_subj_key, "")
+    # Neues Feedback sofort persistieren (auch wenn es keine neuen Karten gibt)
+    if feedback_new:
+        existing = _persisted_fb.splitlines()
+        if feedback_new not in existing:
+            _persisted_fb = "\n".join([l for l in existing if l] + [feedback_new])
+        _fb_store[_subj_key] = _persisted_fb
+        try:
+            _fb_path.write_text(_jfb.dumps(_fb_store, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[Learn/Feedback] Gespeichert für '{subject}': {feedback_new[:80]}")
+        except Exception as _fbe:
+            print(f"[Learn/Feedback] Speichern fehlgeschlagen: {_fbe}")
+    feedback = _persisted_fb
+
+    # 0. Amboss-Screenshots aus Frontend speichern → werden als available_images eingebunden
+    screenshot_paths = []
+    if screenshots_b64:
+        import base64 as _b64
+        subj_dir = UPLOADS_DIR / "images" / f"amboss_{(subject or 'medizin').lower().replace(' ', '_')}"
+        subj_dir.mkdir(parents=True, exist_ok=True)
+        for i, data_url in enumerate(screenshots_b64):
+            try:
+                if data_url.startswith("data:image/svg"):
+                    print(f"[Learn] Screenshot {i} übersprungen: SVG nicht unterstützt")
+                    continue
+                # Strip "data:image/...;base64," prefix
+                if "," in data_url:
+                    data_url = data_url.split(",", 1)[1]
+                img_bytes = _b64.b64decode(data_url)
+                # Auf 1024px verkleinern — verhindert stille Timeouts bei großen Screenshots
+                try:
+                    from PIL import Image as _SPIL
+                    import io as _sio
+                    _simg = _SPIL.open(_sio.BytesIO(img_bytes))
+                    _simg.thumbnail((1024, 1024))
+                    _sbuf = _sio.BytesIO()
+                    _simg.save(_sbuf, format="PNG")
+                    img_bytes = _sbuf.getvalue()
+                except Exception:
+                    pass  # Pillow nicht verfügbar — Original nutzen
+                img_name = f"amboss_{uuid.uuid4().hex[:8]}.png"
+                img_path = subj_dir / img_name
+                img_path.write_bytes(img_bytes)
+                screenshot_paths.append(str(img_path.relative_to(UPLOADS_DIR)).replace("\\", "/"))
+                print(f"[Learn] Amboss-Screenshot gespeichert: {img_name}")
+            except Exception as e:
+                print(f"[Learn] Screenshot {i} konnte nicht gespeichert werden: {e}")
+
+    # 0.5 Amboss: Artikel-Bilder + Text-Kontext via Session-Cookie (Cache > config.json)
+    from amboss_client import _load_cached_cookie as _load_amboss_cookie
+    _amboss_cookie = _load_amboss_cookie(UPLOADS_DIR) or CONFIG.get("amboss_cookie", "").strip()
+    amboss_article_texts: list[dict] = []
+    if not use_amboss:
+        print(f"[Learn] Amboss uebersprungen (source_mode={source_mode})")
+    elif _amboss_cookie:
+        try:
+            from amboss_client import fetch_amboss_context as _fetch_amboss_ctx
+            _terms = topics if topics else [subject]
+            _amboss_result = await _fetch_amboss_ctx(
+                cookie=_amboss_cookie,
+                terms=_terms,
+                subject=subject,
+                uploads_dir=UPLOADS_DIR,
+            )
+            _amboss_paths = _amboss_result.get("image_paths") or []
+            amboss_article_texts = _amboss_result.get("article_texts") or []
+            screenshot_paths.extend(_amboss_paths)
+            print(f"[Learn] Amboss: {len(_amboss_paths)} Bilder + {len(amboss_article_texts)} Artikel-Texte")
+        except Exception as _ae:
+            print(f"[Learn] Amboss-Abruf fehlgeschlagen (ignoriert): {_ae}")
+    else:
+        print("[Learn] Amboss: kein Cookie — übersprungen (Login via Medizin-Tab oder config.json `amboss_cookie`)")
+
+    # 0.6 ViaMedici (Thieme): Bilder + Artikel-Text via Keycloak Silent-Refresh
+    viamedici_article_texts: list[dict] = []
+    if not use_viamedici:
+        print(f"[Learn] ViaMedici uebersprungen (source_mode={source_mode})")
+    else:
+        try:
+            from viamedici_client import _load_kc_cookies as _load_vm_cookies, fetch_viamedici_context
+            if _load_vm_cookies(UPLOADS_DIR) or CONFIG.get("viamedici_cookies", "").strip():
+                _terms = topics if topics else [subject]
+                _vm_result = await fetch_viamedici_context(
+                    uploads_dir=UPLOADS_DIR, terms=_terms, subject=subject,
+                )
+                _vm_paths = _vm_result.get("image_paths") or []
+                viamedici_article_texts = _vm_result.get("article_texts") or []
+                screenshot_paths.extend(_vm_paths)
+                print(f"[Learn] ViaMedici: {len(_vm_paths)} Bilder + {len(viamedici_article_texts)} Texte")
+            else:
+                print("[Learn] ViaMedici: keine Cookies — übersprungen")
+        except Exception as _ve:
+            print(f"[Learn] ViaMedici-Abruf fehlgeschlagen (ignoriert): {_ve}")
+
+    # 1. RAG-Suche: nur wenn source_mode=lernraum (sonst kein eigenes Material)
+    all_chunks = []
+    if not use_rag:
+        print(f"[Learn] RAG uebersprungen (source_mode={source_mode}) — Karten kommen aus externen Quellen")
+    else:
+        try:
+            from rag.search import query as rag_query
+            loop = asyncio.get_event_loop()
+
+            search_terms = topics if topics else [subject]
+            seen_ids = set()
+            for term in search_terms:
+                q = f"{subject} {term}".strip()
+                hits = await loop.run_in_executor(None, lambda q=q: rag_query(q, n_chunks))
+                for h in hits:
+                    cid = h.get("id") or h.get("text", "")[:60]
+                    if cid not in seen_ids:
+                        seen_ids.add(cid)
+                        all_chunks.append(h)
+        except Exception as e:
+            print(f"[Learn/Generate] RAG-Fehler (ignoriert): {e}")
+
+    # 2. Bilder aus UPLOADS_DIR/images/ auflisten und nach Fach vorfiltern
+    img_root = UPLOADS_DIR / "images"
+    available_images = []
+    if img_root.exists():
+        import json as _jmeta2
+        # Lese learn_meta.json für direkte Stem→Subject-Zuordnung
+        meta_path = img_root / "learn_meta.json"
+        meta = {}
+        if meta_path.exists():
+            try:
+                meta = _jmeta2.loads(meta_path.read_text("utf-8"))
+            except Exception:
+                meta = {}
+
+        subj_key = subject.lower()
+        direct_stems = set(meta.get(subj_key, []))
+
+        # Fuzzy-Fallback: subject-Wörter gegen gespeicherte Keys matchen
+        if not direct_stems:
+            subj_words = [w for w in subject.lower().split() if len(w) > 3]
+            for key, stems in meta.items():
+                if any(w in key or key in w for w in subj_words):
+                    direct_stems.update(stems)
+
+        # Keywords aus Subject + Topics für Dateiname-Matching (Score 1)
+        match_keywords = set()
+        for t in ([subject] + topics):
+            for word in t.lower().split():
+                if len(word) > 3:
+                    match_keywords.add(word)
+
+        all_imgs = []
+        for img in img_root.rglob("*"):
+            if img.suffix.lower() in (".jpg", ".jpeg", ".png", ".gif", ".webp") and img.name != "learn_meta.json":
+                all_imgs.append(img)
+
+        def img_score(img):
+            # Score 2: Bild gehört zu einem direkt gemappten Ordner (via learn_meta.json)
+            if img.parent.name in direct_stems:
+                return 2
+            name_lower = img.stem.lower()
+            if any(kw in name_lower for kw in match_keywords):
+                return 1
+            return 0
+
+        scored = sorted(all_imgs, key=img_score, reverse=True)
+        relevant = [i for i in scored if img_score(i) > 0]
+        if len(relevant) >= 3:
+            available_images = [str(i.relative_to(UPLOADS_DIR)).replace("\\", "/") for i in relevant[:20]]
+        else:
+            available_images = [str(i.relative_to(UPLOADS_DIR)).replace("\\", "/") for i in scored[:20]]
+
+    # Amboss-Screenshots haben höchste Priorität — vorne einreihen, Duplikate vermeiden
+    if screenshot_paths:
+        available_images = screenshot_paths + [p for p in available_images if p not in set(screenshot_paths)]
+
+    # source_meta.json aus Thieme/Amboss-Upload-Ordnern einlesen (werden nicht durch img_score erfasst)
+    # Für Amboss: Artikel-Bilder (article) vor Atlas-Bildern (atlas) einreihen
+    import json as _jsmeta
+    _subj_slug = (subject or "medizin").lower().replace(" ", "_")
+    for _provider_prefix in ("thieme", "amboss"):
+        _pmeta = img_root / f"{_provider_prefix}_{_subj_slug}" / "source_meta.json"
+        if _pmeta.exists():
+            try:
+                _pdata = _jsmeta.loads(_pmeta.read_text("utf-8"))
+                if _provider_prefix == "amboss":
+                    # Artikel-Bilder haben Vorrang — Atlas nur als Bonus hinten
+                    _art_paths = [e["path"] for e in _pdata if "path" in e and e.get("source") != "atlas"]
+                    _atl_paths = [e["path"] for e in _pdata if "path" in e and e.get("source") == "atlas"]
+                    _ppaths = _art_paths + _atl_paths
+                    print(f"[Learn] Amboss source_meta: {len(_art_paths)} Artikel + {len(_atl_paths)} Atlas eingebunden")
+                else:
+                    _ppaths = [e["path"] for e in _pdata if "path" in e]
+                    print(f"[Learn] {_provider_prefix} source_meta: {len(_ppaths)} Bilder eingebunden")
+                available_images = _ppaths + [p for p in available_images if p not in set(_ppaths)]
+            except Exception as _pme:
+                print(f"[Learn] {_provider_prefix} source_meta Lesefehler: {_pme}")
+
+    # 3. Prompt für Claude zusammenbauen
+    chunks_text = "\n\n---\n\n".join(
+        h.get("text", "") for h in all_chunks[:20]
+    ) or "(Kein RAG-Material verfügbar — nutze dein Medizin-Wissen)"
+
+    # Load captions from captions.json files in image directories
+    all_captions = {}
+    try:
+        import json as _jcap2
+        for cap_file in img_root.rglob("captions.json"):
+            try:
+                all_captions.update(_jcap2.loads(cap_file.read_text("utf-8")))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Captions + Provider-Tag aus source_meta.json mergen (Thieme/Amboss)
+    import json as _jsmeta2
+    for _provider_prefix in ("thieme", "amboss"):
+        _pmeta2 = img_root / f"{_provider_prefix}_{_subj_slug}" / "source_meta.json"
+        if _pmeta2.exists():
+            try:
+                for _e in _jsmeta2.loads(_pmeta2.read_text("utf-8")):
+                    if "path" in _e:
+                        _cap_parts = []
+                        if _e.get("caption"):
+                            _cap_parts.append(_e["caption"])
+                        # Immer Provider-Tag hinzufügen — _provider_prefix als Fallback wenn "provider" fehlt
+                        _src = (_e.get("provider") or _provider_prefix).capitalize()
+                        _cap_parts.append(f"Quelle: {_src}")
+                        all_captions[_e["path"]] = " — ".join(_cap_parts)
+            except Exception:
+                pass
+
+    images_hint = ""
+    if available_images:
+        img_lines = []
+        for p in available_images:
+            cap = all_captions.get(p, "")
+            if cap:
+                img_lines.append(f"- {p}  → Thema: \"{cap}\"")
+            else:
+                img_lines.append(f"- {p}  → (kein Folientitel)")
+        images_hint = (
+            f"\n\nVerfügbare Bilder für **{subject}** (relative Pfade für ImagePath-Feld):\n"
+            + "\n".join(img_lines)
+            + "\n\nZuordnungsregel: Bevorzuge Amboss-Artikel-Bilder (Pfad enthält `amboss_art_`) — "
+            "sie sind didaktisch aufbereitet und stehen immer zur Verfügung. "
+            "Atlas-Bilder (Pfad enthält `amboss_atl_`) nur verwenden, wenn kein passendes Artikel-Bild existiert. "
+            "Wähle das Bild dessen Thema-Label inhaltlich am stärksten zur Kartenfrage passt. "
+            "Kopiere den Pfad wörtlich. Verteile alle Bilder möglichst gleichmäßig auf die Karten."
+        )
+
+    topics_line = ", ".join(topics) if topics else subject
+    feedback_block = f"\n\nNUTZER-FEEDBACK zu vorherigen Karten (bitte umsetzen): {feedback}" if feedback else ""
+    rules_block = (
+        "\n\nZUSÄTZLICHE NUTZER-REGELN (überschreiben Defaults bei Konflikt):\n"
+        + "\n".join(f"- {r}" for r in user_rules)
+    ) if user_rules else ""
+
+    # Source-Kontext für Karten: welche Quelldateien wurden genutzt
+    source_files = list({
+        p.split("/")[1] if "/" in p else p
+        for p in available_images
+    })[:5]
+    source_hint = f"\n\nQuelldateien: {', '.join(source_files)}" if source_files else ""
+
+    # Amboss-Artikel-Text als ergänzender Kontext (Claude soll vertiefende Karten generieren)
+    amboss_context_block = ""
+    if amboss_article_texts:
+        _blocks = []
+        for at in amboss_article_texts[:4]:  # max 4 Artikel → Prompt-Budget
+            _blocks.append(f"── Amboss-Artikel: {at['title']} ──\n{at['text']}")
+        amboss_context_block = (
+            "\n\nZUSÄTZLICHER AMBOSS-KONTEXT (Amboss-Artikel-Auszüge zum Thema — "
+            "nutze dies um das Vorlesungs-/Seminarmaterial zu **ergänzen und zu vertiefen**, "
+            "z.B. mit Details/Leitlinien/Amboss-Perlen die im Lernraum-Material fehlen):\n\n"
+            + "\n\n".join(_blocks)
+        )
+
+    # ViaMedici (Thieme)-Artikel-Text als ergänzender Kontext
+    viamedici_context_block = ""
+    if viamedici_article_texts:
+        _vblocks = []
+        for vt in viamedici_article_texts[:3]:
+            _vblocks.append(f"── Thieme/ViaMedici-Lernmodul: {vt['title']} ──\n{vt['text']}")
+        viamedici_context_block = (
+            "\n\nZUSÄTZLICHER THIEME/VIAMEDICI-KONTEXT (Lernmodul-Auszüge — "
+            "ergänze damit das Vorlesungsmaterial um Thieme-spezifische Erklärungen, "
+            "IMPP-Hochleistungsfakten und didaktisch aufbereitete Zusammenhänge):\n\n"
+            + "\n\n".join(_vblocks)
+        )
+
+    # Karten-Anzahl: entweder hart vorgegeben oder Density-Bereich für Claude-Selbsteinschätzung
+    if n_cards is not None:
+        count_directive = f"Erstelle genau **{n_cards}** hochwertige Anki-Karten"
+    else:
+        _ranges = {
+            "low":    ("WENIG",  "5-10",  "Nur die absolut wichtigsten Konzepte. Highlights only — keine Details."),
+            "medium": ("MITTEL", "12-20", "Solide Coverage der Hauptthemen + ein paar Vertiefungen / IMPP-relevante Details."),
+            "high":   ("VIEL",   "22-40", "Tiefe Abdeckung inkl. Edge-Cases, IMPP-Fallen, Differenzialdiagnosen, Pharmako-Details."),
+        }
+        _label, _range, _desc = _ranges.get(density, _ranges["medium"])
+        count_directive = (
+            f"Wähle SELBST eine sinnvolle Karten-Anzahl im Bereich **{_range}** "
+            f"(Modus: **{_label}** — {_desc})\n"
+            f"Schau dir das Quellmaterial an und entscheide:\n"
+            f"- Wenig/leichter Stoff → eher untere Bereichsgrenze\n"
+            f"- Viel komplexer Stoff → eher obere Bereichsgrenze\n"
+            f"- Lieber {_range.split('-')[0]} richtig gute Karten als {_range.split('-')[1]} dünne. "
+            f"Qualität > Quantität, aber bleib im Bereich.\n"
+            f"Erstelle die Anki-Karten dann"
+        )
+
+    prompt = f"""Du bist ein Medizin-Lernkarten-Experte. Erstelle Anki-Karten zum Thema: **{subject}**.
+Fokus-Topics: {topics_line}
+
+Quellmaterial aus dem Lernraum:
+{chunks_text}{images_hint}{source_hint}{amboss_context_block}{viamedici_context_block}
+
+{count_directive} im folgenden CSV-Format (TAB-separiert, kein Header):
+Front[TAB]Back[TAB]Tags[TAB]ImagePath[TAB]FunFact[TAB]Merkhilfe[TAB]Source
+
+KARTEN-TYPEN (wähle pro Karte) — **Mindestens 60% des Decks MUSS Cloze sein**:
+- **Cloze/Lückentext (default!)**: Nutze Anki-Syntax IMMER mit DOPPELTEN geschweiften Klammern: `{{c1::Antwort}}`. **NIEMALS** `{{c1::Antwort}}` (single brace), das wird nicht als Cloze erkannt und landet als Roh-Text auf der Karte.
+  - **Format-Konvention**: Front = kurzer Kontext-Header (z.B. "Glasgow Coma Scale - Augenoeffnung"), Back = der Lueckentext-Satz mit den `{{c1::}}`-Markern. Front darf KEINE Cloze-Marker haben — nur Back. Wenn die Karte nur ein einzelner Lueckentext-Satz ist, lass Front leer und schreib alles in Back.
+  - Beispiel: Front = `Aortenstenose - Diagnostik`. Back = `Echokardiographie zeigt {{c1::AVA < 1,0 cm²}} und {{c2::dPmean > 40 mmHg}}; Goldstandard ist {{c3::TTE}}.`
+  - Mehrere Cluecken pro Karte OK. Gut fuer: Definitionen, Zahlen/Werte, Medikamente+Dosen, Klassifikationen, Schemata. Werden rot+fett gerendert.
+- **Basic (Front/Back klassisch)**: NUR fuer komplexe Erklaerungen, offene Fragen, Algorithmen — wenn Cloze inhaltlich gar nicht passt. Sollte die Minderheit sein (<= 40%).
+
+EIGENE GRAFIK erzeugen — **MINDESTENS 25% der Karten sollen ein eigenes SVG/Mermaid-Element haben**, wenn der Inhalt visualisierbar ist:
+- **SVG inline**: `<svg viewBox="0 0 320 140" xmlns="http://www.w3.org/2000/svg">…</svg>` — Pflicht-Trigger: Druckkurven (Aortenstenose), Achsen-Diagramme (BNP-Cutoffs), Schemata (Klappen, Hirnnerven, Reizleitung), EKG-Streifen, anatomische Abrisse. Max 4-6 Elemente, klar beschriftet, dunkler Hintergrund passt (stroke hell, z.B. `stroke="#60a5fa"` oder `#34d399`).
+- **Mermaid-Diagramm**: `<div class="mermaid">graph TD; A[Dyspnoe] --> B{{BNP}}; B -->|hoch| C[Echokardiographie]; B -->|normal| D[DD prüfen]</div>` — Pflicht-Trigger: Algorithmen, Entscheidungsbaeume, Differenzialdiagnose-Trees, Therapie-Stufenschemata.
+- **KI-Generierung (Nano Banana/Gemini)**: Wenn KEIN passendes Amboss-/Thieme-Bild existiert UND ein Foto-aehnliches Bild (klinisches Bild, makroskopische Anatomie) den Inhalt verstaerkt, schreibe in ImagePath: `[GENERATE: "Detaillierter Prompt fuer eine medizinische Illustration von ..."]`. Nur wenn echt noetig — bei abstrakten Konzepten lieber SVG/Mermaid.
+
+**Bild-Quality-Filter (KRITISCH)**: Bevor du ein Bild aus der Liste oben zuordnest, frag dich: "Zeigt dieses Bild DIREKT was die Karte abfragt?" Wenn das Bild nur tangential passt oder nur dekorativ waere → **ImagePath leer lassen** und stattdessen ein eigenes SVG bauen oder ohne Bild auskommen. Schlechte Bild-Zuordnung ist schlimmer als kein Bild.
+
+IMAGE OCCLUSION (optional, nur bei anatomischen Schema-Bildern mit klar erkennbaren Strukturen):
+Wenn ImagePath ein Bild mit mehreren sichtbaren anatomischen/klinischen Strukturen zeigt (z.B. Herzklappen-Schema, Leber-Segmente, Hirnnerven-Austritt, EKG-Ableitungen), kannst du im Back Abdeckungen hinzufügen:
+- Syntax pro Struktur: `[OCCLUDE x=25 y=30 w=20 h=15]Aortenklappe[/OCCLUDE]`
+- Koordinaten in Prozent der Bildgröße (0-100). x,y = obere linke Ecke des Rechtecks.
+- Nutze NUR wenn du das Bild wirklich verstehst (du siehst die Bilder oben per Vision) und Strukturen präzise lokalisieren kannst.
+- Max 6 Abdeckungen pro Bild, sonst unleserlich.
+- Bei Foto/Graph/Tabelle keine [OCCLUDE]-Tags, normale Karte.
+
+FELDER:
+- **Front**: bei Basic = praezise klinische Frage; bei Cloze = kurzer Kontext-Header (max 80 Zeichen), keine `{{c}}`-Marker hier.
+- **Back**: bei Basic = strukturierte Antwort; bei Cloze = der Lueckentext-Satz mit `{{c1::}}`-Markern. HTML erlaubt (`<b>`, `<i>`, `<br>`, `<ul><li>`, `<span style="…">`), SVG/Mermaid inline OK; Box-Palette nur wenn echter Mehrwert.
+- **Format-Pflicht**: Aufzaehlungen mit ≥3 Items IMMER untereinander (`<ul><li>` oder `<br>`-getrennt). NIEMALS komma-getrennt nebeneinander wenn es eine Liste ist. Beispiel falsch: "Symptome: Dyspnoe, Synkope, Angina." Beispiel richtig: `<ul><li>Dyspnoe</li><li>Synkope</li><li>Angina</li></ul>` oder mit `<br>` zwischen den Items.
+- **Tags**: Komma-getrennt, z.B. "Kardiologie,EKG,sem8"
+- **ImagePath**: EXAKT einen Pfad aus der Bilderliste oben kopieren (nicht erfinden). Bild-Quality-Filter (oben) anwenden — lieber leer als unpassend. Matche ueber das Thema-Label.
+- **FunFact**: NUR wenn du eine wirklich ueberraschende klinische Pointe hast (z.B. Epidemiologie-Trivia, historischer Fakt, Eponym-Hintergrund). Keine Fueller. Sonst leer.
+- **Merkhilfe**: NUR konkrete Eselsbruecken — Akronyme (z.B. "MONA fuer ACS: Morphin, O2, Nitro, ASS"), Reime, Visual-Bilder ("Aortenstenose-Trias = SAD: Synkope/Angina/Dyspnoe"). KEINE schwammigen "Denke an X"-Phrasen. Wenn du nichts Echtes hast, lass leer.
+- **Source**: Format `Datei.pdf · S. N` (mit Seitenzahl wenn aus dem Bildpfad ableitbar, z.B. `slide_03.png` → `S. 3`). Wenn keine Seite ableitbar: nur Datei.pdf. Bei Amboss/Thieme: "Quelle: Amboss" / "Quelle: Thieme".
+
+BOX-PALETTE (optional im Back, max 3 pro Karte, Syntax `[TAG]Inhalt[/TAG]`):
+- `[THERAPIE]…[/THERAPIE]`    💊 grün   — Medikamente, Dosierungen, Therapie-Schemata
+- `[NOTFALL]…[/NOTFALL]`      ⚠️ rot    — akute Situationen, was sofort tun
+- `[DX]…[/DX]`                🩺 blau   — Diagnostik-Kriterien, Scores, Tests
+- `[PATHO]…[/PATHO]`          🧬 lila   — Pathomechanismus
+- `[LABOR]…[/LABOR]`          🔬 gelb   — Laborwerte, Cut-offs, Normbereiche
+- `[IMPP]…[/IMPP]`            🎯 pink   — examensrelevante High-Yield-Fakten
+- `[LEITLINIE]…[/LEITLINIE]`  📖 türkis — S3/S2k-Empfehlungen, Guideline-Zitate
+- `[REDFLAG]…[/REDFLAG]`      🚨 dunkelrot — Alarm-/Warnsymptome
+- `[DD]…[/DD]`                🎯 violett — Differentialdiagnosen
+- `[AMBOSS]…[/AMBOSS]`        🟢 grün-Badge — wenn Inhalt klar aus Amboss-Kontext (wenn oben mitgegeben), explizit als Ergänzung markieren
+- `[THIEME]…[/THIEME]`        🔵 blau-Badge — wenn Inhalt aus ViaMedici/Thieme
+
+TEXT-FORMATIERUNG im Back:
+- Schlüsselbegriffe fett: `<b>Aortenstenose</b>`
+- Synonyme/Definitionen kursiv: `<i>(syn.: Valvula aortae)</i>`
+- Farb-Codes direkt inline (nur wenn nicht in einer Box):
+  • Therapie → `<span style="color:#34d399">Metoprolol 2×25mg</span>`
+  • Notfall/Warning → `<span style="color:#ef4444;font-weight:700">Notfall!</span>`
+  • Diagnostik → `<span style="color:#60a5fa">EKG, TTE</span>`
+  • Laborwerte → `<span style="color:#fde047">BNP > 400 pg/ml</span>`
+- Hervorgehobene Begriffe: `<span style="font-size:1.15em;font-weight:700">Kernaussage</span>`
+- Emojis inline für Kategorien: 🩺 💊 ⚠️ 🔬 🧬 💉 📊 📖
+
+INHALT-PRIORITÄT (WICHTIG):
+1. **Primärquelle:** Robins Seminar-/VL-Material (oben unter „Quellmaterial aus dem Lernraum"). Der KERN jeder Karte kommt daher. Wenn das Material eine Aussage macht, ist DAS das Fundament.
+2. **Amboss/Thieme ist ergänzend**, NICHT Ersatz. Pro Karte maximal EINE externe Box — entweder [AMBOSS] ODER [THIEME], nie beide gleichzeitig, nie mehrfach.
+3. Nutze die externe Box nur wenn sie KONKRETEN Mehrwert hat, den das Seminar-Material nicht bringt (z.B. „Amboss-Perle: 80% rechtsventrikulär", „Thieme-Lernmodul ergänzt: ESC-Leitlinie 2021 sagt …", eine IMPP-Falle). Nicht einfach „auch Amboss bestätigt X".
+4. Wenn das Seminar-Material die Frage vollständig abdeckt, LASS die externe Box weg. Nicht jede Karte braucht Extras.
+5. Nicht jede Karte braucht Boxen überhaupt. Klare, präzise Antworten sind besser als voll-gestopfte Karten.
+
+Gib NUR die TSV-Zeilen aus, keine Erklärungen, keinen Header.{feedback_block}{rules_block}"""
+
+    # 4. Top-5-Bilder als base64 für Vision-API laden
+    import base64 as _b64_vision
+    _ext_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".gif": "image/gif", ".webp": "image/webp"}
+    image_blocks = []
+    for img_rel in available_images[:5]:
+        img_file = UPLOADS_DIR / img_rel
+        ext = img_file.suffix.lower()
+        media = _ext_map.get(ext, "image/png")
+        try:
+            try:
+                _fsize = img_file.stat().st_size
+            except Exception:
+                _fsize = 0
+            if _fsize > 5 * 1024 * 1024:
+                print(f"[Learn] Bild zu groß ({_fsize // (1024*1024)}MB), übersprungen: {img_rel}")
+                continue
+            raw_bytes = img_file.read_bytes()
+            try:
+                from PIL import Image as _PILImage
+                import io as _io
+                _pil_img = _PILImage.open(_io.BytesIO(raw_bytes))
+                _pil_img.thumbnail((1024, 1024))
+                _buf = _io.BytesIO()
+                _pil_img.save(_buf, format="PNG")
+                raw_bytes = _buf.getvalue()
+                media = "image/png"
+            except Exception:
+                pass  # Pillow nicht verfügbar oder Fehler — Original nutzen
+            img_data = _b64_vision.b64encode(raw_bytes).decode()
+            image_blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media, "data": img_data}
+            })
+        except Exception as _img_err:
+            print(f"[Learn] Bild nicht lesbar ({img_rel}): {_img_err}")
+
+    # 5. Claude-Aufruf — SDK nur wenn ANTHROPIC_API_KEY gesetzt, sonst direkt CLI.
+    # Robin's Setup nutzt OAuth via claude-cli, kein API-Key → SDK-Versuch ist
+    # dort sinnlos (wirft "Could not resolve authentication method") und kostet
+    # nur Latenz. CLI kann via Read-Tool die Bilder selbst lesen.
+    raw = ""
+    _claude_error = None
+    _has_api_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    if _has_api_key and image_blocks:
+        try:
+            import anthropic as _anthropic
+            _aclient = _anthropic.AsyncAnthropic()
+            _model = CONFIG.get("claude_model_force") or CONFIG.get("claude_model") or "claude-sonnet-4-6"
+            _content = image_blocks + [{"type": "text", "text": prompt}]
+            _resp = await _aclient.messages.create(
+                model=_model,
+                max_tokens=4096,
+                messages=[{"role": "user", "content": _content}]
+            )
+            raw = _resp.content[0].text.strip()
+            print(f"[Learn] SDK Vision-Call: {len(image_blocks)} Bilder, Modell {_model}")
+        except Exception as _sdk_err:
+            _claude_error = f"SDK fail (CLI-Fallback aktiv): {_sdk_err}"
+            print(f"[Learn] {_claude_error}")
+            raw = ""
+
+    if not raw:
+        try:
+            # CLI-Pfad: Bilder als absolute Pfade in den Prompt — Agent liest sie via Read-Tool.
+            cli_prompt = prompt
+            if available_images:
+                paths = []
+                for img_rel in available_images[:5]:
+                    try:
+                        abs_path = str((UPLOADS_DIR / img_rel).resolve()).replace("\\", "/")
+                        paths.append(abs_path)
+                    except Exception:
+                        pass
+                if paths:
+                    img_section = (
+                        "\n\n## Bilder zum Analysieren\n"
+                        "Lies die folgenden Bilder mit deinem Read-Tool und beziehe sie "
+                        "in die Karten ein. Schreibe in ImagePath **exakt** einen dieser Pfade — "
+                        "kopiere den Pfad wörtlich, erfinde keinen eigenen Namen. "
+                        "Wähle das Bild das inhaltlich am besten zur Karte passt. "
+                        "Verteile alle verfügbaren Bilder auf die Karten:\n"
+                        + "\n".join("- " + p for p in paths)
+                    )
+                    cli_prompt = prompt + img_section
+
+            # claude-cli: --dangerously-skip-permissions damit Read-Tool ohne
+            # Approval durchgeht. Sonst haengt der Subprocess auf der Bilder-Phase.
+            _gen_model = (CONFIG.get("claude_model_generate") or "opus").strip()
+            proc = await asyncio.create_subprocess_exec(
+                "claude", "-p", "--model", _gen_model,
+                "--dangerously-skip-permissions",
+                "--max-turns", "30",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(cli_prompt.encode("utf-8")), timeout=300
+            )
+            raw = stdout.decode("utf-8", errors="replace").strip()
+            # Markdown-Codeblock-Wrap entfernen falls Modell ihn dazugepackt hat
+            if raw.startswith("```"):
+                lines = raw.splitlines()
+                # erste + letzte ``` Zeile droppen
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].strip().startswith("```"):
+                    lines = lines[:-1]
+                raw = "\n".join(lines).strip()
+            print(f"[Learn] CLI-Call: {len(raw)} chars output, {len(available_images[:5])} Bilder")
+            if not raw:
+                _claude_error = (_claude_error or "") + " | CLI lieferte leeren Output"
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": "Claude Timeout (300s) — vermutlich zu viele Bilder"}
+        except FileNotFoundError:
+            return {"ok": False, "error": "claude CLI nicht gefunden"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # 5. TSV parsen → strukturierte Karten
+    import re as _re
+    # LLMs schreiben oft single-brace `{c1::...}` statt Anki's `{{c1::...}}` —
+    # ohne Normalisierung schlaegt _is_cloze in apkg_export fehl und die Karte
+    # landet als Basic mit Roh-Text "Augenoeffnung max {c1::4}" auf der Front.
+    _SINGLE_BRACE_CLOZE = _re.compile(r'(?<!\{)\{c(\d+)::([^{}]+?)\}(?!\})')
+
+    def _normalize_cloze(text: str) -> str:
+        if not text:
+            return text
+        return _SINGLE_BRACE_CLOZE.sub(r'{{c\1::\2}}', text)
+
+    # Page-Number-Extraktion aus Bildpfaden (z.B. slide_03.png, page-5.jpg, _p12_).
+    _PAGE_RE = _re.compile(r'(?:slide|seite|page|_p|-p)[_\-]?0*(\d{1,4})', _re.IGNORECASE)
+
+    def _extract_page(image_path: str) -> str:
+        if not image_path:
+            return ""
+        m = _PAGE_RE.search(image_path)
+        return f"S. {m.group(1)}" if m else ""
+
+    cards = []
+    fields_order = ["front", "back", "tags", "image", "funfact", "merkhilfe", "source"]
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        # Pad to 7 fields
+        while len(parts) < 7:
+            parts.append("")
+        card = dict(zip(fields_order, parts[:7]))
+        # Nano-Banana-Tag aus image-Feld extrahieren: [GENERATE: "Prompt"]
+        # → image_prompt gesetzt, image geleert. _enrich_anki_cards_with_images
+        # generiert nach der Loop parallel via Gemini Flash Image.
+        _gen_m = _re.match(r'\s*\[GENERATE:\s*"(.+?)"\s*\]\s*$', card.get("image") or "")
+        if _gen_m:
+            card["image_prompt"] = _gen_m.group(1).strip()
+            card["image"] = ""
+        # Cloze-Normalisierung (single-brace -> double-brace) BEVOR irgendwas anderes
+        # die Felder anschaut. Sonst sieht _is_cloze ein "{c1::4}" als Plaintext.
+        card["front"] = _normalize_cloze(card.get("front") or "")
+        card["back"] = _normalize_cloze(card.get("back") or "")
+        # External-Source vor Transform ableiten (nach Transform sind die [TAG]s weg)
+        _raw_back = card.get("back") or ""
+        if _re.search(r'\[AMBOSS\]', _raw_back, _re.IGNORECASE):
+            card["external_source"] = "Amboss"
+        elif _re.search(r'\[THIEME\]', _raw_back, _re.IGNORECASE):
+            card["external_source"] = "Thieme/ViaMedici"
+        else:
+            card["external_source"] = None
+        # Image-Occlusions aus Back extrahieren BEVOR Box-Transform läuft
+        _raw_back, _occs = _extract_occlusions(_raw_back)
+        card["occlusions"] = _occs
+        card["back"] = _raw_back
+        # Box-Tags [THERAPIE]…[/THERAPIE] etc. zu inline-HTML transformieren (Anki-kompatibel)
+        if card.get("back"):
+            card["back"] = _transform_card_boxes(card["back"])
+        # Fallback: Source aus Bildpfad ableiten wenn Claude es leer gelassen hat
+        if not card.get("source") and card.get("image"):
+            img_p = card["image"].lower()
+            if "amboss" in img_p:
+                card["source"] = "Quelle: Amboss"
+            elif "thieme" in img_p:
+                card["source"] = "Quelle: Thieme"
+        # Caption als Source-Override wenn Quelle bekannt
+        elif card.get("image") and all_captions.get(card["image"]):
+            cap = all_captions[card["image"]]
+            if cap.startswith("Quelle:"):
+                card["source"] = cap.split(" — ")[0]  # nur "Quelle: Amboss" ohne Caption-Text
+        # Seitenzahl in Source ergaenzen wenn aus Bildpfad ableitbar und noch nicht drin
+        _page = _extract_page(card.get("image") or "")
+        if _page and card.get("source") and "S." not in card["source"] and "Seite" not in card["source"]:
+            card["source"] = f'{card["source"]} · {_page}'
+        cards.append(card)
+
+    # 5b. Nano Banana 2: parallel Bilder generieren für Karten mit image_prompt
+    # (extrahiert aus [GENERATE: "..."]-Tags des LLM). Best-effort — Fehler killen
+    # den Generate-Flow nicht. Cap=8 / 4 parallel via _enrich_anki_cards_with_images.
+    _img_prompts_n = sum(1 for c in cards if c.get("image_prompt"))
+    if _img_prompts_n:
+        print(f"[Learn/Image] Nano Banana: {_img_prompts_n} Karte(n) mit image_prompt → generiere Bilder")
+        try:
+            await _enrich_anki_cards_with_images(cards)
+        except Exception as _enrich_e:
+            print(f"[Learn/Image] enrich failed (ignored): {type(_enrich_e).__name__}: {_enrich_e}")
+
+
+    # 6. CSV für Download zusammenbauen
+    import io, csv as _csv
+    buf = io.StringIO()
+    writer = _csv.writer(buf, delimiter="\t")
+    for c in cards:
+        writer.writerow([c["front"], c["back"], c["tags"], c["image"], c["funfact"], c["merkhilfe"], c.get("source", "")])
+    csv_content = buf.getvalue()
+
+    # 7. In UPLOADS_DIR speichern für späteres Herunterladen
+    out_filename = f"anki_{subject.lower().replace(' ', '_') or 'karten'}_{uuid.uuid4().hex[:6]}.tsv"
+    out_path = UPLOADS_DIR / out_filename
+    out_path.write_text(csv_content, encoding="utf-8")
+
+    # 7b. Vollständigen Deck-Snapshot als JSON ablegen — erlaubt späteres
+    # Re-Building von .apkg (mit aktuellem Design) und HTML-Preview.
+    # Bei source_mode != lernraum kommt der Inhalt nicht aus dem gewaehlten
+    # Lernraum (Subject), sondern aus Amboss/Thieme. Dann ist der Subject-Name
+    # irrefuehrend — Topics + Source-Label sind ehrlicher.
+    _source_label = {"amboss": "Amboss", "thieme": "Thieme", "mix": "Amboss+Thieme"}.get(source_mode)
+    if _source_label and topics:
+        _display_subject = f"{', '.join(topics)} ({_source_label})"
+    else:
+        _display_subject = subject
+    import json as _jdeck
+    deck_id = uuid.uuid4().hex[:12]
+    decks_dir = UPLOADS_DIR / "decks"
+    decks_dir.mkdir(parents=True, exist_ok=True)
+    deck_payload = {
+        "deck_id": deck_id,
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "subject": _display_subject,
+        "topics": topics,
+        "card_count": len(cards),
+        "cards": cards,
+    }
+    (decks_dir / f"{deck_id}.json").write_text(
+        _jdeck.dumps(deck_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # 8. History-Eintrag schreiben
+    import json as _jh
+    history_path = UPLOADS_DIR / "learn_history.json"
+    try:
+        history = _jh.loads(history_path.read_text(encoding="utf-8")) if history_path.exists() else []
+    except Exception:
+        history = []
+    history.insert(0, {
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "subject": _display_subject,
+        "topics": topics,
+        "card_count": len(cards),
+        "source_files": source_files,
+        "screenshots_used": len(screenshot_paths),
+        "filename": out_filename,
+        "deck_id": deck_id,
+    })
+    history_path.write_text(_jh.dumps(history[:50], ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return {
+        "ok": True,
+        "subject": subject,
+        "cards": cards,
+        "count": len(cards),
+        "csv": csv_content,
+        "filename": out_filename,
+        "deck_id": deck_id,
+        "screenshots_used": len(screenshot_paths),
+        "images_used": len(image_blocks),
+        "claude_error": _claude_error,
+    }
+
+
+# Box-Palette: Claude schreibt [TAG]Inhalt[/TAG], wir transformieren zu inline-style HTML.
+# Inline Styles → robust auch im Anki-Export ohne externes CSS.
+_CARD_BOX_PALETTE = {
+    "THERAPIE":    {"emoji": "💊", "label": "Therapie",          "bg": "#34d39912", "border": "#34d399", "fg": "#86efac"},
+    "NOTFALL":     {"emoji": "⚠️", "label": "Notfall",           "bg": "#ef444418", "border": "#ef4444", "fg": "#fca5a5"},
+    "DX":          {"emoji": "🩺", "label": "Diagnostik",        "bg": "#60a5fa15", "border": "#60a5fa", "fg": "#93c5fd"},
+    "PATHO":       {"emoji": "🧬", "label": "Pathophysiologie",  "bg": "#c084fc15", "border": "#c084fc", "fg": "#d8b4fe"},
+    "LABOR":       {"emoji": "🔬", "label": "Labor",             "bg": "#fde04718", "border": "#eab308", "fg": "#fde047"},
+    "IMPP":        {"emoji": "🎯", "label": "IMPP-Perle",        "bg": "#f472b615", "border": "#f472b6", "fg": "#f9a8d4"},
+    "LEITLINIE":   {"emoji": "📖", "label": "Leitlinie",         "bg": "#2dd4bf15", "border": "#2dd4bf", "fg": "#5eead4"},
+    "REDFLAG":     {"emoji": "🚨", "label": "Red Flag",          "bg": "#dc262620", "border": "#dc2626", "fg": "#fca5a5"},
+    "DD":          {"emoji": "🎯", "label": "DD",                "bg": "#a855f715", "border": "#a855f7", "fg": "#d8b4fe"},
+    "AMBOSS":      {"emoji": "🟢", "label": "Ergänzung aus Amboss",  "bg": "#16a34a15", "border": "#16a34a", "fg": "#86efac"},
+    "THIEME":      {"emoji": "🔵", "label": "Aus Thieme/ViaMedici",  "bg": "#0ea5e915", "border": "#0ea5e9", "fg": "#7dd3fc"},
+}
+
+
+def _transform_card_boxes(text: str) -> str:
+    """Ersetzt [TAG]…[/TAG] durch inline-styled HTML-Boxen (Anki-kompatibel)."""
+    if not text:
+        return text
+    import re as _re_cb
+    for tag, style in _CARD_BOX_PALETTE.items():
+        pattern = _re_cb.compile(r"\[" + tag + r"\](.*?)\[/" + tag + r"\]", _re_cb.DOTALL | _re_cb.IGNORECASE)
+        replacement = (
+            '<div style="background:' + style["bg"] + ';border-left:3px solid ' + style["border"] +
+            ';padding:8px 12px;border-radius:6px;margin:8px 0;font-size:13px;line-height:1.5">'
+            '<b style="color:' + style["fg"] + ';letter-spacing:.02em">' + style["emoji"] + ' ' + style["label"] + ':</b> '
+            '\\1</div>'
+        )
+        text = pattern.sub(replacement, text)
+    return text
+
+
+# Image-Occlusion: [OCCLUDE x=25 y=30 w=20 h=15]Label[/OCCLUDE] → parsed aus Back,
+# danach aus Back entfernt. Renderer baut SVG-Overlay aus `card.occlusions`.
+_OCCLUDE_RE = __import__("re").compile(
+    r"\[OCCLUDE\s+x=(\d+(?:\.\d+)?)\s*%?\s+y=(\d+(?:\.\d+)?)\s*%?\s+w=(\d+(?:\.\d+)?)\s*%?\s+h=(\d+(?:\.\d+)?)\s*%?\s*\](.*?)\[/OCCLUDE\]",
+    __import__("re").DOTALL | __import__("re").IGNORECASE,
+)
+
+
+def _extract_occlusions(text: str) -> tuple[str, list[dict]]:
+    """Zieht [OCCLUDE x=.. y=.. w=.. h=..]Label[/OCCLUDE] aus `text` raus.
+    Gibt (text_ohne_occlude, [{label, x, y, w, h}]) zurück. Koordinaten in % (0-100).
+    """
+    if not text or "[OCCLUDE" not in text.upper():
+        return text, []
+    occlusions: list[dict] = []
+    def _capture(m):
+        try:
+            x, y, w, h = float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4))
+        except ValueError:
+            return ""
+        # Clamp auf sinnvolle Bereiche
+        x = max(0.0, min(99.0, x))
+        y = max(0.0, min(99.0, y))
+        w = max(1.0, min(100.0 - x, w))
+        h = max(1.0, min(100.0 - y, h))
+        occlusions.append({
+            "label": (m.group(5) or "").strip(),
+            "x": round(x, 2), "y": round(y, 2),
+            "w": round(w, 2), "h": round(h, 2),
+        })
+        return ""  # Tag aus Back entfernen
+    cleaned = _OCCLUDE_RE.sub(_capture, text)
+    # Whitespace-Aufräumen (doppelte Leerzeichen/Umbrüche wo Tags waren)
+    import re as _re_oc
+    cleaned = _re_oc.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = _re_oc.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, occlusions
+
+
+def _find_best_image_for_topic(uploads_dir: Path, topic: str, subject: str) -> dict | None:
+    """Sucht in allen `source_meta.json`-Files unter `uploads/images/*/` nach dem
+    besten Bild-Match zum Topic. Scoring: Anzahl Topic-Keywords in Caption (voll)
+    + 0.5 pro Subject-Keyword. Gibt `{path, caption, provider, source}` oder None.
+    Fallback-Strategie: wenn kein Caption-Match, bevorzuge Bilder aus dem Subject-Ordner.
+    """
+    import json as _jfi
+    images_root = uploads_dir / "images"
+    if not images_root.exists():
+        return None
+
+    topic_kws = {w.lower() for w in topic.split() if len(w) > 3}
+    subj_kws  = {w.lower() for w in subject.split() if len(w) > 3}
+    subj_slug = (subject or "").lower().replace(" ", "_")
+
+    candidates: list[tuple[float, dict, str]] = []  # (score, entry, folder_name)
+    for folder in images_root.iterdir():
+        if not folder.is_dir():
+            continue
+        meta = folder / "source_meta.json"
+        if not meta.exists():
+            continue
+        try:
+            entries = _jfi.loads(meta.read_text("utf-8"))
+        except Exception:
+            continue
+        for e in entries:
+            if not isinstance(e, dict) or not e.get("path"):
+                continue
+            caption = (e.get("caption") or "").lower()
+            score = sum(1 for kw in topic_kws if kw in caption)
+            score += 0.5 * sum(1 for kw in subj_kws if kw in caption)
+            # Kleine Bonus wenn der Ordner selbst zum Fach passt (z.B. amboss_kardiologie)
+            if subj_slug and subj_slug in folder.name:
+                score += 0.25
+            candidates.append((score, e, folder.name))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda t: -t[0])
+    best_score, best_entry, _ = candidates[0]
+    # Nur zurückgeben wenn echter thematischer Match (Topic-Keyword in Caption).
+    # Kein Fallback auf „irgendein Bild aus dem Subject-Ordner" mehr — das führt
+    # zu irrelevanten Bildern („Aortenstenose" → generisches Herzklappen-Bild).
+    # Lieber garkein Bild als ein unpassendes.
+    if best_score >= 1.0:
+        return best_entry
+    return None
+
+
+async def api_learn_preview_card(request):
+    """POST /api/learn/preview-card
+    Body: { topic: str, subject?: str }
+    Returns: { ok, card: {front, back, tags, funfact, merkhilfe, image, subject, topic} }
+    Leichtgewichtiger Preview ohne RAG — Haiku generiert 1 echte Karte.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    topic = (body.get("topic") or "").strip()
+    subject = (body.get("subject") or topic).strip()
+    if not topic:
+        return web.json_response({"ok": False, "error": "topic erforderlich"}, status=400)
+
+    prompt = (
+        f"Erstelle eine einzige hochwertige Anki-Karte auf Deutsch zum Thema: {topic} (Fach: {subject}).\n\n"
+        "Format — genau eine Zeile, Felder durch Tab getrennt:\n"
+        "Front\tBack\tTags\tFunFact\tMerkhilfe\n\n"
+        "FELDER:\n"
+        "- Front: präzise klinische Frage (1-2 Sätze). BEVORZUGT als Cloze/Lückentext mit {{c1::…}}, {{c2::…}} wenn das Thema Fakten/Zahlen/Definitionen sind.\n"
+        "- Back: strukturierte Antwort (HTML erlaubt: <b>, <i>, <br>, <span style=…>); Box-Tags siehe unten. Cloze-Syntax {{c1::…}} auch hier erlaubt.\n"
+        "- Tags: Fach::Unterthema Format\n"
+        "- FunFact: **DEFAULT: LEER LASSEN.** Nur ausfüllen wenn du einen WIRKLICH überraschenden, nicht-offensichtlichen Fakt hast (z.B. 'Amiodaron enthält 37% Jod nach Gewicht'). Keine Füller wie 'Aortenstenose ist häufig bei Älteren'. 80% der Karten haben KEINEN guten FunFact — dann leer.\n"
+        "- Merkhilfe: **DEFAULT: LEER LASSEN.** Nur ausfüllen wenn du eine echt einprägsame Eselsbrücke hast (z.B. 'SINKEN: Sinus-Na-Kalium-Ca'). Erzwungene Mnemonics wie 'A=Aortenklappe, S=Stenose' sind schlechter als keine. 70% der Karten haben keine gute — dann leer.\n\n"
+        "BOX-PALETTE (optional im Back, max 3, Syntax [TAG]Inhalt[/TAG]):\n"
+        "  [THERAPIE] 💊 Medikamente/Therapie   |  [NOTFALL] ⚠️ akute Situation\n"
+        "  [DX] 🩺 Diagnostik/Scores            |  [PATHO] 🧬 Pathomechanismus\n"
+        "  [LABOR] 🔬 Laborwerte/Cut-offs       |  [IMPP] 🎯 examensrelevante Perle\n"
+        "  [LEITLINIE] 📖 S3/S2k-Guideline      |  [REDFLAG] 🚨 Alarm-Symptom\n"
+        "  [DD] Differentialdiagnose            |  [AMBOSS]/[THIEME] Ergänzung aus externer Quelle\n\n"
+        "FORMATIERUNG im Back: <b>wichtig</b>, <i>Synonym</i>, Farbcodes "
+        "(Therapie=#34d399, Notfall=#ef4444, Diagnostik=#60a5fa, Labor=#fde047), "
+        "Emojis inline (🩺💊⚠️🔬🧬).\n\n"
+        "SVG/Mermaid inline im Back NUR wenn simples Diagramm den Inhalt klarer macht "
+        "(Kurven, Algorithmen, Schemata). Reine Faktenkarten brauchen das nicht.\n\n"
+        "Gib NUR die eine Tab-getrennte Zeile aus, kein Markdown, keine Überschrift. "
+        "Leere Felder = einfach Tab, keine Platzhalter."
+    )
+
+    # Claude CLI Subprocess — MC nutzt Max-Subscription, kein API-Key.
+    # Opus für beste Befolgung der Prompt-Regeln (Cloze-Nutzung, FunFact/Merkhilfe nur wenn echt sinnvoll,
+    # Box-Auswahl). Dauer: ~20-30s statt ~8s mit Haiku, aber Qualität deutlich besser.
+    _preview_model = (CONFIG.get("claude_model_preview") or "opus").strip()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "-p", "--model", _preview_model,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(prompt.encode("utf-8")), timeout=90
+        )
+        text = stdout.decode("utf-8", errors="replace").strip()
+        if not text:
+            err = stderr.decode("utf-8", errors="replace")[:300]
+            return web.json_response({"ok": False, "error": f"Claude CLI leere Antwort: {err}"}, status=500)
+        parts = text.split("\t")
+        _back_raw = parts[1] if len(parts) > 1 else text
+        import re as _re_es
+        if _re_es.search(r'\[AMBOSS\]', _back_raw, _re_es.IGNORECASE):
+            _ext_src = "Amboss"
+        elif _re_es.search(r'\[THIEME\]', _back_raw, _re_es.IGNORECASE):
+            _ext_src = "Thieme/ViaMedici"
+        else:
+            _ext_src = None
+        card = {
+            "front": parts[0] if len(parts) > 0 else topic,
+            "back": _transform_card_boxes(_back_raw),
+            "tags": parts[2] if len(parts) > 2 else subject,
+            "funfact": parts[3] if len(parts) > 3 else "",
+            "merkhilfe": parts[4] if len(parts) > 4 else "",
+            "image": None,
+            "external_source": _ext_src,
+            "subject": subject,
+            "topic": topic,
+        }
+        # Passendes Bild via source_meta.json (Caption-Match, nicht Filename-Keyword)
+        # Amboss/ViaMedici-Bilder haben UUID-Filenames — Filename-Match fand nie was.
+        # Bild-Feld bleibt relativer Pfad (wie beim Full-Generate); Renderer prefixt /api/uploads/.
+        best = _find_best_image_for_topic(UPLOADS_DIR, topic, subject)
+        if best:
+            card["image"] = best["path"]
+            card["image_caption"] = best.get("caption") or ""
+            card["image_provider"] = best.get("provider") or ""
+        # Cookie-Status für Frontend-Anzeige
+        import time as _time
+        from amboss_client import _load_cached_cookie as _lcc, _cookie_saved_at as _csa
+        _ck = _lcc(UPLOADS_DIR)
+        _saved = _csa(UPLOADS_DIR)
+        _cookie_age_h = round(((_time.time() - _saved) / 3600), 1) if _saved else None
+        return web.json_response({
+            "ok": True,
+            "card": card,
+            "cookie_status": {
+                "has_cookie": bool(_ck),
+                "age_hours": _cookie_age_h,
+                "warning": (_cookie_age_h or 0) > 48,
+            }
+        })
+    except asyncio.TimeoutError:
+        return web.json_response({"ok": False, "error": "Claude CLI Timeout (90s) — Opus ist lahmer, versuch's nochmal oder setze claude_model_preview=sonnet in config.json"}, status=504)
+    except FileNotFoundError:
+        return web.json_response({"ok": False, "error": "claude CLI nicht im PATH gefunden"}, status=500)
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
+async def api_learn_meta(request):
+    """GET /api/learn/meta — Gibt learn_meta.json zurück: Fach → [Ordner/Stems]."""
+    import json as _jlm
+    meta_path = UPLOADS_DIR / "images" / "learn_meta.json"
+    if not meta_path.exists():
+        return web.json_response({"subjects": {}, "total_files": 0})
+    try:
+        meta = _jlm.loads(meta_path.read_text("utf-8"))
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+    # Count original PDF/PPTX uploads per subject via stem name matching
+    upload_exts = {".pdf", ".pptx", ".ppt"}
+    uploaded_originals = list(UPLOADS_DIR.glob("*")) if UPLOADS_DIR.exists() else []
+    uploaded_originals = [f for f in uploaded_originals if f.suffix.lower() in upload_exts]
+
+    subjects_info = {}
+    for subject, stems in meta.items():
+        stem_list = stems if isinstance(stems, list) else [stems]
+        image_count = 0
+        for stem in stem_list:
+            img_dir = UPLOADS_DIR / "images" / stem
+            if img_dir.exists():
+                image_count += sum(1 for _ in img_dir.iterdir())
+        # Match uploaded files whose name contains any stem of this subject
+        file_count = sum(
+            1 for f in uploaded_originals
+            if any(stem.lower() in f.name.lower() for stem in stem_list)
+        )
+        subjects_info[subject] = {
+            "stems": stem_list,
+            "image_count": image_count,
+            "file_count": file_count,
+        }
+    # Total unique originals (may overlap if same file covers multiple subjects → deduplicate)
+    total_originals = len(uploaded_originals)
+    return web.json_response({
+        "subjects": subjects_info,
+        "total_files": sum(v["image_count"] for v in subjects_info.values()),
+        "total_uploads": total_originals,
+    })
+
+
+async def api_learn_history(request):
+    """GET /api/learn/history — Letzte 50 Generierungsläufe."""
+    import json as _jh2
+    history_path = UPLOADS_DIR / "learn_history.json"
+    if not history_path.exists():
+        return web.json_response({"history": []})
+    try:
+        history = _jh2.loads(history_path.read_text(encoding="utf-8"))
+    except Exception:
+        history = []
+    return web.json_response({"history": history})
+
+
+def _load_deck(deck_id: str) -> dict | None:
+    import json as _jd
+    safe = "".join(ch for ch in (deck_id or "") if ch.isalnum())[:32]
+    if not safe:
+        return None
+    p = UPLOADS_DIR / "decks" / f"{safe}.json"
+    if not p.exists():
+        return None
+    try:
+        return _jd.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+async def api_learn_deck_apkg(request):
+    """GET /api/learn/decks/{deck_id}/apkg — Aktueller Design-Stand der gespeicherten Karten."""
+    deck = _load_deck(request.match_info.get("deck_id", ""))
+    if not deck:
+        return web.Response(status=404, text="Deck nicht gefunden")
+    try:
+        from apkg_export import build_apkg
+        data, _stats = build_apkg(deck.get("cards") or [], deck.get("subject") or "Karten", UPLOADS_DIR)
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+    slug = (deck.get("subject") or "karten").lower().replace(" ", "_")
+    return web.Response(
+        body=data,
+        content_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{slug}_anki.apkg"'},
+    )
+
+
+async def api_learn_deck_preview(request):
+    """GET /api/learn/decks/{deck_id}/preview — HTML-Vorschau aller Karten im MC-Design."""
+    deck = _load_deck(request.match_info.get("deck_id", ""))
+    if not deck:
+        return web.Response(status=404, text="Deck nicht gefunden")
+    try:
+        from apkg_export import render_deck_preview_html
+        html = render_deck_preview_html(deck.get("cards") or [], deck.get("subject") or "Karten",
+                                        deck.get("topics") or [], deck.get("ts") or "")
+    except Exception as e:
+        import traceback as _tb
+        _tb.print_exc()
+        return web.Response(text=f"Preview-Fehler: {type(e).__name__}: {e}", status=500)
+    return web.Response(text=html, content_type="text/html")
+
+
+async def api_learn_feedback(request):
+    """GET/DELETE /api/learn/feedback?subject=X — Persistiertes Feedback pro Fach lesen oder löschen."""
+    import json as _jfb2
+    _fb_path = UPLOADS_DIR / "learn_feedback.json"
+    try:
+        store = _jfb2.loads(_fb_path.read_text(encoding="utf-8")) if _fb_path.exists() else {}
+    except Exception:
+        store = {}
+    subject = (request.rel_url.query.get("subject") or "").strip().lower()
+    if request.method == "DELETE":
+        if subject and subject in store:
+            del store[subject]
+            _fb_path.write_text(_jfb2.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+        return web.json_response({"ok": True})
+    if subject:
+        return web.json_response({"subject": subject, "feedback": store.get(subject, "")})
+    return web.json_response({"feedback": store})
+
+
+async def api_learn_screenshot(request):
+    """POST /api/learn/screenshot
+    Body: { subject: str, images: [dataURL, ...] }
+    Speichert Amboss-Screenshots für ein Fach, ohne Kartengenerierung.
+    Returns: { ok, saved: int, paths: [...] }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    subject = (body.get("subject") or "medizin").strip().lower().replace(" ", "_")
+    images = body.get("images") or []
+    if not images:
+        return web.json_response({"ok": False, "error": "Keine Bilder übergeben"}, status=400)
+
+    import base64 as _b64
+    import re as _re
+    subj_dir = UPLOADS_DIR / "images" / f"amboss_{subject}"
+    subj_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    saved_paths = []
+    for idx, data_url in enumerate(images[:20]):
+        try:
+            m = _re.match(r"data:image/(\w+);base64,(.+)", data_url, _re.DOTALL)
+            ext = m.group(1) if m else "png"
+            b64_data = m.group(2) if m else data_url
+            img_bytes = _b64.b64decode(b64_data)
+            img_path = subj_dir / f"amboss_{ts}_{idx}.{ext}"
+            img_path.write_bytes(img_bytes)
+            saved_paths.append(str(img_path.relative_to(UPLOADS_DIR)).replace("\\", "/"))
+        except Exception as e:
+            print(f"[Learn/Screenshot] Fehler idx {idx}: {e}")
+
+    print(f"[Learn/Screenshot] {len(saved_paths)} Bilder gespeichert → {subj_dir}")
+    return web.json_response({"ok": True, "saved": len(saved_paths), "paths": saved_paths})
+
+
+async def api_learn_upload(request):
+    """POST /api/learn/upload
+    Thieme-Zugang: Bilder und Quellen aus Thieme/Amboss speichern.
+    Body: { subject: str, images: [dataURL, ...], source_url?: str, caption?: str, provider?: "thieme"|"amboss" }
+    Speichert in UPLOADS_DIR/images/thieme_<subject>/ (oder amboss_ wenn provider=amboss).
+    Optional: source_meta.json mit URL + Caption pro Bild für Quellenangabe.
+    Returns: { ok, saved: int, paths: [...], provider: str }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    subject = (body.get("subject") or "medizin").strip().lower().replace(" ", "_")
+    images = body.get("images") or []
+    source_url = (body.get("source_url") or "").strip()
+    caption = (body.get("caption") or "").strip()
+    provider = (body.get("provider") or "thieme").strip().lower()
+    if provider not in ("thieme", "amboss"):
+        provider = "thieme"
+
+    if not images:
+        return web.json_response({"ok": False, "error": "Keine Bilder übergeben"}, status=400)
+
+    import base64 as _b64
+    import re as _re
+    import json as _jtu
+    subj_dir = UPLOADS_DIR / "images" / f"{provider}_{subject}"
+    subj_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    saved_paths = []
+    meta_entries = []
+
+    for idx, data_url in enumerate(images[:30]):
+        try:
+            m = _re.match(r"data:image/(\w+);base64,(.+)", data_url, _re.DOTALL)
+            ext = m.group(1) if m else "png"
+            b64_data = m.group(2) if m else data_url
+            img_bytes = _b64.b64decode(b64_data)
+            img_name = f"{provider}_{ts}_{idx}.{ext}"
+            img_path = subj_dir / img_name
+            img_path.write_bytes(img_bytes)
+            rel = str(img_path.relative_to(UPLOADS_DIR)).replace("\\", "/")
+            saved_paths.append(rel)
+            meta_entries.append({
+                "path": rel,
+                "source_url": source_url,
+                "caption": caption or img_name,
+                "provider": provider,
+                "subject": subject,
+                "saved_at": ts,
+            })
+        except Exception as e:
+            print(f"[Learn/Upload] Fehler idx {idx}: {e}")
+
+    # Quellenmetadaten persistieren für Kartengenerierung
+    if meta_entries:
+        meta_path = subj_dir / "source_meta.json"
+        existing_meta = []
+        if meta_path.exists():
+            try:
+                existing_meta = _jtu.loads(meta_path.read_text("utf-8"))
+            except Exception:
+                existing_meta = []
+        existing_meta.extend(meta_entries)
+        meta_path.write_text(_jtu.dumps(existing_meta, ensure_ascii=False, indent=2), "utf-8")
+
+    print(f"[Learn/Upload] {len(saved_paths)} {provider}-Bilder gespeichert → {subj_dir}")
+    return web.json_response({"ok": True, "saved": len(saved_paths), "paths": saved_paths, "provider": provider})
+
+
+async def api_learn_export_zip(request):
+    """POST /api/learn/export-zip
+    Body: { subject: str, cards: [...] }
+    Returns: .apkg-Paket mit Custom Note Types (MC-Basic + MC-Cloze) — bringt
+    das Mockup-Design von card-mockup.html direkt in Anki, inkl. Image
+    Occlusion (Cloze-Boxen über dem Bild), Cloze-Lücken und SVGs.
+
+    Pfad heisst weiterhin /export-zip (Frontend-Kompat); Content ist aber .apkg.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return web.Response(status=400, text="Invalid JSON")
+
+    subject_raw = (body.get("subject") or "karten").strip()
+    subject_slug = subject_raw.lower().replace(" ", "_") or "karten"
+    cards = body.get("cards") or []
+    if not cards:
+        return web.Response(status=400, text="Keine Karten übergeben")
+
+    try:
+        from apkg_export import build_apkg
+        apkg_bytes, stats = build_apkg(cards, subject_raw, UPLOADS_DIR)
+    except Exception as e:
+        import traceback as _tb
+        _tb.print_exc()
+        return web.json_response({"ok": False, "error": f"apkg-Build fehlgeschlagen: {type(e).__name__}: {e}"}, status=500)
+
+    print(
+        f"[Learn/ExportApkg] {stats['basic']} basic + {stats['cloze']} cloze "
+        f"({stats['occlusion']} occlusion) + {stats['images']} Bilder → {len(apkg_bytes)} bytes"
+    )
+
+    return web.Response(
+        body=apkg_bytes,
+        content_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{subject_slug}_anki.apkg"',
+        },
+    )
+
+
+async def api_learn_amboss_login(request):
+    """POST /api/learn/amboss-login
+    Body: { cookie: str }  — der `next_auth_amboss_de`-Wert aus Browser-DevTools
+    (oder der komplette Cookie-String). Wird in data/amboss_cookie_cache.json gecached.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    cookie = (body.get("cookie") or "").strip()
+    if not cookie:
+        return web.json_response({"ok": False, "error": "cookie erforderlich"}, status=400)
+
+    try:
+        import aiohttp as _ahttp
+        from amboss_client import _save_cookie, search_article_eids
+        connector = _ahttp.TCPConnector(ssl=True)
+        async with _ahttp.ClientSession(connector=connector) as sess:
+            articles = await search_article_eids(sess, cookie, "Herz", limit=3)
+        _save_cookie(UPLOADS_DIR, cookie)
+        print(f"[Learn/AmbossLogin] Cookie akzeptiert, Testsuche 'Herz': {len(articles)} Artikel")
+        return web.json_response({
+            "ok": True,
+            "message": f"Cookie gespeichert — Testsuche lieferte {len(articles)} Artikel",
+        })
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
+async def api_learn_amboss_test(request):
+    """GET /api/learn/amboss-test
+    Testet Amboss-Verbindung: prüft Cookie-Cache, macht searchSuggestions-Testsuche,
+    gibt Status + Artikel-Anzahl zurück. Fallback: config.json `amboss_cookie`.
+    """
+    from amboss_client import _load_cached_cookie, _cookie_saved_at, search_article_eids
+
+    cookie = _load_cached_cookie(UPLOADS_DIR)
+    saved_at = _cookie_saved_at(UPLOADS_DIR)
+    source = "cache"
+    if not cookie:
+        _cfg_cookie = CONFIG.get("amboss_cookie", "").strip()
+        if _cfg_cookie:
+            cookie = _cfg_cookie
+            source = "config"
+        else:
+            return web.json_response({
+                "ok": False,
+                "error": "Kein Cookie gecacht und keines in config.json. Bitte Cookie im Medizin-Tab einfügen.",
+                "has_token": False,
+                "source": None,
+                "saved_at": None,
+            })
+
+    try:
+        import aiohttp as _ahttp
+        connector = _ahttp.TCPConnector(ssl=True)
+        async with _ahttp.ClientSession(connector=connector) as sess:
+            articles = await search_article_eids(sess, cookie, "Herz", limit=3)
+
+        print(f"[Learn/AmbossTest] Testsuche 'Herz': {len(articles)} Artikel")
+        return web.json_response({
+            "ok": True,
+            "has_token": True,
+            "source": source,                  # "cache" | "config"
+            "saved_at": saved_at,              # Unix-Timestamp, wann gecached
+            "image_count": len(articles),
+            "first_image": articles[0] if articles else None,
+            "message": f"Verbindung OK — {len(articles)} Artikel für 'Herz' gefunden",
+        })
+    except Exception as e:
+        err_s = str(e)
+        if "abgelaufen" in err_s.lower() or "UNAUTH" in err_s.upper():
+            return web.json_response({
+                "ok": False, "has_token": False, "source": source, "saved_at": saved_at,
+                "error": err_s,
+            }, status=200)
+        return web.json_response({
+            "ok": False, "has_token": True, "source": source, "saved_at": saved_at,
+            "error": err_s,
+        }, status=500)
+
+
+async def api_learn_viamedici_login(request):
+    """POST /api/learn/viamedici-login
+    Body: { cookie: str }  — Keycloak-Session-Cookies von authentication.thieme.de
+    (z.B. `document.cookie` aus DevTools Console auf dieser Domain).
+    Wird in data/viamedici_auth_cache.json gespeichert. Ein Silent-Refresh wird sofort
+    versucht um zu prüfen ob die Cookies valid sind.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    cookie = (body.get("cookie") or "").strip()
+    if not cookie:
+        return web.json_response({"ok": False, "error": "cookie erforderlich"}, status=400)
+
+    try:
+        from viamedici_client import save_kc_cookies, ensure_access_token, _normalize_kc_cookies, _jwt_exp
+        normalized = _normalize_kc_cookies(cookie)
+        save_kc_cookies(UPLOADS_DIR, normalized)
+        # Silent-Refresh sofort triggern — liefert uns auch ein Access-Token + Refresh-Token
+        try:
+            access_token = await ensure_access_token(UPLOADS_DIR)
+        except Exception as se:
+            return web.json_response({
+                "ok": False,
+                "error": f"Cookies gespeichert, aber Silent-Refresh fehlgeschlagen: {se}",
+            })
+        exp = _jwt_exp(access_token) or 0
+        remaining = max(0, exp - int(__import__("time").time()))
+        print(f"[Learn/ViaMediciLogin] Silent-Refresh OK, Access-Token läuft in {remaining}s ab")
+        return web.json_response({
+            "ok": True,
+            "message": f"Cookies OK — Access-Token frisch, gültig für {remaining // 60} Min {remaining % 60} s",
+        })
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
+async def api_learn_viamedici_test(request):
+    """GET /api/learn/viamedici-test
+    Prüft ob Cookies da sind und macht einen Silent-Refresh um Access-Token zu refreshen.
+    Gibt aktuellen Status zurück inkl. echter JWT-Expiry (KC-Identity + Refresh-Token).
+    """
+    from viamedici_client import (
+        _load_cache, ensure_access_token, saved_at as _saved_at,
+        _jwt_exp, get_session_info,
+    )
+
+    cache = _load_cache(UPLOADS_DIR)
+    kc_cookies = cache.get("kc_cookies") or CONFIG.get("viamedici_cookies", "").strip()
+    source = "cache" if cache.get("kc_cookies") else ("config" if kc_cookies else None)
+    sess = get_session_info(UPLOADS_DIR)
+    base = {
+        "source": source,
+        "saved_at": _saved_at(UPLOADS_DIR),
+        "session_exp": sess["kc_identity_exp"],
+        "refresh_exp": sess["refresh_token_exp"],
+        "is_offline": sess["is_offline"],
+    }
+    if not kc_cookies:
+        return web.json_response({
+            **base,
+            "ok": False,
+            "has_cookies": False,
+            "access_token_exp": None,
+            "error": "Keine Keycloak-Cookies gecached. Bitte Cookies im Medizin-Tab einfügen.",
+        })
+
+    try:
+        access_token = await ensure_access_token(UPLOADS_DIR)
+        exp = _jwt_exp(access_token) or 0
+        remaining = max(0, exp - int(__import__("time").time()))
+        # Session-Info nach Refresh neu lesen — offline-Flag kann sich gerade erst gesetzt haben
+        sess2 = get_session_info(UPLOADS_DIR)
+        return web.json_response({
+            **base,
+            "ok": True,
+            "has_cookies": True,
+            "access_token_exp": exp,
+            "session_exp": sess2["kc_identity_exp"],
+            "refresh_exp": sess2["refresh_token_exp"],
+            "is_offline": sess2["is_offline"],
+            "message": f"Silent-Refresh OK — Access-Token gültig für {remaining // 60} Min {remaining % 60} s",
+        })
+    except Exception as e:
+        return web.json_response({
+            **base,
+            "ok": False,
+            "has_cookies": False,  # Cookies da, aber nicht mehr nutzbar
+            "access_token_exp": None,
+            "error": str(e),
+        }, status=500)
+
+
 async def _run_funnel_task(task_id: str, funnel_log_id: str = None):
     """Run a brain-ingest task via Claude CLI, no WS streaming."""
     _activity_set("funnel", active=True)
@@ -3543,8 +6310,203 @@ def _pick_model(message: str, session) -> str:
 # ---------------------------------------------------------------------------
 ARENA_FILE = Path("C:/Users/Robin/Jarvis/data/arena-rooms.json")
 ARENA_CRASH_DIR = Path("C:/Users/Robin/Jarvis/data/arena-crashes")
+ARENA_FAIL_BACKLOG_FILE = Path("C:/Users/Robin/Jarvis/data/arena-fail-backlog.json")
+ARENA_REVIEWS_LOG = Path("C:/Users/Robin/Jarvis/data/arena-reviews.jsonl")
+ARENA_ARCHIVE_DIR = Path("C:/Users/Robin/Jarvis/data/arena-archive")
+
+# Room renewal thresholds (trim oversized rooms to fight frontend lag)
+ARENA_RENEW_MSG_COUNT = 120       # trim when message count exceeds this
+ARENA_RENEW_PAYLOAD_KB = 300      # trim when messages payload exceeds this size
+# Density trigger: renew when avg msg size is large even if total count/payload is below main thresholds
+# Catches "long rooms" (few msgs, each very verbose) that still cause frontend lag
+ARENA_RENEW_AVG_MSG_KB = 3.5     # avg KB per message
+ARENA_RENEW_AVG_MSG_MIN_COUNT = 25  # only apply density check once room has this many messages
+
+
+def _archive_and_renew_room(room: dict) -> dict:
+    """Archive current messages to JSONL and reseed the room with a compact
+    continuity seed (Fazit + offene ACTIONs). Returns info dict for logging.
+
+    Mutates ``room`` in place: replaces ``messages`` with a compact seed,
+    resets ``turn_count`` and keeps ``fazit_log`` / ``done_actions`` intact.
+    """
+    import re as _re
+    messages = room.get("messages", []) or []
+    room_id = room.get("id", "unknown")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # 1) Archive-Dump: jede Message eine Zeile + Meta-Header
+    try:
+        room_dir = ARENA_ARCHIVE_DIR / str(room_id)
+        room_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = room_dir / f"{ts}.jsonl"
+        with archive_path.open("w", encoding="utf-8") as fh:
+            meta = {
+                "_meta": True,
+                "room_id": room_id,
+                "title": room.get("title"),
+                "topic": room.get("topic"),
+                "archived_at": datetime.now().isoformat(),
+                "msg_count": len(messages),
+                "turn_count": room.get("turn_count", 0),
+            }
+            fh.write(json.dumps(meta, ensure_ascii=False) + "\n")
+            for m in messages:
+                try:
+                    fh.write(json.dumps(m, ensure_ascii=False) + "\n")
+                except Exception:
+                    fh.write(json.dumps({"_err": "unserializable", "role": m.get("role")}) + "\n")
+    except Exception as e:
+        print(f"[Arena-Renew] Archive-Write failed: {e}")
+
+    # 2) Offene [ACTION:...] Items sammeln (aus den letzten 40 Messages)
+    done_keys = set(k.strip().lower() for k in room.get("done_actions", []))
+    open_actions: list = []
+    seen_keys: set = set()
+    action_re = _re.compile(r"\[ACTION:([^\]]+)\]\s*([^\n]+)")
+    for m in messages[-40:]:
+        content = m.get("content", "") or ""
+        for bot, body in action_re.findall(content):
+            txt = body.strip().rstrip(".")
+            key = f"{bot.strip()}{txt}".lower()
+            if key in seen_keys or txt.lower() in done_keys:
+                continue
+            seen_keys.add(key)
+            open_actions.append(f"[ACTION:{bot.strip()}] {txt}")
+        if len(open_actions) >= 12:
+            break
+
+    # 3) Continuity-Seed (Gammas Vorschlag) als Orchestrator-System-Turn
+    fazit = (room.get("orchestrator_summary") or "").strip()
+    if not fazit:
+        fazit_log = room.get("fazit_log") or []
+        if fazit_log:
+            fazit = (fazit_log[-1].get("content") or "").strip()
+    fazit = fazit[:1800] if fazit else "(kein Fazit gespeichert)"
+
+    # Konsens-Historie: letzte 3 Fazits aus renewals[] (sofern vorhanden)
+    prior_renewals = [r for r in room.get("renewals", []) if r.get("fazit")][-3:]
+    if prior_renewals:
+        history_lines = []
+        for i, r in enumerate(prior_renewals, 1):
+            history_lines.append(f"[Runde -{len(prior_renewals)-i+1}] {r['fazit'][:600]}")
+        history_block = "\n\n".join(history_lines)
+        history_section = f"\nKONSENS-HISTORIE (letzte {len(prior_renewals)} Runden):\n{history_block}\n"
+    else:
+        history_section = ""
+
+    open_block = "\n".join(open_actions) if open_actions else "(keine offenen Aktionen)"
+
+    # [FAIL-CONTEXT] Block: letzte failed/timeout Actions als Lernmaterial für Bots
+    fail_items = [
+        a for a in room.get("action_items", [])
+        if a.get("status") in ("failed", "timeout") and a.get("result")
+    ][-3:]
+    if fail_items:
+        fail_lines = []
+        for fa in fail_items:
+            bot_tag = f"[ACTION:{fa.get('bot', '?')}]" if fa.get("bot") else "[ACTION]"
+            txt = (fa.get("text") or "")[:120]
+            reason = (fa.get("result") or "")[:180]
+            fail_lines.append(f"{bot_tag} {txt}\n  → Fehler: {reason}")
+        fail_block = "\n\n".join(fail_lines)
+        fail_section = f"\nFEHLGESCHLAGENE AKTIONEN (analysiere Ursache, schlage kleinere Variante vor):\n{fail_block}\n"
+    else:
+        fail_section = ""
+
+    seed_content = (
+        f"RAUM WURDE AUTOMATISCH KOMPAKTIERT (Lag-Schutz)\n\n"
+        f"KONTEXT AUS VORRUNDE:\n{fazit}\n"
+        f"{history_section}"
+        f"{fail_section}\n"
+        f"OFFENE AKTIONEN:\n{open_block}"
+    )
+
+    # Beta's Token-Diff: alle [ACTION:...] aus dem gesamten Log gegen Seed prüfen.
+    # Fehlende deterministisch anhängen — rettet Actions, die das LLM-Fazit verschluckt.
+    all_action_keys: list = []
+    seen_all: set = set()
+    for m in messages:
+        content = m.get("content", "") or ""
+        for bot, body in action_re.findall(content):
+            txt = body.strip().rstrip(".")
+            key = f"{bot.strip()}{txt}".lower()
+            if key in seen_all or txt.lower() in done_keys:
+                continue
+            seen_all.add(key)
+            all_action_keys.append((bot.strip(), txt))
+    seed_lower = seed_content.lower()
+    missed: list = []
+    for bot, txt in all_action_keys:
+        if txt.lower() not in seed_lower:
+            missed.append(f"[ACTION:{bot}] {txt}")
+    if missed:
+        seed_content += "\n\nNACHGETRAGEN (im Fazit vergessen):\n" + "\n".join(missed[:10])
+
+    # Tag action_items: missed → recovered, surviving open → stale
+    _now_iso = datetime.now().isoformat()
+    missed_texts_lower = set()
+    for _m in missed:
+        _part = _m.split("] ", 1)[-1].strip().lower() if "] " in _m else _m.lower()
+        missed_texts_lower.add(_part)
+    for _item in room.get("action_items", []):
+        if _item.get("status") == "offen":
+            if _item["text"].lower() in missed_texts_lower:
+                _item["recovered"] = True
+                _item["recovered_at"] = _now_iso
+                _item.pop("stale", None)
+            else:
+                _item["stale"] = True
+                _item.pop("recovered", None)
+
+    seed_msg = {
+        "role": "orchestrator",
+        "name": "Orchestrator",
+        "content": seed_content,
+        "timestamp": datetime.now().isoformat(),
+        "color": "#a855f7",
+        "turn": 0,
+        "is_renewal_seed": True,
+    }
+
+    old_count = len(messages)
+    room["messages"] = [seed_msg]
+    room.setdefault("renewals", []).append({
+        "at": datetime.now().isoformat(),
+        "ts": ts,
+        "old_msg_count": old_count,
+        "open_actions": len(open_actions),
+        "recovered_actions": len(missed),
+        "archive": str(archive_path) if 'archive_path' in locals() else None,
+        "fazit": fazit[:2000],
+    })
+
+    return {
+        "archived_msgs": old_count,
+        "open_actions": len(open_actions),
+        "recovered": len(missed),
+        "ts": ts,
+    }
 
 _arena_rooms: dict = {}  # room_id -> ArenaRoom state
+
+
+def _extract_and_store_action_items(room: dict, fazit_text: str):
+    """Extract [ACTION:Bot] tags from fazit and upsert into room['action_items'] with offen/erledigt."""
+    action_re = re.compile(r"\[ACTION:([^\]]+)\]\s*([^\n]+)")
+    existing = {item["key"]: item for item in room.get("action_items", [])}
+    done_keys = set(k.strip().lower() for k in room.get("done_actions", []))
+    now = datetime.now().isoformat()
+    for bot, body in action_re.findall(fazit_text):
+        bot = bot.strip()
+        text = body.strip().rstrip(".")
+        key = f"{bot}:{text}".lower()
+        status = "erledigt" if text.lower() in done_keys else "offen"
+        if key not in existing:
+            existing[key] = {"key": key, "bot": bot, "text": text, "status": status, "created_at": now}
+        else:
+            existing[key]["status"] = status
+    room["action_items"] = list(existing.values())
 
 
 def _log_arena_crash(room_id: str, bot_name: str, turn: int, kind: str,
@@ -3609,6 +6571,139 @@ def _save_arena_rooms(rooms: list):
     ARENA_FILE.write_text(
         json.dumps(rooms, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
+def _append_fail_backlog(entries: list):
+    """Append failed/rejected actions to the persistent fail backlog.
+
+    Dedup: Wenn (approval_id, action_num) schon existiert, wird kein neuer Eintrag
+    angefuegt — stattdessen requeue_count auf dem bestehenden Eintrag hochgezaehlt.
+    Fehlender approval_id (bei reinen fail/reject-Eintraegen) umgeht das Matching.
+    """
+    if not entries:
+        return
+    try:
+        ARENA_FAIL_BACKLOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        existing = []
+        if ARENA_FAIL_BACKLOG_FILE.exists():
+            existing = json.loads(ARENA_FAIL_BACKLOG_FILE.read_text(encoding="utf-8"))
+
+        for entry in entries:
+            aid = entry.get("approval_id")
+            anum = entry.get("action_num")
+            match = None
+            if aid and anum is not None:
+                for e in existing:
+                    if e.get("approval_id") == aid and e.get("action_num") == anum:
+                        match = e
+                        break
+            if match is not None:
+                match["requeue_count"] = int(match.get("requeue_count", 1)) + 1
+                match["last_requeue_ts"] = entry.get("timestamp")
+                match["reason"] = entry.get("reason", match.get("reason"))
+            else:
+                entry.setdefault("requeue_count", 1)
+                existing.append(entry)
+
+        ARENA_FAIL_BACKLOG_FILE.write_text(
+            json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        print(f"[Arena] fail-backlog write error: {e}")
+
+
+def _get_requeue_count(approval_id: str, action_num: int) -> int:
+    """Liest aktuellen requeue_count fuer (approval_id, action_num) aus dem Backlog."""
+    try:
+        if not ARENA_FAIL_BACKLOG_FILE.exists():
+            return 0
+        existing = json.loads(ARENA_FAIL_BACKLOG_FILE.read_text(encoding="utf-8"))
+        for e in existing:
+            if e.get("approval_id") == approval_id and e.get("action_num") == action_num:
+                return int(e.get("requeue_count", 1))
+    except Exception:
+        pass
+    return 0
+
+
+async def api_arena_fail_backlog(request):
+    """GET /api/arena/fail-backlog  — returns persisted failed/rejected actions."""
+    try:
+        if ARENA_FAIL_BACKLOG_FILE.exists():
+            data = json.loads(ARENA_FAIL_BACKLOG_FILE.read_text(encoding="utf-8"))
+        else:
+            data = []
+        return web.json_response({"ok": True, "items": data})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
+async def api_arena_fail_backlog_clear(request):
+    """DELETE /api/arena/fail-backlog  — clears the backlog after user acknowledges."""
+    try:
+        if ARENA_FAIL_BACKLOG_FILE.exists():
+            ARENA_FAIL_BACKLOG_FILE.write_text("[]", encoding="utf-8")
+        return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
+def _requeue_nachbessern_actions(room: dict, reviewer: str, room_id: str, turn: int, action_nums: list = None):
+    """Put NACHBESSERN-flagged actions back into the fail-backlog so the Orchestrator can retry them.
+
+    If action_nums is given (1-based indices from 'URTEIL: NACHBESSERN #N'), only those
+    specific actions are requeued. Otherwise all actions from the last approval are requeued.
+    """
+    last_approval = None
+    for m in reversed(room.get("messages", [])):
+        if m.get("role") == "approval" and m.get("actions"):
+            last_approval = m
+            break
+    if not last_approval:
+        return
+
+    topic = room.get("topic", "")
+    approval_id = last_approval.get("approval_id", "")
+    all_actions = last_approval.get("actions", [])
+    if action_nums:
+        selected = [(n, all_actions[n - 1]) for n in action_nums if 1 <= n <= len(all_actions)]
+    else:
+        selected = [(i + 1, a) for i, a in enumerate(all_actions)]
+
+    entries = []
+    capped = []
+    for num, a in selected:
+        text = (a.get("text") or "").strip()
+        if not text:
+            continue
+        prior = _get_requeue_count(approval_id, num) if approval_id else 0
+        if prior >= 2:
+            capped.append(num)
+            print(f"[Arena] NACHBESSERN CAP: Action #{num} (approval={approval_id[:8] if approval_id else '-'}) bereits {prior}x requeued → FAIL, nicht neu angelegt")
+            continue
+        entries.append({
+            "kind": "nachbessern",
+            "action": text,
+            "action_num": num,
+            "reason": f"URTEIL: NACHBESSERN #{num} von {reviewer} (Turn {turn})",
+            "room_id": room_id,
+            "topic": topic,
+            "approval_id": approval_id,
+            "timestamp": datetime.now().isoformat(),
+        })
+    if entries:
+        _append_fail_backlog(entries)
+        print(f"[Arena] NACHBESSERN: {len(entries)} Aktion(en) zurück in Backlog (reviewer={reviewer}, room={room_id[:8]}, nums={action_nums or 'all'})")
+    if capped:
+        print(f"[Arena] NACHBESSERN: {len(capped)} Aktion(en) durch Cap blockiert (nums={capped})")
+        for cap_num in capped:
+            room["messages"].append({
+                "role": "system",
+                "name": "System",
+                "content": f"🛑 Action #{cap_num} nach 2 Nachbesserungsrunden gestoppt — kein weiterer Retry.",
+                "timestamp": datetime.now().isoformat(),
+                "color": "#ef4444",
+            })
 
 
 def _get_arena_room(rooms, room_id):
@@ -3688,14 +6783,49 @@ async def api_arena_delete(request):
 
 
 async def api_arena_room(request):
-    """GET /api/arena/rooms/{id}  -  Get room details."""
+    """GET /api/arena/rooms/{id}  -  Get room details (includes snapshots index)."""
     room_id = request.match_info["id"]
     rooms = _load_arena_rooms()
     room = _get_arena_room(rooms, room_id)
     if not room:
         raise web.HTTPNotFound(reason="Room not found")
     room["running"] = room_id in _arena_rooms and _arena_rooms[room_id].get("running", False)
+    room["snapshots"] = _list_room_snapshots(room_id)
     return web.json_response(room)
+
+
+def _arena_task_running(room_id: str) -> bool:
+    """True wenn entweder ein Trialog-Task oder ein klassischer Arena-Flow
+    für diesen Room aktiv ist. Vereint beide Registries + säubert stale Flags.
+    """
+    t_task = _trialog_tasks.get(room_id)
+    if t_task and not t_task.done():
+        return True
+    if t_task and t_task.done():
+        _trialog_tasks.pop(room_id, None)
+        if room_id in _arena_rooms:
+            _arena_rooms[room_id]["running"] = False
+    state = _arena_rooms.get(room_id) or {}
+    return bool(state.get("running"))
+
+
+def _spawn_for_room(room_id: str, rooms_list=None):
+    """Zentraler Dispatcher: spawn _run_trialog für trialog-Räume, sonst
+    _run_arena. Setzt `_arena_rooms[room_id].running=True` und trackt
+    trialog-Tasks in `_trialog_tasks` damit inject/stop/start-Checks
+    nicht parallel zu laufenden Flows einen zweiten Loop starten.
+    """
+    if rooms_list is None:
+        rooms_list = _load_arena_rooms()
+    room = _get_arena_room(rooms_list, room_id)
+    if not room:
+        return None
+    _arena_rooms[room_id] = {"running": True, "process": None}
+    if (room.get("mode") or "").lower() == "trialog":
+        task = asyncio.create_task(_run_trialog(room_id, rooms_list))
+        _trialog_tasks[room_id] = task
+        return task
+    return asyncio.create_task(_run_arena(room_id))
 
 
 async def api_arena_start(request):
@@ -3705,7 +6835,7 @@ async def api_arena_start(request):
     room = _get_arena_room(rooms, room_id)
     if not room:
         raise web.HTTPNotFound(reason="Room not found")
-    if room_id in _arena_rooms and _arena_rooms[room_id].get("running"):
+    if _arena_task_running(room_id):
         return web.json_response({"error": "Already running"}, status=409)
 
     body = await request.json() if request.content_length else {}
@@ -3715,8 +6845,7 @@ async def api_arena_start(request):
 
     room["last_active"] = datetime.now().isoformat()
     _save_arena_rooms(rooms)
-    _arena_rooms[room_id] = {"running": True, "process": None}
-    asyncio.create_task(_run_arena(room_id))
+    _spawn_for_room(room_id, rooms)
     return web.json_response({"ok": True, "room_id": room_id})
 
 
@@ -3728,6 +6857,19 @@ async def api_arena_stop(request):
         proc = _arena_rooms[room_id].get("process")
         if proc and proc.returncode is None:
             proc.kill()
+    # Zusätzlich Trialog-Task canceln falls das ein Trialog-Room ist
+    t_task = _trialog_tasks.get(room_id)
+    if t_task and not t_task.done():
+        t_task.cancel()
+    # Status im Room auf stopped markieren damit UI es sieht
+    try:
+        rooms = _load_arena_rooms()
+        rm = _get_arena_room(rooms, room_id)
+        if rm and rm.get("mode") == "trialog":
+            rm["status"] = "stopped"
+            _save_arena_rooms(rooms)
+    except Exception:
+        pass
     return web.json_response({"ok": True})
 
 
@@ -3777,7 +6919,1034 @@ async def api_arena_inject(request):
         "room_id": room_id,
         "message": msg,
     })
+
+    # Trialog-Room: User-Message triggert automatisch eine neue Runde —
+    # alle Bots antworten nacheinander. Nur wenn aktuell KEIN Task läuft
+    # (weder Trialog- noch klassischer Arena-Flow, sonst Dopplung).
+    # WICHTIG: max_rounds NICHT persistent auf 1 setzen — das würde den
+    # konfigurierten Wert im Room für alle folgenden Starts kaputtmachen.
+    # Stattdessen in-memory Override (_trialog_round_override) für genau
+    # diesen Inject-getriggerten Run.
+    if room.get("mode") == "trialog" and not _arena_task_running(room_id):
+        print(f"[Trialog] inject-triggered round for {room_id[:8]} (override max_rounds=1)")
+        _trialog_round_override[room_id] = 1
+        _spawn_for_room(room_id)
+
     return web.json_response({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Multi-Model Trialog — provider-agnostische Arena-Variante.
+#
+# Im Gegensatz zum klassischen _run_arena (Claude-CLI-only, mit Tools, Escalation,
+# Crash-Recovery) ist dies eine schlanke Round-Robin-Runde: jeder Bot bekommt
+# round-weise das Wort und antwortet über invoke_llm mit seinem eigenen
+# Provider + Model. Text-only, keine Tools, keine Escalation — gedacht für
+# "reden miteinander" ohne agentische Sub-Tasks.
+# ---------------------------------------------------------------------------
+
+_trialog_tasks: dict[str, asyncio.Task] = {}
+# Einmalige Overrides pro Run (nicht persistent im Room), z.B. inject-triggered
+# rounds wollen nur 1 Runde statt der im Room konfigurierten max_rounds.
+_trialog_round_override: dict[str, int] = {}
+
+# Rollen-Inkompatibilität: jeder Bot kriegt pro Position eine feste Rolle.
+# Zwingt echten Dissens statt "ich stimme zu, ergänze X"-Ornamente.
+# Position im `bots`-Array wird modulo genommen → bei 3 Bots: Kritiker/Simplifier/Umsetzer.
+_TRIALOG_ROLES = [
+    (
+        "Kritiker",
+        "Dein Job: WIDERSPRECHEN. Such dir einen konkreten Punkt aus dem eben Gesagten und "
+        "widerleg ihn oder zeig was übersehen wurde. \"Ich stimme zu, ergänze X\" ist VERBOTEN — "
+        "das hilft der Diskussion nicht. Wenn du wirklich keinen Gegenpunkt findest, sag das "
+        "ehrlich und frag eine scharfe Rückfrage. Keine Floskeln-Zustimmung.",
+    ),
+    (
+        "Simplifier",
+        "Dein Job: SCOPE REDUZIEREN. Bei jedem Vorschlag der anderen: was kann weg? Was ist "
+        "eigentlich Sprint 3 statt Sprint 1? Welches File gehört NICHT dazu? Du schlägst "
+        "keine neuen Features vor — nur streichen, zusammenlegen, vertagen. Jedes \"ja, und "
+        "zusätzlich...\" ist ein Fehler in deiner Rolle.",
+    ),
+    (
+        "Umsetzer",
+        "Dein Job: KONKRET WERDEN. Wenn die anderen abstrakt reden, forderst du Code oder "
+        "Diff. Du selbst schlägst nur vor was du als tatsächlichen Datei-Inhalt oder ```diff "
+        "sofort ausformulieren kannst. Keine Architektur-Prosa, keine Namespacing-Debatten. "
+        "Wenn du etwas baust: zeig die ersten 10 Zeilen Code.",
+    ),
+]
+
+
+async def _gather_repo_facts(topic: str, recent_lines: list[str]) -> str:
+    """Forced Read-Before-Talk: sucht im Repo-RAG nach Fakten zum Topic + letzten
+    Peer-Messages. Bots sehen was es im Repo schon gibt bevor sie spekulieren.
+    Gibt formatierten Block zurück (leer wenn RAG unavailable oder nix gefunden).
+    """
+    try:
+        from rag.search import query as _rag_query
+    except Exception:
+        return ""
+    # Query: Topic + letzte 2 peer-lines (zusammen max ~400 Zeichen)
+    parts = [topic[:200]]
+    for ln in (recent_lines or [])[-2:]:
+        parts.append(ln[:150])
+    query_text = " ".join(parts).strip()
+    if not query_text:
+        return ""
+    try:
+        loop = asyncio.get_event_loop()
+        hits = await loop.run_in_executor(None, lambda: _rag_query(query_text, 4))
+    except Exception:
+        return ""
+    if not hits:
+        return ""
+    lines = []
+    for h in hits[:4]:
+        path = h.get("source") or h.get("path") or h.get("file") or "?"
+        snip = (h.get("text") or h.get("content") or h.get("chunk") or "")
+        snip = snip.replace("\n", " ").strip()[:200]
+        if snip:
+            lines.append(f"- `{path}`: {snip}")
+    return "\n".join(lines) if lines else ""
+
+
+async def _run_trialog(room_id: str, rooms_list: list) -> None:
+    """Round-Robin Discussion zwischen 3+ Bots mit je eigenem Provider/Model.
+
+    rooms_list ist der shared _load_arena_rooms-Resultat damit wir
+    Änderungen persistieren können.
+    """
+    # Room aus Liste rausfischen
+    room = next((r for r in rooms_list if r.get("id") == room_id), None)
+    if not room:
+        print(f"[Trialog] room {room_id} verschwunden")
+        return
+
+    bots = room.get("bots") or []
+    if len(bots) < 2:
+        print(f"[Trialog] zu wenig bots ({len(bots)})")
+        return
+
+    # Einmaliger Override (z.B. inject-triggered "nur 1 Runde"), fällt sonst
+    # auf den im Room konfigurierten Wert zurück
+    _override = _trialog_round_override.pop(room_id, None)
+    max_rounds = int(_override) if _override else int(room.get("max_rounds", 3))
+    topic = room.get("topic") or room.get("title") or ""
+
+    room["status"] = "running"
+    room["last_active"] = datetime.now().isoformat()
+    _save_arena_rooms(rooms_list)
+
+    await _broadcast_all_ws({
+        "type": "arena.status",
+        "room_id": room_id,
+        "status": "running",
+        "mode": "trialog",
+    })
+
+    turn_counter = 0
+    try:
+        for round_idx in range(max_rounds):
+            # Check if stopped externally
+            fresh = _load_arena_rooms()
+            rr = next((r for r in fresh if r.get("id") == room_id), None)
+            if not rr or rr.get("status") == "stopped":
+                print(f"[Trialog] room {room_id[:8]} externally stopped")
+                break
+
+            for bot in bots:
+                turn_counter += 1
+                bot_name = bot.get("name") or f"Bot-{turn_counter}"
+                bot_color = bot.get("color") or "#6366f1"
+                bot_provider = bot.get("provider") or "claude-cli"
+                bot_model = bot.get("model") or ""
+                bot_persona = bot.get("persona") or "Du bist ein hilfreicher Diskussionspartner."
+
+                await _broadcast_all_ws({
+                    "type": "arena.thinking",
+                    "room_id": room_id,
+                    "bot_name": bot_name,
+                    "bot_color": bot_color,
+                    "turn": turn_counter,
+                })
+
+                # --- Historie bauen wie in klassischer Arena: NUR echte Bot-
+                # Beiträge + Robin-Zwischenrufe + (wenn vorhanden) das letzte
+                # Orchestrator-Fazit. System-Gemecker (Health-Check, skip-tot)
+                # wird rausgefiltert damit Bots sich auf den Diskurs
+                # konzentrieren statt auf Infrastruktur-Rauschen.
+                _all_msgs = (room.get("messages") or [])
+                last_orch_line = ""
+                for _m in reversed(_all_msgs):
+                    if _m.get("role") == "orchestrator":
+                        _o = (_m.get("content") or _m.get("text") or "").strip()
+                        if _o:
+                            import re as _re
+                            _o_clean = _re.sub(r"\[VERDICT:[^\]]+\]", "", _o).strip()
+                            last_orch_line = _o_clean[:900]
+                        break
+                peer_lines: list[str] = []
+                for m in _all_msgs[-14:]:
+                    role = (m.get("role") or "").lower()
+                    if role not in ("bot", "robin", "user"):
+                        continue
+                    from_bot = (
+                        m.get("bot_name") or m.get("name") or
+                        ("Robin" if role in ("robin", "user") else "Bot")
+                    )
+                    text = (m.get("text") or m.get("content") or "").strip()
+                    if not text:
+                        continue
+                    peer_lines.append(f"{from_bot}: {text}")
+                # Auf ~8 Einträge kappen (gleiche Dichte wie classic Arena)
+                peer_lines = peer_lines[-8:]
+                history_block = "\n\n".join(peer_lines) or "(noch keine Beiträge)"
+
+                orch_hint = ""
+                if last_orch_line:
+                    orch_hint = (
+                        f"\nLETZTES ORCHESTRATOR-FAZIT (darauf aufbauen, nicht wiederholen):\n"
+                        f"{last_orch_line}\n"
+                    )
+
+                # Frischer Robin-Zwischenruf: user/robin-Message NACH letztem Bot
+                _last_bot_ts = ""
+                for _m in reversed(_all_msgs):
+                    if _m.get("role") == "bot":
+                        _last_bot_ts = _m.get("timestamp", "")
+                        break
+                robin_hint = ""
+                _fresh = [
+                    (m.get("content") or m.get("text") or "").strip()
+                    for m in _all_msgs
+                    if m.get("role") in ("robin", "user")
+                    and m.get("timestamp", "") > _last_bot_ts
+                    and (m.get("content") or m.get("text") or "").strip()
+                ]
+                if _fresh:
+                    robin_hint = (
+                        "\n=== ROBINS ZWISCHENRUF (direkte Anweisung — Priorität!) ===\n"
+                        + "\n\n".join(f"[Robin: {t[:500]}]" for t in _fresh[-3:])
+                        + "\n=== ENDE ZWISCHENRUF ===\n"
+                    )
+
+                # --- Rollen-Inkompatibilität (Anti-Theater Fix 1) -----------
+                # Position im bots-Array → feste Rolle (Kritiker/Simplifier/Umsetzer).
+                # Zwingt echten Dissens statt paralleler Monologe.
+                _pos = next((i for i, b in enumerate(bots) if b.get("name") == bot_name), 0)
+                _role_name, _role_task = _TRIALOG_ROLES[_pos % len(_TRIALOG_ROLES)]
+                role_block = (
+                    f"\n=== DEINE ROLLE DIESE RUNDE: {_role_name.upper()} ===\n"
+                    f"{_role_task}\n"
+                    f"=== ENDE ROLLE ===\n"
+                )
+
+                # --- Force-Diff-Modus (Anti-Theater Fix 2) ------------------
+                # Ab dem 1. Orchestrator-Fazit: Ideensammlung ist vorbei, ab jetzt
+                # müssen Vorschläge Code/Diff enthalten damit sie approvable sind.
+                force_diff = bool((room.get("orchestrator_summary") or "").strip())
+                diff_block = ""
+                if force_diff:
+                    diff_block = (
+                        "\n=== FORCE-DIFF-MODUS AKTIV ===\n"
+                        "Der Orchestrator hat bereits mindestens ein Fazit gezogen — die reine "
+                        "Ideensammlung ist vorbei. Wenn du eine neue Umsetzung vorschlägst, "
+                        "zeig sie als Code-Block mit ```diff oder ```python (o.ä.) mit dem "
+                        "tatsächlichen Datei-Inhalt/Patch — Abstrakt 'wir könnten X bauen' "
+                        "wird nicht mehr approved. Wenn du keinen Patch liefern kannst, "
+                        "widersprich/frag zurück — aber schlag nichts Abstraktes vor.\n"
+                        "=== ENDE FORCE-DIFF ===\n"
+                    )
+
+                # --- Forced Read-Before-Talk (Anti-Theater Fix 3) -----------
+                # RAG-Suche im Repo bevor der Bot spekuliert. Heilt die "diskutiert
+                # über Code den sie nicht gelesen haben"-Pathologie.
+                repo_facts_block = ""
+                try:
+                    _facts = await _gather_repo_facts(topic, peer_lines[-3:] if peer_lines else [])
+                    if _facts:
+                        repo_facts_block = (
+                            "\n=== IST-STAND IM REPO (echte Fakten aus dem Code — lies bevor du spekulierst) ===\n"
+                            f"{_facts}\n"
+                            "Wenn deine Argumentation dem oben widerspricht: erklär warum konkret. "
+                            "Schlag NICHTS vor was laut den obigen Fakten schon existiert.\n"
+                            "=== ENDE IST-STAND ===\n"
+                        )
+                except Exception as _e:
+                    print(f"[Trialog] repo facts fetch failed: {_e}")
+
+                user_prompt = (
+                    f"THEMA: {topic}\n"
+                    f"{orch_hint}"
+                    f"{robin_hint}\n"
+                    f"{repo_facts_block}"
+                    f"{role_block}"
+                    f"{diff_block}"
+                    f"\nBISHERIGE DISKUSSION (die anderen Bots — lies sie und geh konkret darauf ein):\n"
+                    f"{history_block}\n\n"
+                    f"Du bist jetzt dran, {bot_name} (Runde {round_idx + 1}/{max_rounds}). "
+                    f"Halte dich strikt an deine Rolle oben. Zitier einen Namen, bau auf einem "
+                    f"konkreten Punkt auf oder widersprich gezielt. 2-4 Sätze, keine Floskeln, "
+                    f"kein \"{bot_name}: \"-Prefix."
+                )
+
+                system_prompt = (
+                    f"Du bist {bot_name} in einem Multi-Model-Trialog von Robin Mandel. "
+                    f"Persona: {bot_persona}\n\n"
+                    f"SPRACHE: Antworte IMMER auf Deutsch. Niemals Englisch — auch nicht "
+                    f"teilweise, auch nicht 'nur ein Satz'. Robin schreibt Deutsch, "
+                    f"die anderen Bots schreiben Deutsch, du ebenso.\n\n"
+                    f"Du redest mit den anderen Bots, nicht mit Robin. Keine "
+                    f"\"Ich als {bot_name}...\"-Floskeln. Greife konkrete Aussagen der "
+                    f"anderen auf (mit Namen), statt parallel monolog-artig zu senden."
+                )
+
+                # --- Mode-Decision (Phase 2 + 3) ---
+                # Feldnamen analog classic Arena damit existing /execute + /read
+                # Endpoints auch für Trialog-Räume funktionieren.
+                fresh_room_check = _load_arena_rooms()
+                rr_now = _get_arena_room(fresh_room_check, room_id)
+                is_exec = bool(rr_now and rr_now.get("tools_enabled") and
+                               int(rr_now.get("execution_turns_left", 0)) > 0)
+                is_read = bool(rr_now and not is_exec and
+                               rr_now.get("read_enabled") and
+                               int(rr_now.get("read_turns_left", 0)) > 0)
+
+                # --- Phase 4 Cross-Review: Bot der zuletzt executed hat,
+                # darf die nächste Runde nicht direkt selbst reviewen.
+                # Wenn es so passieren würde → swap zum nächsten alive Bot.
+                _last_executor = rr_now.get("last_executing_bot") if rr_now else None
+                _cross_pending = rr_now.pop("cross_review_pending", False) if rr_now else False
+                if _cross_pending and _last_executor and bot_name == _last_executor:
+                    _candidates = [b for b in bots if b.get("name") != _last_executor]
+                    if _candidates:
+                        bot = _candidates[0]
+                        bot_name = bot.get("name", bot_name)
+                        bot_provider = (bot.get("provider") or "claude-cli").strip()
+                        bot_model = (bot.get("model") or "").strip()
+                        bot_persona = bot.get("persona") or bot_persona
+                        bot_color = bot.get("color") or bot_color
+                        # System-/User-Prompt neu mit dem getauschten Bot bauen
+                        system_prompt = (
+                            f"Du bist {bot_name} in einem Multi-Model-Trialog. "
+                            f"Persona: {bot_persona}. Du wirst jetzt gebeten die "
+                            f"Arbeit von {_last_executor} kritisch zu reviewen — "
+                            f"konstruktiv aber ehrlich. Was ist solide? Was fehlt?"
+                        )
+                    _save_arena_rooms(fresh_room_check)
+
+                t0 = datetime.now()
+                err = None
+                answer = ""
+                usage = {}
+
+                if is_exec:
+                    exec_system = (
+                        system_prompt + "\n\n"
+                        "EXEC-MODUS: Du darfst in diesem Turn Dateien lesen und schreiben. "
+                        "Setze konkrete Änderungen um wenn das die Diskussion weiterbringt. "
+                        "Berichte am Ende kurz was du gemacht hast."
+                    )
+                    try:
+                        answer, usage, err = await _trialog_exec_turn(
+                            bot=bot, prompt_text=user_prompt,
+                            system_prompt=exec_system, read_only=False,
+                        )
+                    except Exception as e:
+                        err = f"exec_dispatch: {type(e).__name__}: {e}"
+                    rr_now["execution_turns_left"] = int(rr_now.get("execution_turns_left", 0)) - 1
+                    if rr_now["execution_turns_left"] <= 0:
+                        rr_now["tools_enabled"] = False
+                        rr_now["execution_turns_left"] = 0
+                    # Nach Exec-Turn: cross-review für nächsten Bot markieren
+                    rr_now["last_executing_bot"] = bot_name
+                    rr_now["cross_review_pending"] = True
+                    _save_arena_rooms(fresh_room_check)
+
+                elif is_read:
+                    read_system = (
+                        system_prompt + "\n\n"
+                        "READ-MODUS: Du darfst in diesem Turn Dateien LESEN und suchen "
+                        "(Read/Glob/Grep oder plan-only), aber NICHT schreiben/ändern. "
+                        "Nutze das um deine Argumente mit Fakten aus Robins Codebase zu "
+                        "belegen statt zu spekulieren."
+                    )
+                    try:
+                        answer, usage, err = await _trialog_exec_turn(
+                            bot=bot, prompt_text=user_prompt,
+                            system_prompt=read_system, read_only=True,
+                        )
+                    except Exception as e:
+                        err = f"read_dispatch: {type(e).__name__}: {e}"
+                    rr_now["read_turns_left"] = int(rr_now.get("read_turns_left", 0)) - 1
+                    if rr_now["read_turns_left"] <= 0:
+                        rr_now["read_enabled"] = False
+                        rr_now["read_turns_left"] = 0
+                    _save_arena_rooms(fresh_room_check)
+
+                else:
+                    # Normale Discussion: reiner LLM-Turn, keine Tools.
+                    # MCP/Tools gibts in EXEC- und READ-Mode (siehe oben).
+                    try:
+                        answer, usage, err = await _llm_oneshot(
+                            provider=bot_provider, model=bot_model,
+                            user_message=user_prompt, system=system_prompt,
+                            max_tokens=500,
+                        )
+                    except Exception as e:
+                        err = f"{type(e).__name__}: {e}"
+
+                # --- Phase 4 Escalation: bei Fehler/Leer auf stärkeres Modell ---
+                # Nur für claude-cli (andere Provider haben kein klares Modell-Tier-
+                # Mapping). haiku → sonnet → opus.
+                _ESC_MAP_CLAUDE = {"haiku": "sonnet", "sonnet": "opus", "": "opus"}
+                needs_escalation = (not answer or err) and bot_provider == "claude-cli"
+                if needs_escalation:
+                    escalated = _ESC_MAP_CLAUDE.get(bot_model, None)
+                    if escalated and escalated != bot_model:
+                        print(f"[Trialog] escalating {bot_name} {bot_model!r} → {escalated!r} (err={err})")
+                        try:
+                            if is_exec:
+                                answer, usage, err = await _trialog_exec_turn(
+                                    bot={**bot, "model": escalated},
+                                    prompt_text=user_prompt,
+                                    system_prompt=system_prompt,
+                                    read_only=False,
+                                )
+                            elif is_read:
+                                answer, usage, err = await _trialog_exec_turn(
+                                    bot={**bot, "model": escalated},
+                                    prompt_text=user_prompt,
+                                    system_prompt=system_prompt,
+                                    read_only=True,
+                                )
+                            else:
+                                answer, usage, err = await _llm_oneshot(
+                                    provider=bot_provider, model=escalated,
+                                    user_message=user_prompt, system=system_prompt,
+                                    max_tokens=500,
+                                )
+                            if answer:
+                                bot_model = escalated  # Für Message-Metadata
+                        except Exception as e:
+                            err = f"escalation_failed: {type(e).__name__}: {e}"
+
+                duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
+
+                if err or not answer:
+                    text_out = f"*(Fehler: {err or 'leere Antwort'})*"
+                else:
+                    text_out = answer.strip()
+
+                # Message aufbauen + persistieren + broadcasten
+                # WICHTIG: Arena-Frontend rendert `content`, nicht `text` —
+                # wir schreiben beide Felder damit sowohl klassische Arena-UI
+                # als auch neue Trialog-Konsumenten es sehen. Zusätzlich `name`
+                # (legacy Arena) + `role` (Arena-Message-Typ).
+                msg = {
+                    "turn": turn_counter,
+                    "round": round_idx + 1,
+                    "role": "bot",
+                    "name": bot_name,        # Arena-legacy
+                    "bot_name": bot_name,
+                    "color": bot_color,      # Arena-legacy
+                    "bot_color": bot_color,
+                    "provider": bot_provider,
+                    "model": bot_model or "default",
+                    "content": text_out,     # Arena-Frontend-Feld
+                    "text": text_out,        # Trialog-Konsistenz
+                    "timestamp": datetime.now().isoformat(),
+                    "duration_ms": duration_ms,
+                    "usage": usage,
+                    "error": err,
+                }
+                # Neueste rooms-Liste holen (andere Endpoints könnten
+                # zwischenzeitlich geschrieben haben)
+                fresh = _load_arena_rooms()
+                rr = next((r for r in fresh if r.get("id") == room_id), None)
+                if rr:
+                    rr.setdefault("messages", []).append(msg)
+                    rr["last_active"] = datetime.now().isoformat()
+                    _save_arena_rooms(fresh)
+
+                await _broadcast_all_ws({
+                    "type": "arena.message",
+                    "room_id": room_id,
+                    "message": msg,
+                })
+
+                # --- Periodic Orchestrator/Summary (Phase 1) ---
+                # Nach jeden `summarize_every`-Turns ein Orchestrator-Call:
+                # fasst die wichtigsten Punkte der bisherigen Diskussion zusammen,
+                # highlightet Dissens und Konsens, setzt Impuls für nächste Runde.
+                # Default 9 (= 3 Runden bei 3 Bots), konfigurierbar über room.summarize_every.
+                _se = int(room.get("summarize_every") or 9)
+                if _se > 0 and turn_counter % _se == 0:
+                    await _trialog_orchestrator_call(room_id, current_turn=turn_counter)
+
+                # --- Room-Renewal: Archive + Continuity-Seed wenn Raum zu
+                # groß wird (Lag-Schutz, identisch zum Classic-Arena-Pattern).
+                # Alle Messages ab Turn 0 bis jetzt werden in data/arena-archive/{room_id}/{ts}.jsonl
+                # geschrieben. Der Room wird mit einem kompakten Seed neu
+                # aufgesetzt: letztes Orchestrator-Fazit + offene Actions + Konsens-Historie.
+                try:
+                    _rr_rooms = _load_arena_rooms()
+                    _rr_room = _get_arena_room(_rr_rooms, room_id)
+                except Exception:
+                    _rr_room = None
+                if _rr_room:
+                    _rr_msgs = _rr_room.get("messages", [])
+                    try:
+                        _payload_kb = len(json.dumps(_rr_msgs, ensure_ascii=False).encode()) / 1024
+                    except Exception:
+                        _payload_kb = 0
+                    _n = len(_rr_msgs)
+                    _avg = _payload_kb / _n if _n else 0
+                    _renew_density = (_n >= ARENA_RENEW_AVG_MSG_MIN_COUNT and _avg > ARENA_RENEW_AVG_MSG_KB)
+                    if _n > ARENA_RENEW_MSG_COUNT or _payload_kb > ARENA_RENEW_PAYLOAD_KB or _renew_density:
+                        _renew_info = _archive_and_renew_room(_rr_room)
+                        _save_arena_rooms(_rr_rooms)
+                        _recov = (
+                            f", {_renew_info.get('recovered', 0)} nachgetragen"
+                            if _renew_info.get("recovered") else ""
+                        )
+                        _divider = {
+                            "role": "system",
+                            "name": "System",
+                            "content": (
+                                f"📦 **Raum komprimiert bei Turn {turn_counter}** — "
+                                f"{_renew_info['archived_msgs']} Messages archiviert, "
+                                f"{_renew_info['open_actions']} offene Aktionen übertragen{_recov} "
+                                f"→ Archiv: {_renew_info['ts']}"
+                                + (f" (⚠️ Dichte: {_avg:.1f} KB/msg)" if _renew_density else "")
+                            ),
+                            "timestamp": datetime.now().isoformat(),
+                            "color": "#6366f1",
+                            "turn": turn_counter,
+                            "is_renewal_divider": True,
+                        }
+                        _rr_rooms2 = _load_arena_rooms()
+                        _rr_room2 = _get_arena_room(_rr_rooms2, room_id)
+                        if _rr_room2:
+                            _rr_room2["messages"].append(_divider)
+                            _save_arena_rooms(_rr_rooms2)
+                        await _broadcast_all_ws({
+                            "type": "arena.message",
+                            "room_id": room_id,
+                            "message": _divider,
+                        })
+                        await _broadcast_all_ws({
+                            "type": "arena.renewed",
+                            "room_id": room_id,
+                            "archived_msgs": _renew_info["archived_msgs"],
+                            "open_actions": _renew_info["open_actions"],
+                            "ts": _renew_info["ts"],
+                        })
+                        # Lokale room-Referenz aktualisieren damit history-Block
+                        # im nächsten Turn aus dem kompakten Seed baut
+                        room = _rr_room2 or _rr_room
+
+                # Kleiner Rate-Gap (verhindert Overload bei Free-Tier-Providers)
+                await asyncio.sleep(0.5)
+
+        # Fertig
+        fresh = _load_arena_rooms()
+        rr = next((r for r in fresh if r.get("id") == room_id), None)
+        if rr:
+            rr["status"] = "idle"
+            _save_arena_rooms(fresh)
+        await _broadcast_all_ws({
+            "type": "arena.status",
+            "room_id": room_id,
+            "status": "idle",
+            "mode": "trialog",
+            "reason": "rounds_complete",
+        })
+        print(f"[Trialog] room {room_id[:8]} fertig — {turn_counter} Turns")
+
+    except asyncio.CancelledError:
+        fresh = _load_arena_rooms()
+        rr = next((r for r in fresh if r.get("id") == room_id), None)
+        if rr:
+            rr["status"] = "stopped"
+            _save_arena_rooms(fresh)
+        raise
+    except Exception as e:
+        print(f"[Trialog] Fehler room {room_id[:8]}: {type(e).__name__}: {e}")
+        fresh = _load_arena_rooms()
+        rr = next((r for r in fresh if r.get("id") == room_id), None)
+        if rr:
+            rr["status"] = "error"
+            _save_arena_rooms(fresh)
+    finally:
+        # In-memory Flag zurücksetzen damit Restart möglich ist
+        if room_id in _arena_rooms:
+            _arena_rooms[room_id]["running"] = False
+
+
+async def _trialog_exec_turn(
+    bot: dict,
+    prompt_text: str,
+    system_prompt: str,
+    cwd: str = "C:/Users/Robin/Jarvis",
+    timeout_sec: int = 240,
+    read_only: bool = False,
+) -> tuple[str, dict, str | None]:
+    """Per-Provider-Exec-Dispatch für Phase 2 (write) + Phase 3 (read-only).
+
+    write (default):
+      - claude-cli  → --permission-mode bypassPermissions (volle MCP-Tools)
+      - codex-cli   → exec --sandbox workspace-write --full-auto
+      - gemini-cli  → --approval-mode yolo -s (sandboxed)
+
+    read-only (Phase 3):
+      - claude-cli  → --tools Read,Glob,Grep
+      - codex-cli   → exec --sandbox read-only
+      - gemini-cli  → --approval-mode plan
+
+    Text-only Provider (claude-api, openai, openclaw) fallen auf LLM-only
+    mit Disclaimer zurück.
+    """
+    import time as _t
+
+    bot_provider = (bot.get("provider") or "claude-cli").strip()
+    bot_model = (bot.get("model") or "").strip()
+    t0 = _t.time()
+    _suffix = "-read" if read_only else "-exec"
+
+    # --- Claude-CLI ------------------------------------------------------
+    if bot_provider == "claude-cli":
+        cmd = [
+            CLAUDE_EXE, "-p",
+            "--output-format", "text",
+            "--max-turns", "8" if read_only else "25",
+        ]
+        if read_only:
+            cmd.extend(["--tools", "Read,Glob,Grep"])
+        else:
+            cmd.extend(["--permission-mode", "bypassPermissions"])
+        if bot_model:
+            cmd.extend(["--model", bot_model])
+        stdin_text = f"<system>\n{system_prompt}\n</system>\n\n{prompt_text}"
+        return await _run_exec_subprocess(
+            cmd, stdin_text, cwd, timeout_sec, "claude-cli" + _suffix,
+        )
+
+    # --- Codex-CLI -------------------------------------------------------
+    if bot_provider == "codex-cli":
+        from llm_client import _resolve_codex_exe, _codex_is_logged_in
+        codex_exe = _resolve_codex_exe()
+        if not _codex_is_logged_in():
+            return "", {}, "codex nicht eingeloggt (codex login)"
+        cmd = [
+            codex_exe, "exec",
+            "--sandbox", "read-only" if read_only else "workspace-write",
+            "--skip-git-repo-check",
+            "-C", cwd,
+        ]
+        if not read_only:
+            cmd.append("--full-auto")
+        if bot_model:
+            cmd.extend(["-m", bot_model])
+        cmd.append("-")
+        stdin_text = f"<system>\n{system_prompt}\n</system>\n\n{prompt_text}"
+        return await _run_exec_subprocess(
+            cmd, stdin_text, cwd, timeout_sec, "codex-cli" + _suffix,
+        )
+
+    # --- Gemini-CLI ------------------------------------------------------
+    if bot_provider == "gemini-cli":
+        from llm_client import _resolve_gemini_exe, _gemini_is_logged_in
+        gemini_exe = _resolve_gemini_exe()
+        if not _gemini_is_logged_in():
+            return "", {}, "gemini nicht eingeloggt (gemini interaktiv starten)"
+        cmd = [
+            gemini_exe, "-p", "",
+            "-o", "stream-json",
+            "--skip-trust",
+            "--approval-mode", "plan" if read_only else "yolo",
+        ]
+        if not read_only:
+            cmd.append("-s")
+        if bot_model:
+            cmd.extend(["-m", bot_model])
+        stdin_text = f"<system>\n{system_prompt}\n</system>\n\n{prompt_text}"
+        return await _run_exec_subprocess(
+            cmd, stdin_text, cwd, timeout_sec,
+            "gemini-cli" + _suffix, parse_stream_json=True,
+        )
+
+    # --- Text-Only Fallback -----------------------------------------------
+    # Provider ohne Exec-Unterstützung: wir degradieren auf LLM-only
+    # mit klarem Disclaimer im Output damit User sieht warum nichts passiert.
+    from llm_client import invoke_llm, Message, TextDelta, ErrorEvent, MessageStop, UsageEvent
+    full_text, usage, err = await _llm_oneshot(
+        provider=bot_provider,
+        model=bot_model,
+        user_message=prompt_text,
+        system=system_prompt + "\n\n(Hinweis: Du kannst für diesen Provider aktuell "
+                               "keine Dateien schreiben. Beschreibe was du tun WÜRDEST.)",
+        max_tokens=1500,
+    )
+    return (full_text or "", usage or {}, err)
+
+
+async def _run_exec_subprocess(
+    cmd: list,
+    stdin_text: str,
+    cwd: str,
+    timeout_sec: int,
+    label: str,
+    parse_stream_json: bool = False,
+) -> tuple[str, dict, str | None]:
+    """Gemeinsame Subprocess-Execution für die drei CLI-Provider.
+
+    Liest stdout bis EOF, sammelt alle Text-Chunks. Bei parse_stream_json:
+    versucht JSONL zu parsen (Gemini-Format), fällt bei Fehler auf raw text
+    zurück.
+    """
+    import asyncio as _asyncio
+    import time as _t
+
+    subprocess_flags = 0
+    if os.name == "nt":
+        subprocess_flags = 0x08000000  # CREATE_NO_WINDOW
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE,
+            cwd=cwd,
+            limit=8 * 1024 * 1024,
+            creationflags=subprocess_flags if os.name == "nt" else 0,
+        )
+    except FileNotFoundError:
+        return "", {}, f"{label}: executable nicht gefunden"
+    except Exception as e:
+        return "", {}, f"{label} spawn failed: {e}"
+
+    try:
+        proc.stdin.write(stdin_text.encode("utf-8"))
+        await proc.stdin.drain()
+        proc.stdin.close()
+    except Exception as e:
+        proc.kill()
+        await proc.wait()
+        return "", {}, f"{label} stdin failed: {e}"
+
+    full_text = ""
+    usage: dict = {}
+    t0 = _t.time()
+    try:
+        stdout_bytes = await asyncio.wait_for(proc.stdout.read(), timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return "", {}, f"{label} timeout nach {timeout_sec}s"
+
+    out = stdout_bytes.decode("utf-8", errors="replace")
+
+    if parse_stream_json:
+        # Gemini-Format: JSONL mit {type: message, role: assistant, content, delta}
+        for line in out.splitlines():
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "message" and ev.get("role") == "assistant":
+                c = ev.get("content")
+                if isinstance(c, str):
+                    full_text += c
+            elif ev.get("type") == "result":
+                stats = ev.get("stats") or {}
+                if stats:
+                    usage = {
+                        "input_tokens": int(stats.get("input_tokens", 0) or 0),
+                        "output_tokens": int(stats.get("output_tokens", 0) or 0),
+                    }
+    else:
+        # Plain text output (claude-cli -p text, codex exec default)
+        full_text = out.strip()
+
+    if not full_text:
+        return "", usage, f"{label} lieferte leere Antwort"
+
+    return full_text, usage, None
+
+
+async def _trialog_orchestrator_call(room_id: str, current_turn: int = 0) -> None:
+    """Orchestrator-Tick: liest die bisherige Konversation, generiert eine
+    strukturierte Zusammenfassung (Dissens/Konsens/Aktionspunkte/Nächster
+    Impuls) und injiziert sie als role=orchestrator Message in den Room.
+
+    Provider für den Orchestrator ist konfigurierbar via room.orchestrator_provider
+    (default claude-cli/sonnet) — bewusst unabhängig von den Teilnehmer-Bots,
+    damit eine neutrale Meta-Sicht entsteht.
+
+    `current_turn` ist der Trialog-Loop-Turn-Counter (1-basiert, analog Bot-Messages).
+    Wird fürs UI verwendet damit Orchestrator im selben Turn-Nummern-Raum wie die
+    Bots angezeigt wird (nicht als Message-Index).
+    """
+    t0 = datetime.now()
+    # "Thinking"-Indicator für Orchestrator — damit UI wie bei Bots anzeigt
+    # dass gerade gerechnet wird
+    await _broadcast_all_ws({
+        "type": "arena.thinking",
+        "room_id": room_id,
+        "bot_name": "Orchestrator",
+        "bot_color": "#eab308",
+        "turn": current_turn,
+        "role": "orchestrator",
+    })
+    rooms = _load_arena_rooms()
+    room = _get_arena_room(rooms, room_id)
+    if not room:
+        return
+
+    o_provider = (room.get("orchestrator_provider") or "claude-cli").strip()
+    o_model = (room.get("orchestrator_model") or "sonnet").strip()
+    topic = room.get("topic") or room.get("title") or ""
+    bot_names = [b.get("name", "?") for b in (room.get("bots") or [])]
+
+    # Letzte ~40 Bot-Messages als Diskussionsgrundlage (analog classic Arena)
+    recent_msgs = []
+    for m in (room.get("messages") or [])[-40:]:
+        role = m.get("role") or ""
+        name = m.get("bot_name") or m.get("name") or "?"
+        content = (m.get("content") or m.get("text") or "").strip()
+        if not content:
+            continue
+        if role in ("orchestrator", "approval"):
+            continue
+        recent_msgs.append(f"{name}: {content[:400]}")
+    if not recent_msgs:
+        return
+
+    history_block = "\n\n".join(recent_msgs)
+
+    # Classic-Arena-kompatibles Format: ACTION-Zeilen + VERDICT-Marker
+    # damit das existing Frontend (arena.js) daraus Approve-Buttons macht
+    # und Robin die Aktionen wie gewohnt freigeben kann.
+    system_prompt = (
+        "Du bist der Orchestrator einer Bot-Diskussion. Robin ist kein reiner "
+        "Entwickler — schreib verstaendlich, in Alltagssprache.\n\n"
+        "Format (STRIKT einhalten):\n\n"
+        "**Worum es geht**\n"
+        "1-2 Saetze, was die Bots gerade besprechen.\n\n"
+        "**Was koennen wir umsetzen**\n"
+        "Fuer JEDE konkret umsetzbare Aktion genau EINE Zeile im Format:\n"
+        "[ACTION:BotName] <Was passiert und was bringt das — max 12 Woerter> — "
+        "Datei: <Dateiname>, Funktion: <Funktionsname oder Route>\n\n"
+        "Regeln fuer ACTION-Zeilen:\n"
+        "- BotName = Name eines Teilnehmer-Bots aus {" + ", ".join(bot_names) + "}\n"
+        "- Datei + Funktion nur angeben wenn du sie aus der Diskussion sicher "
+        "ableiten kannst — sonst weglassen\n"
+        "- Keine vagen Ideen, nur konkrete umsetzbare Schritte\n"
+        "- Deutsch, knapp, Alltagssprache\n\n"
+        "Nach den ACTION-Zeilen in einer eigenen letzten Zeile EXAKT einen "
+        "dieser Marker setzen:\n"
+        "[VERDICT:ongoing]   - Bots bringen noch neue Punkte, weiterdiskutieren lohnt\n"
+        "[VERDICT:consensus] - Plan steht, Robin sollte die ACTIONs pruefen+freigeben\n"
+        "[VERDICT:stalemate] - Bots drehen sich im Kreis, Robin muss eingreifen\n\n"
+        "HARTE REGEL zu Runden/Aufwand:\n"
+        "Falls du Aufwand in Runden nennst: HARTE OBERGRENZE 10 Runden. Niemals "
+        "hoehere Zahlen, passt nicht in 10: in kleinere [ACTION]-Schritte aufteilen."
+    )
+    user_prompt = (
+        f"Thema: {topic}\n"
+        f"Teilnehmer: {', '.join(bot_names)}\n\n"
+        f"Diskussion:\n{history_block}"
+    )
+
+    try:
+        answer, usage, err = await _llm_oneshot(
+            provider=o_provider,
+            model=o_model,
+            user_message=user_prompt,
+            system=system_prompt,
+            max_tokens=500,
+        )
+    except Exception as e:
+        answer = ""
+        usage = {}
+        err = f"{type(e).__name__}: {e}"
+
+    duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
+
+    if err or not answer:
+        print(f"[Trialog] orchestrator failed room={room_id[:8]}: {err}")
+        return
+
+    # Classic-Arena-kompatibel: role=orchestrator + name=Orchestrator + verdict
+    # damit die existing arena.js-UI die ACTION-Zeilen parsed und Approve-
+    # Buttons rendert. turn-Feld für Dedup im Frontend.
+    verdict = "ongoing"
+    low = answer.lower()
+    if "[verdict:consensus]" in low:
+        verdict = "consensus"
+    elif "[verdict:stalemate]" in low:
+        verdict = "stalemate"
+
+    msg = {
+        "role": "orchestrator",
+        "name": "Orchestrator",
+        "bot_name": "Orchestrator",
+        "color": "#eab308",
+        "bot_color": "#eab308",
+        "provider": o_provider,
+        "model": o_model,
+        "content": answer.strip(),
+        "text": answer.strip(),
+        "verdict": verdict,
+        "timestamp": datetime.now().isoformat(),
+        "duration_ms": duration_ms,
+        "usage": usage,
+        "turn": current_turn if current_turn > 0 else len(room.get("messages", [])),
+    }
+    # Persistieren
+    fresh = _load_arena_rooms()
+    rr = _get_arena_room(fresh, room_id)
+    if rr:
+        rr.setdefault("messages", []).append(msg)
+        rr["orchestrator_summary"] = answer.strip()
+        rr["last_active"] = datetime.now().isoformat()
+        _save_arena_rooms(fresh)
+
+    await _broadcast_all_ws({
+        "type": "arena.message",
+        "room_id": room_id,
+        "message": msg,
+    })
+    print(f"[Trialog] orchestrator tick room={room_id[:8]} via {o_provider}/{o_model} ({duration_ms}ms)")
+
+
+async def api_arena_trialog_start(request):
+    """POST /api/arena/trialog/start — legt einen Multi-Model-Trialog-Raum an
+    und startet die Round-Robin-Loop.
+
+    Body: {
+      title?, topic, max_rounds?,
+      bots: [{name, provider, model, persona?, color?}, …]  (2-4 Bots)
+    }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    topic = (body.get("topic") or "").strip()
+    if not topic:
+        return web.json_response({"ok": False, "error": "topic erforderlich"}, status=400)
+
+    bots = body.get("bots") or []
+    if not isinstance(bots, list) or len(bots) < 2 or len(bots) > 6:
+        return web.json_response(
+            {"ok": False, "error": "2-6 Bots erforderlich"}, status=400,
+        )
+
+    # Default-Persona falls leer, Colors falls leer
+    from llm_client import PROVIDER_NAMES as _PN
+    color_palette = ["#6366f1", "#22c55e", "#f59e0b", "#ec4899", "#a78bfa", "#14b8a6"]
+    cleaned_bots = []
+    for i, b in enumerate(bots):
+        if not isinstance(b, dict):
+            continue
+        provider = (b.get("provider") or "claude-cli").strip()
+        if provider not in _PN:
+            return web.json_response(
+                {"ok": False, "error": f"Unbekannter Provider {provider!r}"},
+                status=400,
+            )
+        cleaned_bots.append({
+            "name": (b.get("name") or f"Bot-{i+1}").strip(),
+            "provider": provider,
+            "model": (b.get("model") or "").strip(),
+            "persona": (b.get("persona") or "Du bist ein hilfreicher Diskussionspartner.").strip(),
+            "color": b.get("color") or color_palette[i % len(color_palette)],
+        })
+
+    room = {
+        "id": str(uuid.uuid4()),
+        "title": (body.get("title") or f"Trialog — {topic[:40]}").strip(),
+        "topic": topic,
+        "category": "trialog",
+        "mode": "trialog",
+        "bots": cleaned_bots,
+        "messages": [],
+        "max_rounds": max(1, min(10, int(body.get("max_rounds", 3)))),
+        # Orchestrator-Config. Default: alle 9 Turns (= nach 3 vollen Runden
+        # bei 3 Bots — analog classic Arena mit ~10). Neutraler Provider
+        # claude-cli/sonnet. 0 deaktiviert den Orchestrator komplett.
+        "summarize_every": int(body.get("summarize_every", 9)),
+        "orchestrator_provider": (body.get("orchestrator_provider") or "claude-cli").strip(),
+        "orchestrator_model": (body.get("orchestrator_model") or "sonnet").strip(),
+        "created": datetime.now().isoformat(),
+        "last_active": datetime.now().isoformat(),
+        "status": "idle",
+    }
+
+    rooms = _load_arena_rooms()
+    rooms.append(room)
+    _save_arena_rooms(rooms)
+
+    # Loop starten (Background-Task)
+    task = asyncio.create_task(_run_trialog(room["id"], rooms))
+    _trialog_tasks[room["id"]] = task
+
+    return web.json_response({"ok": True, "room": room}, status=201)
+
+
+async def api_arena_trialog_read(request):
+    """POST /api/arena/trialog/{id}/read — Read-Mode aktivieren.
+    Body: {"turns": N} — N Bot-Turns im read-only-Modus (Claude: Read/Glob/Grep,
+    Codex: --sandbox read-only, Gemini: --approval-mode plan).
+
+    Zweck: Bots sollen ihre Argumente mit echten Fakten aus der Codebase
+    belegen können, ohne Schreibrechte. Weniger invasiv als /execute.
+    """
+    room_id = request.match_info.get("id", "")
+    try:
+        body = await request.json() if request.content_length else {}
+    except Exception:
+        body = {}
+    turns = max(1, min(int(body.get("turns", 3)), 10))
+
+    rooms = _load_arena_rooms()
+    room = _get_arena_room(rooms, room_id)
+    if not room:
+        return web.json_response({"ok": False, "error": "Room nicht gefunden"}, status=404)
+
+    room["read_enabled"] = True
+    room["read_turns_left"] = turns
+    _save_arena_rooms(rooms)
+
+    await _broadcast_all_ws({
+        "type": "arena.mode_change",
+        "room_id": room_id,
+        "mode": "read",
+        "turns_left": turns,
+    })
+    return web.json_response({"ok": True, "read_turns_left": turns})
+
+
+async def api_arena_trialog_stop(request):
+    """POST /api/arena/trialog/{id}/stop — bricht einen laufenden Trialog ab."""
+    room_id = request.match_info.get("id", "")
+    task = _trialog_tasks.get(room_id)
+    if task and not task.done():
+        task.cancel()
+    rooms = _load_arena_rooms()
+    room = next((r for r in rooms if r.get("id") == room_id), None)
+    if room:
+        room["status"] = "stopped"
+        _save_arena_rooms(rooms)
+    return web.json_response({"ok": True, "room_id": room_id})
 
 
 async def api_arena_update(request):
@@ -3947,6 +8116,142 @@ async def api_arena_orchestrator_chat(request):
     return web.json_response({"response": response})
 
 
+ARENA_SNAPSHOTS_DIR = Path("C:/Users/Robin/Jarvis/data/arena-snapshots")
+
+
+async def api_arena_snapshot(request):
+    """POST /api/arena/rooms/{id}/snapshot  -  Save a named checkpoint of the current room state."""
+    room_id = request.match_info["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    label = (body.get("label") or "").strip() or datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    rooms = _load_arena_rooms()
+    room = _get_arena_room(rooms, room_id)
+    if not room:
+        raise web.HTTPNotFound(reason="Room not found")
+
+    ARENA_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_title = "".join(c if c.isalnum() or c in "-_" else "_" for c in room.get("title", room_id))[:40]
+    fname = f"{ts}_{safe_title}.json"
+    snapshot = {
+        "snapshot_at": datetime.now().isoformat(),
+        "label": label,
+        "room_id": room_id,
+        "title": room.get("title"),
+        "topic": room.get("topic"),
+        "messages": room.get("messages", []),
+        "orchestrator_summary": room.get("orchestrator_summary"),
+    }
+    (ARENA_SNAPSHOTS_DIR / fname).write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # Manuell gemerkten Stand auch in consensus_marks eintragen, damit er in Bot-Prompts fliesst
+    orch_summary = (room.get("orchestrator_summary") or "").strip()
+    mark_summary = label
+    if orch_summary:
+        mark_summary += ": " + orch_summary[:250]
+    room.setdefault("consensus_marks", []).append({
+        "turn": len(room.get("messages", [])),
+        "at": datetime.now().isoformat(),
+        "msg_count": len(room.get("messages", [])),
+        "summary": mark_summary[:300],
+        "manual": True,
+        "file": fname,
+    })
+    _save_arena_rooms(rooms)
+
+    return web.json_response({"ok": True, "file": fname, "label": label, "messages": len(snapshot["messages"])})
+
+
+def _list_room_snapshots(room_id: str) -> list:
+    """Return snapshot metadata for a room (index info, no message contents)."""
+    if not ARENA_SNAPSHOTS_DIR.exists():
+        return []
+    result = []
+    for f in sorted(ARENA_SNAPSHOTS_DIR.glob("*.json"), reverse=True):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if data.get("room_id") == room_id:
+                result.append({
+                    "file": f.name,
+                    "label": data.get("label"),
+                    "snapshot_at": data.get("snapshot_at"),
+                    "messages": len(data.get("messages", [])),
+                })
+        except Exception:
+            pass
+    return result
+
+
+async def api_arena_snapshots_list(request):
+    """GET /api/arena/rooms/{id}/snapshots  -  List saved snapshots for a room."""
+    room_id = request.match_info["id"]
+    return web.json_response(_list_room_snapshots(room_id))
+
+
+async def api_arena_consensus_mark_delete(request):
+    """DELETE /api/arena/rooms/{id}/consensus_marks/{index}  -  Remove a poisoned consensus mark."""
+    room_id = request.match_info["id"]
+    try:
+        idx = int(request.match_info["index"])
+    except ValueError:
+        raise web.HTTPBadRequest(reason="index must be int")
+    rooms = _load_arena_rooms()
+    room = _get_arena_room(rooms, room_id)
+    if not room:
+        raise web.HTTPNotFound(reason="Room not found")
+    marks = room.get("consensus_marks") or []
+    if idx < 0 or idx >= len(marks):
+        raise web.HTTPNotFound(reason="Mark index out of range")
+    removed = marks.pop(idx)
+    room["consensus_marks"] = marks
+    _save_arena_rooms(rooms)
+    return web.json_response({"ok": True, "removed": removed, "remaining": len(marks)})
+
+
+async def api_arena_unclear(request):
+    """POST /api/arena/rooms/{id}/unclear  -  Persist or remove an unclear action in room state."""
+    room_id = request.match_info["id"]
+    body = await request.json()
+    action_text = (body.get("text") or "").strip()
+    bot_name = (body.get("bot") or "").strip()
+    msg_idx = body.get("msgIdx")  # original message index for back-reference
+    msg_ts = (body.get("msgTimestamp") or "").strip()
+    remove = bool(body.get("remove", False))
+    if not action_text:
+        raise web.HTTPBadRequest(reason="text required")
+    rooms = _load_arena_rooms()
+    room = _get_arena_room(rooms, room_id)
+    if not room:
+        raise web.HTTPNotFound(reason="Room not found")
+    unclear = room.setdefault("unclear_actions", [])
+    if remove:
+        before = len(unclear)
+        room["unclear_actions"] = [u for u in unclear if u.get("text") != action_text]
+        _save_arena_rooms(rooms)
+        return web.json_response({"ok": True, "removed": before - len(room["unclear_actions"])})
+    # Avoid duplicates
+    if any(u.get("text") == action_text for u in unclear):
+        return web.json_response({"ok": True, "dup": True, "count": len(unclear)})
+    entry = {
+        "text": action_text,
+        "bot": bot_name,
+        "at": datetime.now().isoformat(),
+    }
+    if msg_idx is not None:
+        entry["msgIdx"] = int(msg_idx)
+    if msg_ts:
+        entry["msgTimestamp"] = msg_ts
+    unclear.append(entry)
+    _save_arena_rooms(rooms)
+    return web.json_response({"ok": True, "count": len(unclear)})
+
+
 async def api_arena_summarize(request):
     """POST /api/arena/rooms/{id}/summarize  -  Generate orchestrator summary on demand."""
     room_id = request.match_info["id"]
@@ -3960,25 +8265,31 @@ async def api_arena_summarize(request):
     # Save summary to room
     room["orchestrator_summary"] = summary
     room["orchestrator_summary_at"] = datetime.now().isoformat()
+    _extract_and_store_action_items(room, summary)
     _save_arena_rooms(rooms)
 
-    # Also add as system message
+    # Also add as system message — but skip if last message is already an orchestrator Fazit
+    messages = room.get("messages", [])
+    last_msg = messages[-1] if messages else None
+    already_fazit = last_msg and last_msg.get("role") == "orchestrator"
     msg = {
         "role": "orchestrator",
         "name": "Orchestrator",
         "content": summary,
         "timestamp": datetime.now().isoformat(),
         "color": "#a855f7",
-        "turn": len(room.get("messages", [])),
+        "turn": len(messages),
     }
-    room["messages"].append(msg)
-    _save_arena_rooms(rooms)
-
-    await _broadcast_all_ws({
-        "type": "arena.message",
-        "room_id": room_id,
-        "message": msg,
-    })
+    if not already_fazit:
+        room["messages"].append(msg)
+        _save_arena_rooms(rooms)
+        await _broadcast_all_ws({
+            "type": "arena.message",
+            "room_id": room_id,
+            "message": msg,
+        })
+    else:
+        _save_arena_rooms(rooms)
 
     return web.json_response({"summary": summary})
 
@@ -4048,10 +8359,91 @@ async def api_arena_approve(request):
             "topic": room.get("topic", ""),
         })
 
+    # Persist rejected actions to fail-backlog so they survive to next session
+    if rejected:
+        _append_fail_backlog([{
+            "kind": "rejected",
+            "action": r,
+            "reason": rej_reason or "",
+            "room_id": room_id,
+            "topic": room.get("topic", ""),
+            "timestamp": datetime.now().isoformat(),
+        } for r in rejected])
+
+    # Assigned-bot confirmation: each bot with ≥1 assigned action posts one sentence
+    _BOT_COLORS = {"Alpha": "#6366f1", "Beta": "#22c55e", "Gamma": "#f59e0b", "Delta": "#ec4899"}
+    _import_re = __import__("re")
+    _bot_actions: dict = {}
+    for a in actions:
+        m = _import_re.match(r"^\[([A-Za-z][A-Za-z0-9_-]*)\]\s*(.+)", a.strip())
+        if m:
+            bname = m.group(1)
+            _bot_actions.setdefault(bname, []).append(m.group(2).strip())
+    for bname, btasks in _bot_actions.items():
+        n = len(btasks)
+        task_preview = btasks[0][:60] + ("…" if len(btasks[0]) > 60 else "")
+        confirm_text = (
+            f"Verstanden — ich übernehme {'diese Aufgabe' if n == 1 else f'diese {n} Aufgaben'}: „{task_preview}\u201c"
+            + (f" (+{n-1} weitere)" if n > 1 else "")
+            + " — läuft."
+        )
+        conf_msg = {
+            "role": "assistant",
+            "name": bname,
+            "content": confirm_text,
+            "timestamp": datetime.now().isoformat(),
+            "color": _BOT_COLORS.get(bname, "#9ca3af"),
+            "turn": len(room.get("messages", [])),
+        }
+        room["messages"].append(conf_msg)
+        _save_arena_rooms(rooms)
+        await _broadcast_all_ws({"type": "arena.message", "room_id": room_id, "message": conf_msg})
+
+    # --- Force-Diff-Warnung: wenn Orchestrator schon mal lief (Ideenphase
+    # vorbei) UND eine approved Action von einem Bot kommt der keinen
+    # Code-Block in seinen letzten ~15 Turns gezeigt hat → warnen. Wir
+    # blocken nicht hart (Robin's Freiheit), aber die Warnung landet in
+    # der Response und optional als Info-Message im Raum.
+    force_diff_warnings: list = []
+    if (room.get("orchestrator_summary") or "").strip():
+        recent_msgs = room.get("messages", [])[-20:]
+        for a in actions:
+            m = _import_re.match(r"^\[([A-Za-z][A-Za-z0-9_-]*)\]\s*(.+)", a.strip())
+            if not m:
+                continue
+            bname = m.group(1)
+            had_code = any(
+                ((msg.get("bot_name") or msg.get("name") or "") == bname)
+                and "```" in (msg.get("content") or msg.get("text") or "")
+                for msg in recent_msgs
+            )
+            if not had_code:
+                force_diff_warnings.append(
+                    f"⚠ {bname}: keinen Code-Block/Diff in den letzten Turns gezeigt — "
+                    f"Aktion ist abstrakt. Force-Diff empfiehlt konkreten Patch vor Approve."
+                )
+        if force_diff_warnings:
+            warn_msg = {
+                "role": "system",
+                "name": "System",
+                "content": "**Force-Diff-Warnung:**\n" + "\n".join(force_diff_warnings),
+                "timestamp": datetime.now().isoformat(),
+                "color": "#f59e0b",
+                "turn": len(room.get("messages", [])),
+            }
+            room["messages"].append(warn_msg)
+            _save_arena_rooms(rooms)
+            await _broadcast_all_ws({"type": "arena.message", "room_id": room_id, "message": warn_msg})
+
     # Spawn executor bot in background (does NOT stop the discussion)
     asyncio.ensure_future(_run_executor(room_id, approval_id, actions))
 
-    return web.json_response({"ok": True, "actions": len(actions), "approval_id": approval_id})
+    return web.json_response({
+        "ok": True,
+        "actions": len(actions),
+        "approval_id": approval_id,
+        "force_diff_warnings": force_diff_warnings,
+    })
 
 
 async def api_arena_file_peek(request):
@@ -4296,8 +8688,7 @@ async def api_arena_continue(request):
             _save_arena_rooms(rooms)
             await _broadcast_all_ws({"type": "arena.message", "room_id": room_id, "message": stale_msg})
         else:
-            _arena_rooms[room_id] = {"running": True, "process": None}
-            asyncio.create_task(_run_arena(room_id))
+            _spawn_for_room(room_id, rooms)
 
     return web.json_response({"ok": True})
 
@@ -4500,14 +8891,21 @@ async def _update_approval_action(room_id: str, approval_id: str, action_idx: in
     rooms = _load_arena_rooms()
     room = _get_arena_room(rooms, room_id)
     action_text = ""
+    already_feedback = False
     if room:
         for m in room.get("messages", []):
             if m.get("approval_id") == approval_id and m.get("role") == "approval":
                 if 0 <= action_idx < len(m.get("actions", [])):
+                    prev_status = m["actions"][action_idx].get("status")
+                    already_feedback = bool(m["actions"][action_idx].get("_fail_feedback_sent"))
                     m["actions"][action_idx]["status"] = status
                     if result:
                         m["actions"][action_idx]["result"] = result
                     action_text = m["actions"][action_idx].get("text", "")
+                    # Claim-Flag setzen bevor wir den inject-Broadcast abschicken,
+                    # damit ein zweiter paralleler _update-Call keine zweite Nachricht triggert.
+                    if status == "failed" and not already_feedback and prev_status != "failed":
+                        m["actions"][action_idx]["_fail_feedback_sent"] = True
                 break
         _save_arena_rooms(rooms)
     _append_action_log({
@@ -4528,6 +8926,42 @@ async def _update_approval_action(room_id: str, approval_id: str, action_idx: in
         "result": result,
     })
 
+    # Rueck-Inject bei failed: einmalig pro Action, serverseitig (frueher im
+    # Frontend — das feuerte einmal pro verbundenem Client, deshalb
+    # tauchte die Nachricht bei mehreren offenen Tabs/Geraeten doppelt auf).
+    if status == "failed" and room and action_text and not already_feedback:
+        m_bot = re.match(r"^\[([A-Za-z][A-Za-z0-9_-]*)\]\s*(.+)", action_text.strip())
+        bot_name = m_bot.group(1) if m_bot else ""
+        display_text = (m_bot.group(2) if m_bot else action_text).strip()
+        err_lines = [l for l in (result or "").splitlines() if l.strip()]
+        err_reason = (err_lines[0][:150] if err_lines else "unbekannter Fehler")
+        err_excerpt = " | ".join(err_lines[1:4])[:200] if len(err_lines) > 1 else ""
+        target = f"@{bot_name}" if bot_name else "Wer auch immer die Aktion vorgeschlagen hat"
+        feedback_text = (
+            f"[SYSTEM — FAIL-FEEDBACK] {target}: Deine Aktion \"{display_text[:100]}\" ist fehlgeschlagen.\n"
+            f"Grund: {err_reason}"
+            + (f"\nDetails: {err_excerpt}" if err_excerpt else "")
+            + "\n→ Schlage eine KLEINERE, schrittweise Variante vor — nicht das Gleiche nochmal. "
+              "Was ist der minimale erste Schritt, der sicher funktionieren würde?"
+        )
+        feedback_msg = {
+            "role": "robin",
+            "name": "Robin",
+            "content": feedback_text,
+            "timestamp": datetime.now().isoformat(),
+            "color": "#f59e0b",
+        }
+        rooms2 = _load_arena_rooms()
+        room2 = _get_arena_room(rooms2, room_id)
+        if room2:
+            room2.setdefault("messages", []).append(feedback_msg)
+            _save_arena_rooms(rooms2)
+            await _broadcast_all_ws({
+                "type": "arena.message",
+                "room_id": room_id,
+                "message": feedback_msg,
+            })
+
 
 def _detect_file_changes_since(start_ts: float, max_files: int = 20) -> list:
     """Walk the Jarvis repo and return files modified/created since start_ts.
@@ -4546,7 +8980,7 @@ def _detect_file_changes_since(start_ts: float, max_files: int = 20) -> list:
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
             for fn in filenames:
-                if fn.endswith((".pyc", ".log")) or fn.startswith("."):
+                if fn.endswith((".pyc", ".log", ".tmp", ".bak", ".swp", ".swo", ".lock", ".pid", ".cache")) or fn.startswith("."):
                     continue
                 full = os.path.join(dirpath, fn)
                 try:
@@ -4579,6 +9013,7 @@ _LARGE_HINTS = (
     "mehrere module", "system", "pipeline", "neu strukturier",
     "spracherkennung", "voice pipeline", "speech recognition", "audio pipeline",
     "transkription einricht", "tts integrier", "voice system",
+    "chat-reparatur", "chat reparatur", "chat repair", "chat-fix",
 )
 _SMALL_HINTS = (
     "typo", "rechtschreib", "rename", "umbenenn", "log-message", "log message",
@@ -4613,7 +9048,7 @@ def _classify_action_size(action: str) -> str:
     return "medium"
 
 
-async def _run_single_action(topic: str, project_context: str, action: str, executor_bot: dict | None = None, changed_out: list | None = None, size: str | None = None) -> tuple:
+async def _run_single_action(topic: str, project_context: str, action: str, executor_bot: dict | None = None, changed_out: list | None = None, size: str | None = None, predecessor_failure: str | None = None) -> tuple:
     """Run one action via Claude subprocess. Returns (ok, result_text).
 
     Verification: action only counts as 'done' when at least one file was
@@ -4628,6 +9063,8 @@ async def _run_single_action(topic: str, project_context: str, action: str, exec
     """
     tier = size if size in EXECUTOR_BUDGETS else _classify_action_size(action)
     budget = EXECUTOR_BUDGETS[tier]
+    bot_provider = (executor_bot or {}).get("provider") or "claude-cli"
+    bot_model_cfg = (executor_bot or {}).get("model") or ""
     if executor_bot:
         role_intro = (
             f"Du bist {executor_bot.get('name','Executor')} und uebernimmst diesmal die Umsetzer-Rolle "
@@ -4668,6 +9105,51 @@ async def _run_single_action(topic: str, project_context: str, action: str, exec
         f"Wenn die Aktion unmoeglich oder unklar ist: kurz erklaeren warum und Vorschlag was Robin tun soll."
         )
     )
+
+    # --- Provider-Dispatch (Option A: echtes Multi-Provider-Routing) -----
+    # Wenn der Orchestrator [ACTION:GPT] schreibt und GPT als codex-cli
+    # konfiguriert ist, läuft der Executor wirklich via Codex-CLI. Bei
+    # [ACTION:Gemini] via Gemini-CLI. Nur claude-cli nimmt den existing
+    # Pfad mit den Budget-Tiers (haiku/sonnet/opus + max-turns-Guard).
+    if bot_provider in ("codex-cli", "gemini-cli"):
+        bot_label = (executor_bot or {}).get("name", bot_provider)
+        start_ts_routed = time.time() - 1.0
+        try:
+            out_text, usage_r, err_r = await _trialog_exec_turn(
+                bot={
+                    "provider": bot_provider,
+                    "model": bot_model_cfg,
+                    "name": bot_label,
+                    "persona": (executor_bot or {}).get("persona", ""),
+                },
+                prompt_text=prompt,
+                system_prompt="",  # role_intro steckt schon im prompt
+                cwd="C:/Users/Robin/Jarvis",
+                timeout_sec=budget["timeout"],
+                read_only=False,
+            )
+        except Exception as e:
+            return False, f"({bot_provider} crashed: {type(e).__name__}: {e})"
+        if err_r:
+            return False, f"({bot_provider}: {err_r})"
+        if not (out_text or "").strip():
+            return False, f"({bot_provider}: leere Antwort)"
+        # File-change detection ist provider-unabhängig (mtime-basiert)
+        loop = asyncio.get_event_loop()
+        changed_files = await loop.run_in_executor(None, _detect_file_changes_since, start_ts_routed)
+        if changed_out is not None:
+            changed_out.extend(changed_files or [])
+        if not changed_files:
+            return None, (
+                out_text
+                + f"\n\n(Haengend: {bot_provider} hat geantwortet, aber keine Datei geaendert.)"
+            )
+        files_note = "\n\nGeaenderte Dateien (" + str(len(changed_files)) + "): " + ", ".join(changed_files[:10])
+        if len(changed_files) > 10:
+            files_note += ", ..."
+        return True, f"[via {bot_provider}/{bot_model_cfg or 'default'}]\n" + out_text + files_note
+
+    # --- Claude-CLI (default/fallback) -----------------------------------
     cmd = [
         CLAUDE_EXE, "-p", prompt,
         "--model", budget["model"],
@@ -4843,8 +9325,13 @@ def _persist_executor_results(room_id: str, topic: str, approval_id: str,
 
 ARENA_EXECUTOR_MAX_PARALLEL = 5  # Hard cap: parallele Executor-Aktionen — schuetzt Context/Token-Budget
 
-async def _run_executor(room_id: str, approval_id: str, actions: list):
-    """Execute approved actions in parallel (max ARENA_EXECUTOR_MAX_PARALLEL at once) with per-action status broadcasts."""
+async def _run_executor(room_id: str, approval_id: str, actions: list, skip_done: bool = False):
+    """Execute approved actions in parallel (max ARENA_EXECUTOR_MAX_PARALLEL at once) with per-action status broadcasts.
+
+    skip_done: if True, actions whose persisted status is already terminal
+    (done/failed/skipped) are skipped — used by the executor auto-resume hook
+    so a restarted server doesn't re-run already-finished actions.
+    """
     _activity_set("arena", active=True)
     await _broadcast_all_ws({"type": "arena.started", "room_id": room_id})
     rooms = _load_arena_rooms()
@@ -4857,22 +9344,94 @@ async def _run_executor(room_id: str, approval_id: str, actions: list):
     results = [None] * len(actions)
     sem = asyncio.Semaphore(ARENA_EXECUTOR_MAX_PARALLEL)
 
-    # Rotierende Executor-Rolle: jeder Bot kommt reihum dran.
+    _TERMINAL_STATUSES = {"done", "failed", "skipped"}
+    _done_idx: set = set()
+    if skip_done:
+        for _m in room.get("messages", []):
+            if _m.get("role") == "approval" and _m.get("approval_id") == approval_id:
+                for _i, _a in enumerate(_m.get("actions") or []):
+                    if (_a or {}).get("status") in _TERMINAL_STATUSES:
+                        _done_idx.add(_i)
+                        results[_i] = (_a.get("text", ""), _a.get("status") == "done", _a.get("result", ""))
+                break
+        if _done_idx:
+            print(f"[ArenaExecResume] approval={approval_id[:8]} skipping {len(_done_idx)} already-terminal action(s)")
+
+    # Bot-Zuordnung: PRIMÄR über [BotName]-Prefix in der Action selbst
+    # (der Orchestrator schreibt [ACTION:BotName] und das Frontend propagiert
+    # es als "[BotName] text" in actions-Array). Das bedeutet: wenn der
+    # Orchestrator [ACTION:GPT] schreibt, wird die Aktion wirklich von Codex
+    # ausgeführt, [ACTION:Gemini] → Gemini-CLI, [ACTION:Claude] → Claude-CLI.
+    # Fallback nur wenn Action keinen Prefix hat: Rotations-Bot.
+    import re as _re
     bots_list = [b for b in room.get("bots", []) if b.get("name")]
+    _bots_by_name = {b.get("name", "").lower(): b for b in bots_list}
     rot_idx = int(room.get("executor_rotation_idx", 0))
-    active_bot = bots_list[rot_idx % len(bots_list)] if bots_list else None
+    fallback_bot = bots_list[rot_idx % len(bots_list)] if bots_list else None
     if bots_list:
         room["executor_rotation_idx"] = (rot_idx + 1) % len(bots_list)
-        _save_arena_rooms(rooms)
+
+    def _bot_for_action(action_text: str) -> dict | None:
+        """Parse [BotName]-Prefix aus der Action, lookup in room.bots."""
+        m = _re.match(r"^\[([A-Za-z][A-Za-z0-9_-]*)\]", (action_text or "").strip())
+        if m:
+            bot = _bots_by_name.get(m.group(1).lower())
+            if bot:
+                return bot
+        return fallback_bot
+
+    # Keep old variable name for downstream logging (executor_checkpoint)
+    active_bot = fallback_bot
+    # Executor-Checkpoint: wird bei jedem Action-Complete gebumpt. Ueberlebt
+    # MC-Crash via _save_arena_rooms, der naechste Seed sieht "completed<total"
+    # und kann Bots informieren dass ein Batch unterbrochen war.
+    room["executor_checkpoint"] = {
+        "approval_id": approval_id,
+        "completed": 0,
+        "total": len(actions),
+        "status": "running",
+        "started_at": datetime.now().isoformat(),
+        "bot": (active_bot or {}).get("name"),
+    }
+    _save_arena_rooms(rooms)
 
     async def run_one(idx, action):
+        if idx in _done_idx:
+            return
         async with sem:
             await _update_approval_action(room_id, approval_id, idx, "running")
             changed_seen: list = []
-            ok, result_text = await _run_single_action(topic, project_context, action, active_bot, changed_out=changed_seen)
+            # Route nach dem im Action-Tag angegebenen Bot (echter Provider-
+            # Dispatch), Fallback auf Rotations-Bot wenn kein [Name]-Prefix.
+            per_action_bot = _bot_for_action(action)
+            ok, result_text = await _run_single_action(topic, project_context, action, per_action_bot, changed_out=changed_seen)
             status = "done" if ok is True else ("haengend" if ok is None else "failed")
             await _update_approval_action(room_id, approval_id, idx, status, result_text[:500])
             results[idx] = (action, ok, result_text)
+            # Checkpoint bump — reload/save (race-tolerant: last-write-wins reicht als Fortschrittsanzeige)
+            try:
+                _rooms_cp = _load_arena_rooms()
+                _room_cp = _get_arena_room(_rooms_cp, room_id)
+                if _room_cp is not None:
+                    _cp = _room_cp.get("executor_checkpoint") or {}
+                    if _cp.get("approval_id") == approval_id:
+                        _cp["completed"] = int(_cp.get("completed", 0)) + 1
+                        _cp["last_action_at"] = datetime.now().isoformat()
+                        _room_cp["executor_checkpoint"] = _cp
+                        _save_arena_rooms(_rooms_cp)
+            except Exception as _cp_err:
+                print(f"[arena] checkpoint bump failed: {_cp_err}")
+            # Fehlgeschlagene Aktionen in Fail-Backlog sichern (nächste Session)
+            if ok is False:
+                _append_fail_backlog([{
+                    "kind": "failed",
+                    "action": action,
+                    "reason": (result_text or "")[:300],
+                    "room_id": room_id,
+                    "topic": topic,
+                    "approval_id": approval_id,
+                    "timestamp": datetime.now().isoformat(),
+                }])
             # Erfolgreiche Aktionen in Raumzustand persistieren (Dedup-Basis für künftige Approvals)
             if ok:
                 _rooms_done = _load_arena_rooms()
@@ -4882,6 +9441,10 @@ async def _run_executor(room_id: str, approval_id: str, actions: list):
                     _key = action.strip().lower()
                     if _key not in _room_done["done_actions"]:
                         _room_done["done_actions"].append(_key)
+                    # Sync action_items status to erledigt
+                    for _ai in _room_done.get("action_items", []):
+                        if _ai.get("text", "").lower() == _key or _key.endswith(_ai.get("text", "").lower()):
+                            _ai["status"] = "erledigt"
                     _save_arena_rooms(_rooms_done)
             # Lern-Signal: vergleicht die schnelle Vorschau-Regex mit dem, was
             # der Executor tatsaechlich angefasst hat. Miss/empty/partial landen
@@ -4899,7 +9462,37 @@ async def _run_executor(room_id: str, approval_id: str, actions: list):
             except Exception as _pe:
                 print(f"[arena] preview-outcome log failed: {_pe}")
 
-    await asyncio.gather(*[run_one(i, a) for i, a in enumerate(actions)])
+    # Split actions: "restart MC"-style entries are destructive to siblings (they
+    # kill MC while other tasks are still running), so we defer them. Run regular
+    # actions in parallel first, THEN restart actions serially at the very end.
+    import re as _re
+    _restart_re = _re.compile(r"(mission[- ]?control|\bmc\b).{0,40}(neu[- ]?start|restart)|restart.{0,20}(mission[- ]?control|\bmc\b)", _re.IGNORECASE)
+    regular_items: list = []
+    restart_items: list = []
+    for i, a in enumerate(actions):
+        if _restart_re.search(a or ""):
+            restart_items.append((i, a))
+        else:
+            regular_items.append((i, a))
+    if restart_items:
+        print(f"[arena] {len(restart_items)} restart-action(s) deferred to end (would otherwise kill siblings): {[a for _, a in restart_items]}")
+
+    # Parallel batch of non-restart actions
+    if regular_items:
+        await asyncio.gather(*[run_one(i, a) for i, a in regular_items])
+
+    # Auto-complete "restart MC" actions WITHOUT actually restarting. Running
+    # them used to be destructive: they'd kill MC → kill the executor task that
+    # was supposed to mark its own status → action stayed "running" forever
+    # and Robin saw a phantom hang. Code changes are still picked up — the
+    # watchdog reads the file fresh on the next real MC restart.
+    for i, a in restart_items:
+        if i in _done_idx:
+            continue
+        await _update_approval_action(
+            room_id, approval_id, i, "done",
+            "Restart-Action uebersprungen — Watchdog laedt neuen Code beim naechsten MC-Restart von selbst.",
+        )
 
     # Auto-Persist: fertige Executor-Ergebnisse wandern automatisch in Smart-Tasks
     # (als abgeschlossene Tasks mit Output) + Obsidian-Memory (Tageslog-Eintrag).
@@ -4937,6 +9530,12 @@ async def _run_executor(room_id: str, approval_id: str, actions: list):
     room = _get_arena_room(rooms, room_id)
     if room:
         room["messages"].append(exec_msg)
+        # Checkpoint schliessen — kein "running" mehr, Seed zeigt nichts mehr an
+        _cp_end = room.get("executor_checkpoint") or {}
+        if _cp_end.get("approval_id") == approval_id:
+            _cp_end["status"] = "done"
+            _cp_end["finished_at"] = datetime.now().isoformat()
+            room["executor_checkpoint"] = _cp_end
         _save_arena_rooms(rooms)
     await _broadcast_all_ws({
         "type": "arena.message",
@@ -4959,8 +9558,21 @@ async def _run_executor(room_id: str, approval_id: str, actions: list):
     if room and room.get("auto_continue", True):
         done_count = sum(1 for r in results if r and r[1])
         fail_count = sum(1 for r in results if r and not r[1])
+        # Build per-action output snippets so the reviewer sees the real output,
+        # not just the summary badge. Truncated to 600 chars per action to keep context manageable.
+        output_snippets = []
+        for item in results:
+            if item is None:
+                continue
+            _act, _ok, _txt = item
+            _mark = "OK" if _ok is True else ("HAENGEND" if _ok is None else "FAIL")
+            _snippet = (_txt or "(kein Output)")[:600]
+            output_snippets.append(f"[{_mark}] {_act}\n---\n{_snippet}")
         review_text = (
-            f"Das Executor-Ergebnis liegt vor ({done_count} OK, {fail_count} FAIL). "
+            f"Das Executor-Ergebnis liegt vor ({done_count} OK, {fail_count} FAIL).\n\n"
+            f"=== ECHTER EXECUTOR-OUTPUT ===\n"
+            + "\n\n".join(output_snippets)
+            + f"\n=== ENDE OUTPUT ===\n\n"
             f"Bewertet bitte kurz:\n"
             f"1) Ist das Umgesetzte wirklich so, wie wir es gemeint haben?\n"
             f"2) Was fehlt noch, damit die urspruengliche Aufgabe perfekt ist?\n"
@@ -4980,7 +9592,7 @@ async def _run_executor(room_id: str, approval_id: str, actions: list):
             room2["messages"].append(review_msg)
             _save_arena_rooms(rooms2)
             await _broadcast_all_ws({"type": "arena.message", "room_id": room_id, "message": review_msg})
-            if room_id not in _arena_rooms or not _arena_rooms[room_id].get("running"):
+            if not _arena_task_running(room_id):
                 if _room_is_stale(room2):
                     stale_msg = {
                         "role": "system",
@@ -4993,8 +9605,7 @@ async def _run_executor(room_id: str, approval_id: str, actions: list):
                     _save_arena_rooms(rooms2)
                     await _broadcast_all_ws({"type": "arena.message", "room_id": room_id, "message": stale_msg})
                 else:
-                    _arena_rooms[room_id] = {"running": True, "process": None}
-                    asyncio.create_task(_run_arena(room_id))
+                    _spawn_for_room(room_id, rooms2)
 
 
 def _extract_verdict(summary_raw: str) -> tuple[str, str]:
@@ -5033,8 +9644,9 @@ async def _generate_orchestrator_summary(room):
         f"**Worum es geht** (1-2 Saetze, einfache Sprache, kein Technikjargon)\n\n"
         f"**Was koennen wir umsetzen**\n"
         f"Fuer JEDE moegliche Aktion eine Zeile:\n"
-        f"[ACTION:BotName] <Was passiert, und was bringt das — max 12 Woerter, Alltagssprache>\n"
-        f"BotName = Name des Bots der die Idee hauptsaechlich einbrachte (z.B. Alpha, Beta, Gamma, Delta).\n\n"
+        f"[ACTION:BotName] <Was passiert, und was bringt das — max 12 Woerter, Alltagssprache> — Datei: <Dateiname>, Funktion: <Funktionsname oder Route>\n"
+        f"BotName = Name des Bots der die Idee hauptsaechlich einbrachte (z.B. Alpha, Beta, Gamma, Delta).\n"
+        f"Datei+Funktion: Wenn die Aktion Code betrifft, gib GENAU an wo sie landet (z.B. 'Datei: server.py, Funktion: _generate_orchestrator_summary' oder 'Datei: arena.js, Funktion: renderFazitWithActions'). Nutze den Kontext der mitgelieferten Dateiliste und Routes. Falls nicht eindeutig bestimmbar: weglassen.\n\n"
         f"Regeln:\n"
         f"- Keine Fachbegriffe ohne Erklaerung\n"
         f"- Sag was Robin davon hat, nicht wie es technisch laeuft\n"
@@ -5172,24 +9784,123 @@ async def _arena_healthcheck_bots(bots: list) -> dict:
         else:
             print("[Arena] Health-Check retry fehlgeschlagen — CLI tot", flush=True)
 
+    # Provider, die ihr Default-Modell ohne explizites `model`-Feld nutzen
+    # (codex/gemini leeres model = "benutze was im CLI-Account konfiguriert ist",
+    # openai/claude-api nehmen API-Default).
+    _OPTIONAL_MODEL_PROVIDERS = {
+        "codex-cli", "gemini-cli", "openai", "claude-api", "openclaw",
+    }
     bot_health = {}
     for bot in bots:
         name = bot.get("name") or "(unnamed)"
+        provider = (bot.get("provider") or "claude-cli").strip()
         model = bot.get("model") or ""
         persona = bot.get("persona") or ""
         reasons = []
-        if not model:
+        # Nur für claude-cli ist das Model-Feld Pflicht (haiku/sonnet/opus).
+        # Andere Provider dürfen leer bleiben → Account-Default wird benutzt.
+        if not model and provider not in _OPTIONAL_MODEL_PROVIDERS and provider != "claude-cli":
+            reasons.append("kein Model")
+        if provider == "claude-cli" and not model:
             reasons.append("kein Model")
         if not persona.strip():
             reasons.append("keine Persona")
-        if not cli_ok:
+        # CLI-Ping ist nur für claude-cli-Bots relevant
+        if not cli_ok and provider == "claude-cli":
             reasons.append("Claude-CLI nicht erreichbar")
         bot_health[name] = {
             "alive": not reasons,
             "reason": "ok" if not reasons else ", ".join(reasons),
-            "model": model,
+            "model": model or "(default)",
+            "provider": provider,
         }
     return {"cli_ok": cli_ok, "bots": bot_health}
+
+
+def _build_arena_memory_block(room_dict) -> str:
+    """Gemerkter Stand fuer Bot-Prompts: letztes Orchestrator-Fazit +
+    bereits umgesetzte Executor-Aktionen. Ziel: Bots wiederholen nicht,
+    was schon etabliert / erledigt ist."""
+    parts = []
+
+    orch = (room_dict.get("orchestrator_summary") or "").strip()
+    if orch:
+        # VERDICT-Marker rausstrippen — brauchen Bots nicht, verwirrt nur
+        import re as _re
+        cleaned = _re.sub(r"\[VERDICT:[^\]]+\]", "", orch).strip()
+        if cleaned:
+            parts.append(
+                "Bisheriger Stand (letztes Orchestrator-Fazit — baue darauf auf, "
+                "wiederhole es nicht):\n" + cleaned[:1500]
+            )
+
+    # Letzte Executor-Summaries = schon erledigte Aktionen
+    # "Frisch" = Executor-Msg nach der letzten regulaeren Bot-Msg (noch nicht bestaetigt)
+    all_msgs = (room_dict.get("messages") or [])[-60:]
+    last_bot_ts = ""
+    for m in reversed(all_msgs):
+        if m.get("role") == "bot":
+            last_bot_ts = m.get("timestamp", "")
+            break
+    done_entries = []
+    fresh_entries = []
+    for m in all_msgs:
+        if m.get("role") != "executor":
+            continue
+        body = (m.get("content") or "").strip()
+        if not body:
+            continue
+        msg_ts = m.get("timestamp", "")
+        if last_bot_ts and msg_ts > last_bot_ts:
+            fresh_entries.append(body[:600])
+        else:
+            done_entries.append(body[:600])
+    if fresh_entries:
+        fresh_block = "\n\n".join(fresh_entries[-5:])
+        parts.append(
+            "FRISCH ERLEDIGT — diese Aktionen wurden gerade umgesetzt, noch nicht bestätigt:\n"
+            + fresh_block
+            + "\n\n→ Bitte bestätige im nächsten Turn kurz welche Aktion erledigt wurde (1 Satz), dann diskutier weiter."
+        )
+    if done_entries:
+        done_block = "\n\n".join(done_entries[-3:])
+        parts.append(
+            "Bereits umgesetzte Aktionen (NICHT erneut vorschlagen, aufbauen statt wiederholen):\n"
+            + done_block
+        )
+
+    marks = room_dict.get("consensus_marks") or []
+    if marks:
+        mark_lines = []
+        for m in marks[-5:]:
+            t = m.get("turn", "?")
+            s = (m.get("summary") or "").strip().replace("\n", " ")
+            if s:
+                mark_lines.append(f"- Runde {t}: {s[:280]}")
+        if mark_lines:
+            parts.append(
+                "Konsens-Historie (gemerkte Staende — darauf aufbauen, nicht neu verhandeln):\n"
+                + "\n".join(mark_lines)
+            )
+
+    alpha = room_dict.get("alpha_last_result")
+    if alpha and alpha.get("content"):
+        parts.append(
+            f"Alphas letzte Analyse (Turn {alpha.get('turn', '?')} — als Basis nutzen, nicht wiederholen):\n"
+            + alpha["content"][:600]
+        )
+
+    done_acts = room_dict.get("done_actions") or []
+    if done_acts:
+        lines = [f"- {a}" for a in done_acts[-15:]]
+        parts.append(
+            "Bereits erledigte Aktionen (NICHT erneut vorschlagen — diese sind abgehakt):\n"
+            + "\n".join(lines)
+        )
+
+    if not parts:
+        return ""
+    return "\n\n=== GEMERKTER STAND ===\n" + "\n\n".join(parts) + "\n=== ENDE STAND ===\n"
 
 
 async def _run_arena(room_id: str):
@@ -5225,9 +9936,9 @@ async def _run_arena(room_id: str):
     notbremse_triggered = False
     if "max_rounds" in room:
         try:
-            max_rounds = max(1, min(ROUNDS_HARD_LIMIT, int(room.get("max_rounds", 3))))
+            max_rounds = max(1, min(ROUNDS_HARD_LIMIT, int(room.get("max_rounds", 2))))
         except (TypeError, ValueError):
-            max_rounds = 3
+            max_rounds = 2
         max_turns = max_rounds * max(1, len(bots))
         room["max_turns_effective"] = max_turns
     else:
@@ -5276,6 +9987,9 @@ async def _run_arena(room_id: str):
     _CRASH_THRESHOLD = 2  # Ab wie vielen aufeinanderfolgenden Abstuerzen wird Ersatz-Bot gespawnt
     _REPLACEMENT_MODELS = ["sonnet", "haiku", "sonnet"]  # Modell-Kandidaten fuer Ersatz-Bots
     _replacement_counter = 0  # Zaehler fuer eindeutige Ersatz-Bot-Namen
+    _rounds_without_action = 0   # Runden ohne [JETZT AUSFÜHREN: ja] — Inaktivitäts-Stopp
+    _action_triggered_this_round = False  # Wurde in dieser Runde eine Aktion getriggert?
+    _IDLE_ROUNDS_LIMIT = 2  # Nach N ruhigen Runden: automatisches Ende
 
     try:
         while turn < max_turns:
@@ -5327,6 +10041,23 @@ async def _run_arena(room_id: str):
             bot_model = bot.get("model", "sonnet")
             bot_persona = bot.get("persona", "Du bist ein hilfreicher Diskussionspartner.")
             bot_color = bot.get("color", "#6366f1")
+
+            # --- Cross-Review: nach Execution-Turn darf Ausführer nicht eigene Arbeit reviewen ---
+            _cr_executor = _arena_rooms.get(room_id, {}).get("last_executing_bot")
+            _cr_pending = _arena_rooms.get(room_id, {}).pop("cross_review_pending", False)
+            _is_cross_review = False
+            if _cr_pending and _cr_executor:
+                _is_cross_review = True
+                if bot_name == _cr_executor:
+                    # Swap zu nächstem lebenden Nicht-Ausführer-Bot
+                    _alive_others = [b for b in bots if b.get("name") != _cr_executor and b.get("name") not in _dead_bots]
+                    if _alive_others:
+                        bot = _alive_others[0]
+                        bot_name = bot.get("name", bot_name)
+                        bot_model = bot.get("model", "sonnet")
+                        bot_persona = bot.get("persona", "Du bist ein hilfreicher Diskussionspartner.")
+                        bot_color = bot.get("color", "#6366f1")
+                        print(f"[Arena] Cross-Review: Bot '{_cr_executor}' übersprungen — '{bot_name}' reviewt stattdessen (room={room_id[:8]})")
 
             # Toter Bot? Turn ueberspringen und kurz loggen.
             if bot_name in _dead_bots:
@@ -5382,6 +10113,77 @@ async def _run_arena(room_id: str):
                 history_lines.append(line)
             history_block = "\n\n".join(history_lines) if history_lines else "(Noch keine Nachrichten)"
 
+            # Gemerkter Stand: letztes Fazit + schon umgesetzte Aktionen.
+            # Wird in alle Prompt-Varianten injiziert, damit Bots sich nicht wiederholen.
+            memory_block = _build_arena_memory_block(room)
+
+            # Robin-Zwischenruf: nur user-Messages NACH dem letzten Bot-Turn.
+            # Alte Zwischenrufe wurden im Vorgaenger-Turn schon adressiert.
+            _msgs_all = room.get("messages", [])
+            _last_bot_idx = -1
+            for _i in range(len(_msgs_all) - 1, -1, -1):
+                if _msgs_all[_i].get("role") == "bot":
+                    _last_bot_idx = _i
+                    break
+            _fresh_user = [
+                (m.get("content") or "").strip()
+                for m in _msgs_all[_last_bot_idx + 1:]
+                if m.get("role") == "user" and (m.get("content") or "").strip()
+            ]
+            robin_block = ""
+            if _fresh_user:
+                _lines = "\n\n".join(f"[Robin sagt: {t[:600]}]" for t in _fresh_user[-3:])
+                robin_block = (
+                    "\n\n=== ROBINS ZWISCHENRUF (direkte Anweisung — PRIORITAET vor allem anderen!) ===\n"
+                    + _lines
+                    + "\n=== ENDE ZWISCHENRUF ===\n"
+                )
+
+            # Cross-Review-Hinweis: Wenn Reviewer-Slot aktiv ist, Executor-Status einblenden
+            # und strukturiertes URTEIL anfordern. Ersetzt freies Regex-Parsing.
+            review_hint = ""
+            if _is_cross_review:
+                # Echter per-Action-Status aus der letzten approval-Nachricht holen.
+                # Fallback: Textsuche im executor-Output für Legacy-Räume.
+                _action_lines = []
+                _done_c = _fail_c = _haengend_c = 0
+                for _m in reversed(room.get("messages", [])):
+                    if _m.get("role") == "approval" and _m.get("actions"):
+                        for _ai, _a in enumerate(_m["actions"], start=1):
+                            _s = _a.get("status", "unbekannt")
+                            _t = (_a.get("text") or "")[:80]
+                            _r = (_a.get("result") or "")[:120]
+                            _action_lines.append(f"  #{ _ai} [{_s.upper()}] {_t}" + (f" → {_r}" if _r else ""))
+                            if _s == "done": _done_c += 1
+                            elif _s == "failed": _fail_c += 1
+                            elif _s == "haengend": _haengend_c += 1
+                        break
+                if _action_lines:
+                    _exec_status = f"{_done_c} fertig, {_fail_c} fehlgeschlagen, {_haengend_c} haengend"
+                    _action_block = "\n".join(_action_lines)
+                else:
+                    # Fallback: Textsuche im executor-Output
+                    _exec_status = "unbekannt"
+                    for _m in reversed(room.get("messages", [])):
+                        if _m.get("role") == "executor":
+                            _c = _m.get("content", "")
+                            _exec_status = f"OK={_c.count('[OK]')}, FAIL={_c.count('[FAIL]')}"
+                            break
+                    _action_block = "(keine per-Action Daten verfügbar)"
+                review_hint = (
+                    f"\n\nCROSS-REVIEW-MODUS: Du reviewst die Umsetzung von **{_cr_executor}** "
+                    f"(Executor-Status: {_exec_status}).\n\n"
+                    f"=== ECHTER AUSFÜHRUNGS-STATUS (pro Aktion) ===\n"
+                    f"{_action_block}\n"
+                    f"=== ENDE STATUS ===\n\n"
+                    f"Beurteile NUR auf Basis des obigen echten Status — nicht auf Annahmen. "
+                    f"Gib am Ende deiner Nachricht exakt eine Zeile: "
+                    f"'URTEIL: REIFE' wenn alles sauber umgesetzt. "
+                    f"'URTEIL: NACHBESSERN #N' (z.B. '#1,#3') wenn bestimmte Aktionen Lücken haben — "
+                    f"ersetze #N durch die Nummern der betroffenen Aktionen aus der Liste oben. "
+                    f"Du bist Reviewer, nicht Ausführer — keine Eigen-Vorschläge."
+                )
+
             # Check execution mode for prompt adaptation
             is_executing = room.get("tools_enabled", False) and room.get("execution_turns_left", 0) > 0
 
@@ -5390,6 +10192,7 @@ async def _run_arena(room_id: str):
             read_hint = (
                 "\n\nDu kannst Dateien lesen (Read, Glob, Grep) um deine Argumente zu stuetzen. "
                 "Nutze das wenn es zum Thema passt — z.B. um Code oder Konfiguration zu pruefen. "
+                "WICHTIG: Maximal 2 Read-Operationen pro Turn — dann direkt antworten. "
                 "Arbeitsverzeichnis: C:/Users/Robin/Jarvis"
             ) if can_read else ""
 
@@ -5413,7 +10216,9 @@ async def _run_arena(room_id: str):
                     f"Du bist {bot_name}. {bot_persona}\n"
                     f"{predecessor_hint}"
                     f"\nThema der Diskussion: {topic}\n"
-                    f"{ctx_block}\n"
+                    f"{robin_block}"
+                    f"{ctx_block}"
+                    f"{memory_block}\n"
                     f"Du eroeffnest jetzt die Diskussion. Bringe deinen ersten Standpunkt ein. "
                     f"Beziehe dich auf den TATSAECHLICHEN Stand des Projekts (siehe Kontext oben). "
                     f"Halte dich kurz (max 150 Woerter). Antworte direkt ohne Metakommentare. "
@@ -5426,7 +10231,9 @@ async def _run_arena(room_id: str):
                     f"Du bist {bot_name}. {bot_persona}\n"
                     f"{predecessor_hint}"
                     f"\nThema: {topic}\n"
-                    f"{ctx_block}\n"
+                    f"{robin_block}"
+                    f"{ctx_block}"
+                    f"{memory_block}\n"
                     f"Bisherige Diskussion:\n{history_block}\n\n"
                     f"WICHTIG: Robin hat die Ausfuehrung freigegeben! Du hast jetzt Zugriff auf alle Tools "
                     f"(Read, Write, Edit, Bash, Glob, Grep). Setze um was in der Diskussion besprochen wurde. "
@@ -5447,12 +10254,17 @@ async def _run_arena(room_id: str):
                     f"Du bist {bot_name}. {bot_persona}\n"
                     f"{predecessor_hint}"
                     f"\nThema: {topic}\n"
-                    f"{ctx_insert}\n"
+                    f"{robin_block}"
+                    f"{ctx_insert}"
+                    f"{memory_block}\n"
                     f"Bisherige Diskussion:\n{history_block}\n\n"
                     f"Du bist jetzt dran. Reagiere auf das Gesagte. "
                     f"WICHTIG: Nicht immer widersprechen! Wenn jemand einen guten Punkt macht, sag das und baue darauf auf. "
                     f"Bringe neue Perspektiven, aber sei auch bereit zuzustimmen und gemeinsam weiterzudenken. "
                     f"Wenn Robin etwas eingeworfen hat, geh darauf ein. "
+                    f"ERLEDIGTE AKTIONEN BESTÄTIGEN: Wenn im GEMERKTER STAND ein Abschnitt 'FRISCH ERLEDIGT' steht, "
+                    f"beginne deinen Beitrag mit einem Satz der bestätigt was umgesetzt wurde (z.B. '✓ [Aktion] ist erledigt.'), "
+                    f"dann diskutiere normal weiter. Das ist Pflicht — der Fortschritt muss sichtbar sein. "
                     f"Falls der Orchestrator gerade ein Zwischenfazit gemacht hat: Diskutiere einfach weiter! "
                     f"Das Fazit ist nur eine Zusammenfassung, kein Stopp-Signal. Du wartest NICHT auf Freigabe oder gruenes Licht. "
                     f"Beziehe dich auf das was TATSAECHLICH existiert, nicht auf Vermutungen. "
@@ -5466,6 +10278,7 @@ async def _run_arena(room_id: str):
                     f"'[JETZT AUSFÜHREN: ja]'. Wenn die Diskussion noch nicht reif für Umsetzung ist: '[JETZT AUSFÜHREN: nein]'. "
                     f"Nur bei echtem Konsens 'ja' schreiben — der nächste Bot bekommt dann volle Tool-Rechte und muss die Aktion wirklich durchführen."
                     f"{role_hint}"
+                    f"{review_hint}"
                     f"{read_hint}"
                 )
 
@@ -5484,12 +10297,16 @@ async def _run_arena(room_id: str):
 
             # Prompt via stdin statt argv - umgeht Windows 32K command-line limit
             if room_tools_enabled and execution_turns_left > 0:
-                # EXECUTION MODE: full tools, higher max-turns for tool use
+                # EXECUTION MODE: full tools, higher max-turns for tool use.
+                # bypassPermissions fehlte vorher — ohne den Flag verweigert Claude
+                # Write/Edit/Bash und frisst Turns mit Permission-Prompts → Budget leer
+                # bevor was umgesetzt wurde. 25 Turns matcht in etwa den medium-Executor.
                 cmd = [
                     CLAUDE_EXE, "-p",
                     "--model", bot_model,
                     "--output-format", "text",
-                    "--max-turns", "10",
+                    "--max-turns", "25",
+                    "--permission-mode", "bypassPermissions",
                 ]
                 # Decrement execution turns
                 room["execution_turns_left"] = execution_turns_left - 1
@@ -5506,12 +10323,13 @@ async def _run_arena(room_id: str):
                     })
             elif can_read:
                 # DISCUSSION + READ MODE: bots can read files to inform their arguments
+                # max-turns=4: Grep + 2 Reads + 1 final text turn — Budget-Deckel per bot
                 cmd = [
                     CLAUDE_EXE, "-p",
                     "--model", bot_model,
                     "--output-format", "text",
                     "--tools", "Read,Glob,Grep",
-                    "--max-turns", "8",
+                    "--max-turns", "4",
                 ]
             else:
                 # DISCUSSION MODE: no tools, pure text
@@ -5520,18 +10338,18 @@ async def _run_arena(room_id: str):
                     "--model", bot_model,
                     "--output-format", "text",
                     "--tools", "",
-                    "--max-turns", "3",
+                    "--max-turns", "8",
                 ]
 
             crash_info = None  # set if anything goes wrong, posted as system msg below
             proc = None
             stderr_full = ""
             stdout_full = ""
-            # Timeouts: execution=300s, read-mode=120s, pure-text=120s
+            # Timeouts: execution=300s, read-mode=150s (10 turns), pure-text=120s
             if is_executing:
                 _timeout = 300
             elif can_read:
-                _timeout = 120
+                _timeout = 60
             else:
                 _timeout = 120
             try:
@@ -5893,6 +10711,43 @@ async def _run_arena(room_id: str):
             if room:
                 room["messages"].append(msg)
                 room["last_active"] = datetime.now().isoformat()
+                # Alpha's analytical output carries into next round so the team learns from it
+                if bot_name == "Alpha" and response and not response.startswith("("):
+                    room["alpha_last_result"] = {
+                        "content": response[:800],
+                        "turn": turn,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                if _is_cross_review:
+                    _verdict_m = re.search(r'URTEIL:\s*(REIFE|NACHBESSERN)((?:\s*#\d+(?:,\s*#?\d+)*)?)', response)
+                    if _verdict_m:
+                        _raw_nums = _verdict_m.group(2) or ""
+                        _action_nums = [int(x) for x in re.findall(r'\d+', _raw_nums)] if _raw_nums.strip() else []
+                        _verdict_record = {
+                            "verdict": _verdict_m.group(1),
+                            "action_nums": _action_nums,
+                            "executor": _cr_executor,
+                            "reviewer": bot_name,
+                            "turn": turn,
+                            "timestamp": datetime.now().isoformat(),
+                            "room_id": room_id,
+                            "topic": room.get("topic", ""),
+                            "review_excerpt": response[:600],
+                        }
+                        room["last_review_verdict"] = _verdict_record
+                        # Persist to append-log so the full review history survives
+                        try:
+                            ARENA_REVIEWS_LOG.parent.mkdir(parents=True, exist_ok=True)
+                            with ARENA_REVIEWS_LOG.open("a", encoding="utf-8") as _rl:
+                                _rl.write(json.dumps(_verdict_record, ensure_ascii=False) + "\n")
+                        except Exception as _rle:
+                            print(f"[Arena] review-log write error: {_rle}")
+                        # Schritt 3: Bei NACHBESSERN geflaggte Actions zurück in Queue
+                        if _verdict_m.group(1) == "NACHBESSERN":
+                            try:
+                                _requeue_nachbessern_actions(room, bot_name, room_id, turn, _action_nums)
+                            except Exception as _rqe:
+                                print(f"[Arena] requeue error: {_rqe}")
                 _save_arena_rooms(rooms)
 
             # Broadcast message
@@ -5906,6 +10761,8 @@ async def _run_arena(room_id: str):
             bot_index += 1
 
             # JETZT AUSFÜHREN-Signal: Bot markiert Aktion als umsetzungsreif
+            if "[JETZT AUSFÜHREN: ja]" in response:
+                _action_triggered_this_round = True
             if "[JETZT AUSFÜHREN: ja]" in response and not is_executing:
                 rooms = _load_arena_rooms()
                 room = _get_arena_room(rooms, room_id)
@@ -5960,6 +10817,32 @@ async def _run_arena(room_id: str):
                     })
                     break
                 _fertig_this_round = set()  # Runde vorbei, reset
+                # Inaktivitäts-Stopp: Runde ohne neue Aktion → Zähler hoch
+                if _action_triggered_this_round:
+                    _rounds_without_action = 0
+                else:
+                    _rounds_without_action += 1
+                _action_triggered_this_round = False
+                if _rounds_without_action >= _IDLE_ROUNDS_LIMIT and turn >= len(bots):
+                    idle_msg = {
+                        "role": "system",
+                        "name": "System",
+                        "content": f"🏁 **Arena beendet** — {_IDLE_ROUNDS_LIMIT} Runden ohne neue Aktionen. Diskussion hat sich erschöpft.",
+                        "timestamp": datetime.now().isoformat(),
+                        "color": "#6b7280",
+                        "turn": turn,
+                    }
+                    rooms = _load_arena_rooms()
+                    room = _get_arena_room(rooms, room_id)
+                    if room:
+                        room["messages"].append(idle_msg)
+                        room["status"] = "fertig"
+                        _save_arena_rooms(rooms)
+                    if room_id in _arena_rooms:
+                        _arena_rooms[room_id]["running"] = False
+                    await _broadcast_all_ws({"type": "arena.message", "room_id": room_id, "message": idle_msg})
+                    await _broadcast_all_ws({"type": "arena.fertig", "room_id": room_id, "turn": turn})
+                    break
 
             # Auto-summary every N turns (default 10)
             summarize_every = room.get("summarize_every", 10)
@@ -5989,12 +10872,20 @@ async def _run_arena(room_id: str):
                     room["orchestrator_summary"] = summary
                     room["orchestrator_summary_at"] = datetime.now().isoformat()
                     room["last_verdict"] = verdict
+                    _extract_and_store_action_items(room, summary)
                     _save_arena_rooms(rooms)
                     print(f"[Arena] Zwischenfazit Runde {turn} (verdict={verdict}): {summary[:120]}...")
                     # Auto-pause on consensus or stalemate — Robin soll entscheiden
                     if verdict in ("consensus", "stalemate"):
                         room["awaiting_robin"] = True
                         room["awaiting_reason"] = verdict
+                        if verdict == "consensus":
+                            room.setdefault("consensus_marks", []).append({
+                                "turn": turn,
+                                "at": datetime.now().isoformat(),
+                                "msg_count": len(room.get("messages", [])),
+                                "summary": summary[:300],
+                            })
                         _save_arena_rooms(rooms)
                         await _broadcast_all_ws({
                             "type": "arena.needs_decision",
@@ -6006,6 +10897,57 @@ async def _run_arena(room_id: str):
                         if room_id in _arena_rooms:
                             _arena_rooms[room_id]["running"] = False
                         break
+
+            # Room-Renewal: Archive + Continuity-Seed wenn Raum zu groß wird (Lag-Schutz)
+            rooms = _load_arena_rooms()
+            room = _get_arena_room(rooms, room_id)
+            if room:
+                msgs = room.get("messages", [])
+                try:
+                    payload_kb = len(json.dumps(msgs, ensure_ascii=False).encode()) / 1024
+                except Exception:
+                    payload_kb = 0
+                n = len(msgs)
+                avg_msg_kb = payload_kb / n if n else 0
+                renewal_by_density = (n >= ARENA_RENEW_AVG_MSG_MIN_COUNT and avg_msg_kb > ARENA_RENEW_AVG_MSG_KB)
+                if n > ARENA_RENEW_MSG_COUNT or payload_kb > ARENA_RENEW_PAYLOAD_KB or renewal_by_density:
+                    renew_info = _archive_and_renew_room(room)
+                    _save_arena_rooms(rooms)
+                    recovered_note = (
+                        f", {renew_info.get('recovered', 0)} nachgetragen"
+                        if renew_info.get("recovered") else ""
+                    )
+                    divider = {
+                        "role": "system",
+                        "name": "System",
+                        "content": (
+                            f"📦 **Raum komprimiert bei Turn {turn}** — {renew_info['archived_msgs']} Messages archiviert, "
+                            f"{renew_info['open_actions']} offene Aktionen übertragen{recovered_note} → Archiv: {renew_info['ts']}"
+                            + (f" (⚠️ Dichte: {avg_msg_kb:.1f} KB/msg)" if renewal_by_density else "")
+                        ),
+                        "timestamp": datetime.now().isoformat(),
+                        "color": "#6366f1",
+                        "turn": turn,
+                        "is_renewal_divider": True,
+                    }
+                    rooms2 = _load_arena_rooms()
+                    room2 = _get_arena_room(rooms2, room_id)
+                    if room2:
+                        room2["messages"].append(divider)
+                        _save_arena_rooms(rooms2)
+                    await _broadcast_all_ws({
+                        "type": "arena.message",
+                        "room_id": room_id,
+                        "message": divider,
+                    })
+                    await _broadcast_all_ws({
+                        "type": "arena.renewed",
+                        "room_id": room_id,
+                        "turn": turn,
+                        "archived": renew_info["archived_msgs"],
+                        "ts": renew_info["ts"],
+                    })
+                    print(f"[Arena] Room {room_id[:8]} renewed at turn {turn}: {renew_info['archived_msgs']} msgs archived, {renew_info['open_actions']} open actions seeded")
 
             # Small pause between turns (let Robin inject if needed)
             await asyncio.sleep(2)
@@ -6034,16 +10976,21 @@ async def _run_arena(room_id: str):
                     "color": "#a855f7",
                     "turn": turn,
                 }
-                room["messages"].append(summary_msg)
+                _msgs = room.get("messages", [])
+                _already_final = _msgs and _msgs[-1].get("role") == "orchestrator"
+                if not _already_final:
+                    room["messages"].append(summary_msg)
                 room["orchestrator_summary"] = summary
                 room["orchestrator_summary_at"] = datetime.now().isoformat()
                 room["status"] = "idle"
+                _extract_and_store_action_items(room, summary)
                 _save_arena_rooms(rooms)
-                await _broadcast_all_ws({
-                    "type": "arena.message",
-                    "room_id": room_id,
-                    "message": summary_msg,
-                })
+                if not _already_final:
+                    await _broadcast_all_ws({
+                        "type": "arena.message",
+                        "room_id": room_id,
+                        "message": summary_msg,
+                    })
             except Exception as e2:
                 print(f"[Arena] Summary error: {e2}")
                 room["status"] = "idle"
@@ -6327,8 +11274,1972 @@ User messages:
         print(f"[Classify] Error: {e}")
 
 
+# --- Chat-Helpers für provider-agnostischen Stream (Chat-Refactor 2026-04-23) ---
+#
+# Diese Helpers trennen State-Aufbau von der Stream-Ausführung. `_run_chat` weiter
+# unten nutzt sie, um neutrale LLM-Calls via invoke_llm zu fahren.
+
+_DENY_TOOL_PATTERNS = ",".join([
+    "Bash(taskkill*)",
+    "Bash(Stop-Process*)",
+    "Bash(Stop-Service*)",
+    "Bash(net stop*)",
+    "Bash(sc stop*)",
+    "Bash(Restart-Service*)",
+    "Bash(*python*server.py*)",
+    "Bash(*start.bat*)",
+    "Edit(C:/Users/Robin/Jarvis/Mission-Control/server.py)",
+    "Edit(C:/Users/Robin/Jarvis/Mission-Control/start.bat)",
+    "Write(C:/Users/Robin/Jarvis/Mission-Control/server.py)",
+    "Write(C:/Users/Robin/Jarvis/Mission-Control/start.bat)",
+])
+
+
+def _history_to_messages(session, current_user_text: str, attachment_notes: list[str]):
+    """Baut eine neutrale Message-Liste aus session.history + dem aktuellen User-Input.
+
+    Attachments werden als Text-Hinweise ans Ende des User-Prompts angehängt — sie
+    werden NOCH NICHT als strukturierte ImageBlocks übergeben (Image-Gate-Task
+    erledigt das separat, pro Provider nach supports_images).
+
+    Für Provider mit supports_resume=True und gesetztem provider_thread_id sollte
+    der Aufrufer die History eigentlich weglassen (Provider hat sie intern) — das
+    macht _build_provider_kwargs transparent über cli_session_id. Hier bauen wir
+    immer die volle History, der Provider entscheidet.
+    """
+    from llm_client import Message, TextBlock
+
+    msgs: list = []
+    for h in session.history:
+        role = h.get("role")
+        content = h.get("content", "") or ""
+        if role not in ("user", "assistant"):
+            continue
+        if not content.strip():
+            continue
+        # Truncate sehr lange Einträge (wie im alten Code: 2000 Zeichen)
+        if len(content) > 2000:
+            content = content[:2000] + "...[gekürzt]"
+        msgs.append(Message(role=role, content=content))
+
+    # Aktuelle User-Nachricht + Attachment-Hinweise
+    full_user = current_user_text
+    if attachment_notes:
+        full_user = full_user + "\n\n" + "\n".join(attachment_notes)
+    msgs.append(Message(role="user", content=full_user))
+    return msgs
+
+
+def _build_attachment_notes(attachments, supports_images: bool) -> tuple[list[str], list]:
+    """Wandelt Attachment-Filenames in (notes, image_blocks).
+
+    notes: Text-Zeilen die immer in den Prompt gehängt werden (egal welcher Provider).
+    image_blocks: strukturierte ImageBlocks — NUR wenn supports_images=True.
+                  Aktuell noch nicht verdrahtet (siehe Image-Gate-Task) — wird in
+                  späterer Iteration genutzt, aktuell leer zurückgegeben.
+
+    Image-Gate: Bei supports_images=False degradieren wir zu Text-Hinweis
+    ("[Bild angehängt: X]") statt strukturiertem Block.
+    """
+    notes: list[str] = []
+    image_blocks: list = []  # placeholder für zukünftige ImageBlock-Nutzung
+    if not attachments:
+        return notes, image_blocks
+
+    for filename in attachments:
+        filepath = UPLOADS_DIR / filename
+        if not filepath.exists():
+            continue
+        ext = filepath.suffix.lower()
+        if ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'):
+            if supports_images:
+                # TODO: echte ImageBlocks bauen wenn wir das Bild mitschicken wollen
+                notes.append(f"[Bild angehängt: {filepath}  -  bitte lies und analysiere dieses Bild]")
+            else:
+                notes.append(f"[Bild angehängt: {filepath}  -  Pfad zum Bild, Provider kann Bilder nicht direkt verarbeiten]")
+        elif ext == '.pdf':
+            notes.append(f"[PDF angehängt: {filepath}  -  bitte lies und analysiere dieses PDF]")
+        elif ext in ('.txt', '.md', '.csv', '.json', '.py', '.js', '.html', '.css'):
+            try:
+                content = filepath.read_text(encoding="utf-8", errors="replace")[:5000]
+                notes.append(f"[Datei: {filename}]\n```\n{content}\n```")
+            except Exception:
+                notes.append(f"[Datei angehängt: {filepath}]")
+        elif ext in ('.webm', '.ogg', '.mp3', '.wav', '.m4a'):
+            notes.append(f"[Sprachnachricht angehängt: {filepath}  -  bitte lies und transkribiere diese Audiodatei]")
+        else:
+            notes.append(f"[Datei angehängt: {filepath}]")
+    return notes, image_blocks
+
+
+# Verifiziert 2026-04-25: codex-cli mit ChatGPT-Account akzeptiert nur diese
+# Models. Alles andere → "model not supported when using Codex with a ChatGPT
+# account" → leerer Stream → "keine Antwort". Wir normalisieren defensiv damit
+# ein veralteter Picker-Wert (vor Hard-Reload) nicht jede Session zerlegt.
+_CODEX_OK_MODELS = {"", "gpt-5.5"}
+
+
+def _normalize_codex_model(model: str | None) -> tuple[str, str | None]:
+    """Returns (model, warning_msg). Wenn model fuer codex-cli nicht unterstuetzt,
+    auf '' (Account-Default) zurueckfallen und Warning fuer den Caller liefern."""
+    if model is None:
+        return model, None
+    if model in _CODEX_OK_MODELS:
+        return model, None
+    return "", (
+        f"⚠️ Model {model!r} ist mit dem ChatGPT-Codex-Account nicht verfuegbar — "
+        "auf Account-Default zurueckgesetzt. Im Picker stehen 'Auto' oder 'gpt-5.5'."
+    )
+
+
+def _set_session_provider(session, new_provider: str, new_model: str | None = None) -> dict:
+    """Zentrale Switch-Logik für Provider/Model-Wechsel pro Session.
+
+    Verhalten (nach Codex-Review 2026-04-23):
+      - Nur Model-Wechsel im selben Provider → kein thread_id-Reset, keine Systemmeldung
+      - Provider-Wechsel → provider_thread_id HART auf None, Systemmeldung in history,
+        cli_session_id (Legacy-Alias) synchron auf None
+      - Invalid Provider → ValueError
+
+    Returns: {"changed": bool, "provider_switched": bool, "message": str|None}
+    """
+    from llm_client import PROVIDER_NAMES
+
+    if new_provider not in PROVIDER_NAMES:
+        raise ValueError(
+            f"Unbekannter Provider {new_provider!r}. Erlaubt: {', '.join(PROVIDER_NAMES)}"
+        )
+
+    codex_warning = None
+    if new_provider == "codex-cli":
+        new_model, codex_warning = _normalize_codex_model(new_model)
+        if codex_warning:
+            session.history.append({"role": "system", "content": codex_warning})
+
+    old_provider = session.provider
+    old_model = session.model
+    provider_switched = (new_provider != old_provider)
+    model_changed = (new_model is not None and new_model != old_model)
+
+    if not provider_switched and not model_changed:
+        return {"changed": False, "provider_switched": False, "message": None}
+
+    sys_msg = None
+    if provider_switched:
+        # Resume-Token HART verwerfen — providerspezifisch, nicht transferierbar
+        session.provider_thread_id = None
+        session.cli_session_id = None
+        # Systemmeldung in history damit User Kontextbruch sieht
+        sys_msg = (
+            f"🔄 Provider gewechselt: {old_provider} → {new_provider}. "
+            f"Neue Conversation (Resume-Kontext verworfen)."
+        )
+        session.history.append({"role": "system", "content": sys_msg})
+
+    session.provider = new_provider
+    if new_model is not None:
+        session.model = new_model
+    sessions.persist()
+
+    print(f"[Chat] provider-switch session={session.session_id[:8]} "
+          f"{old_provider}/{old_model!r} → {new_provider}/{session.model!r} "
+          f"(thread_reset={provider_switched})")
+
+    return {
+        "changed": True,
+        "provider_switched": provider_switched,
+        "message": sys_msg,
+    }
+
+
+def _build_provider_kwargs(session, on_resume_token=None) -> dict:
+    """Provider-spezifische Extras für invoke_llm. Keine Branch-Logik auf
+    provider-Namen außerhalb dieser Funktion — hier ist der einzige Ort.
+
+    on_resume_token: Callback, der vom Provider bei neuem Thread/Session-ID
+      aufgerufen wird. Wir hängen ihn hier an die Session-Instanz.
+    """
+    from pathlib import Path as _P
+
+    kwargs: dict = {}
+    p = session.provider
+
+    if p == "claude-cli":
+        # Bei --resume braucht claude-cli die alte CLI-Session-ID
+        if session.provider_thread_id:
+            kwargs["cli_session_id"] = session.provider_thread_id
+        # MCP + System-Prompt-Handling macht der Caller (_run_chat) selbst,
+        # weil der system_file-Pfad temp/pro-call ist
+        kwargs["mcp_config"] = str(BASE_DIR.parent / ".mcp.json")
+        # max_turns 40 war zu knapp fuer agentische Tasks (Jarvis-Main mit
+        # Multi-Tool-Sessions hat Antworten abgebrochen). 100 ist immer noch
+        # eine harte Grenze gegen runaway loops, aber gibt genug Luft fuer
+        # Edit→Read→Bash→Edit-Ketten.
+        kwargs["max_turns"] = 100
+        kwargs["disallowed_tools"] = _DENY_TOOL_PATTERNS
+        kwargs["dangerous_skip_permissions"] = True
+        # Callback für CLI-Session-ID aus init-Event
+        if on_resume_token:
+            kwargs["on_cli_session_id"] = on_resume_token
+
+    elif p == "codex-cli":
+        kwargs["sandbox"] = "workspace-write"
+        kwargs["cwd"] = "C:/Users/Robin/Jarvis"
+        kwargs["skip_git_repo_check"] = True
+        if session.provider_thread_id:
+            kwargs["thread_id"] = session.provider_thread_id  # (Resume-Impl noch offen)
+        if on_resume_token:
+            kwargs["on_thread_id"] = on_resume_token
+
+    elif p == "gemini-cli":
+        kwargs["approval_mode"] = "yolo"  # headless = auto-approve Tools
+        kwargs["cwd"] = "C:/Users/Robin/Jarvis"
+        if on_resume_token:
+            kwargs["on_session_id"] = on_resume_token
+
+    # claude-api und openai brauchen keine provider_kwargs — alles über
+    # messages-Liste. Keine Sonderfälle.
+
+    return kwargs
+
+
+async def _llm_oneshot(
+    provider: str,
+    model: str,
+    user_message: str,
+    system: str | None = None,
+    max_tokens: int = 2000,
+    **kwargs,
+) -> tuple[str, dict, str | None]:
+    """Ruft invoke_llm und sammelt text+usage bis zum MessageStop. Non-streaming."""
+    from llm_client import (
+        invoke_llm, Message, TextDelta, ErrorEvent, MessageStop, UsageEvent,
+    )
+    answer = ""
+    usage: dict = {}
+    err: str | None = None
+    try:
+        async for ev in invoke_llm(
+            provider=provider, model=model,
+            messages=[Message(role="user", content=user_message)],
+            system=system, max_tokens=max_tokens,
+            **kwargs,
+        ):
+            if isinstance(ev, TextDelta):
+                answer += ev.text
+            elif isinstance(ev, UsageEvent):
+                usage = {
+                    "input_tokens": ev.input_tokens + ev.cache_read_tokens,
+                    "output_tokens": ev.output_tokens,
+                }
+            elif isinstance(ev, ErrorEvent):
+                err = f"{ev.code}: {ev.message}"
+            elif isinstance(ev, MessageStop):
+                break
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+    return answer, usage, err
+
+
+async def api_llm_ask_peer(request):
+    """POST /api/llm/ask-peer
+    Body: {provider, model?, query, context?, session_id?}
+
+    "Codex, frag mal Claude ob…" — eine Provider-Session kann via diesem Endpoint
+    einen anderen Provider einmalig fragen. Non-streaming, one-shot. Wenn
+    session_id mitgegeben wird, sehen die Subscriber dieser Session ein
+    `chat.peer_answer`-Event mit Query+Answer.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    provider = (body.get("provider") or "").strip()
+    model = (body.get("model") or "").strip()
+    query = (body.get("query") or "").strip()
+    context = (body.get("context") or "").strip()
+    session_id = (body.get("session_id") or "").strip()
+
+    if not provider or not query:
+        return web.json_response(
+            {"ok": False, "error": "provider und query erforderlich"}, status=400,
+        )
+
+    system_prompt = (
+        "Du bist Peer-Assistent für einen anderen AI-Agent von Robin. "
+        "Beantworte die Frage knapp, präzise, sachlich, ohne Höflichkeits-Floskeln. "
+        "Wenn Kontext beigefügt ist, nutze ihn als Grundlage."
+    )
+    if context:
+        system_prompt += f"\n\n--- BEIGEFÜGTER KONTEXT ---\n{context[:8000]}"
+
+    answer, usage, err = await _llm_oneshot(
+        provider=provider, model=model,
+        user_message=query, system=system_prompt,
+    )
+
+    if session_id and sessions.sessions.get(session_id):
+        await _broadcast_stream_event(session_id, {
+            "type": "chat.peer_answer",
+            "session_id": session_id,
+            "peer_provider": provider,
+            "peer_model": model or "default",
+            "query": query,
+            "answer": answer,
+            "error": err,
+        })
+
+    return web.json_response({
+        "ok": err is None and bool(answer),
+        "provider": provider, "model": model or "default",
+        "query": query, "answer": answer,
+        "usage": usage, "error": err,
+    })
+
+
+async def api_chat_session_scratchpad(request):
+    """Shared Scratchpad pro Session — provider-agnostisch lesen/schreiben.
+
+    GET  → {notes: {...}}
+    POST → {key, value, append?} ODER {notes: {...}, replace?}
+
+    Beide Provider können über diesen dict[str, str] Zwischenergebnisse teilen.
+    Broadcastet `chat.scratchpad_update`-Event an Session-Subscriber.
+    """
+    sid = request.match_info.get("session_id", "")
+    session = sessions.sessions.get(sid)
+    if not session:
+        return web.json_response({"ok": False, "error": "Session nicht gefunden"}, status=404)
+
+    # Backward-Compat: Feld existiert auf alten Sessions evtl. nicht
+    if not hasattr(session, "shared_notes") or session.shared_notes is None:
+        session.shared_notes = {}
+
+    if request.method == "GET":
+        return web.json_response({
+            "ok": True, "session_id": session.session_id,
+            "notes": dict(session.shared_notes),
+        })
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    if "notes" in body:
+        bulk = body.get("notes") or {}
+        if not isinstance(bulk, dict):
+            return web.json_response({"ok": False, "error": "notes muss Dict sein"}, status=400)
+        if body.get("replace"):
+            session.shared_notes = {}
+        for k, v in bulk.items():
+            session.shared_notes[str(k)] = str(v)
+    elif "key" in body:
+        key = str(body.get("key") or "").strip()
+        val = str(body.get("value") or "")
+        if not key:
+            return web.json_response({"ok": False, "error": "key erforderlich"}, status=400)
+        if body.get("append") and key in session.shared_notes:
+            session.shared_notes[key] = session.shared_notes[key] + "\n" + val
+        else:
+            session.shared_notes[key] = val
+    else:
+        return web.json_response(
+            {"ok": False, "error": "Body: entweder {notes:{...}} oder {key,value}"},
+            status=400,
+        )
+
+    sessions.persist()
+    await _broadcast_stream_event(session.session_id, {
+        "type": "chat.scratchpad_update",
+        "session_id": session.session_id,
+        "notes": dict(session.shared_notes),
+    })
+
+    return web.json_response({
+        "ok": True, "session_id": session.session_id,
+        "notes": dict(session.shared_notes),
+    })
+
+
+async def _fetch_amboss_medical(query: str, uploads_dir: Path) -> list[dict]:
+    """Amboss Top-1-Treffer zur Query: search → fetch_article_full.
+    Kein Image-Download. Return list[{title, eid, text, abstract}].
+    """
+    try:
+        from amboss_client import (
+            _load_cached_cookie, search_article_eids, fetch_article_full,
+        )
+    except ImportError:
+        return []
+    # FIX: _load_cookie hieß in amboss_client.py eigentlich _load_cached_cookie
+    cookie = _load_cached_cookie(uploads_dir) or CONFIG.get("amboss_cookie", "").strip()
+    if not cookie:
+        return []
+    try:
+        import aiohttp as _aiohttp
+        timeout = _aiohttp.ClientTimeout(total=45)
+        async with _aiohttp.ClientSession(connector=_aiohttp.TCPConnector(ssl=True), timeout=timeout) as sess:
+            eids = await search_article_eids(sess, cookie, query, limit=2)
+            if not eids:
+                return []
+            results = []
+            for eid_obj in (eids[:2] if isinstance(eids, list) else []):
+                try:
+                    eid = eid_obj.get("articleEid") if isinstance(eid_obj, dict) else eid_obj
+                    full = await fetch_article_full(sess, cookie, eid, media_limit=0, text_char_limit=3000)
+                    if full and full.get("text"):
+                        results.append({
+                            "title": full.get("title", ""),
+                            "eid": full.get("eid", eid),
+                            "abstract": full.get("abstract", ""),
+                            "text": full.get("text", ""),
+                        })
+                except Exception as e:
+                    print(f"[MedAgent] amboss article {eid_obj} failed: {e}")
+            return results
+    except Exception as e:
+        print(f"[MedAgent] amboss search failed: {e}")
+        return []
+
+
+async def _fetch_viamedici_medical(query: str, uploads_dir: Path) -> list[dict]:
+    """ViaMedici Top-2-Module zur Query: search → module_content.
+    Return list[{title, assetId, text}].
+    """
+    try:
+        from viamedici_client import (
+            ensure_access_token, search_learning_modules, fetch_module_content,
+        )
+    except ImportError:
+        return []
+    try:
+        access_token = await ensure_access_token(uploads_dir)
+    except Exception as e:
+        print(f"[MedAgent] viamedici auth skipped: {e}")
+        return []
+    try:
+        import aiohttp as _aiohttp
+        timeout = _aiohttp.ClientTimeout(total=45)
+        async with _aiohttp.ClientSession(connector=_aiohttp.TCPConnector(ssl=True), timeout=timeout) as sess:
+            modules = await search_learning_modules(sess, access_token, query, limit=2)
+            if not modules:
+                return []
+            results = []
+            for mod in modules[:2]:
+                asset_id = mod.get("assetId")
+                slug = mod.get("slug")
+                if not asset_id or not slug:
+                    continue
+                try:
+                    text = await fetch_module_content(sess, access_token, asset_id, slug)
+                    if text:
+                        results.append({
+                            "title": mod.get("title", ""),
+                            "assetId": asset_id,
+                            "text": text,
+                        })
+                except Exception as e:
+                    print(f"[MedAgent] viamedici module {asset_id} failed: {e}")
+            return results
+    except Exception as e:
+        print(f"[MedAgent] viamedici search failed: {e}")
+        return []
+
+
+async def api_image_providers(request):
+    """GET /api/image/providers — Status pro Image-Gen-Provider (configured?)."""
+    from image_client import list_image_providers
+    return web.json_response({"providers": list_image_providers()})
+
+
+async def api_image_usage(request):
+    """GET /api/image/usage?period=today|month|all — Cost-Tracking.
+    Returns: {total_images, total_usd, by_provider, by_model, recent, period}
+    """
+    from image_client import read_usage_log
+    period = (request.rel_url.query.get("period") or "all").lower()
+    if period not in ("today", "month", "all"):
+        period = "all"
+    return web.json_response(read_usage_log(period=period))
+
+
+def _find_latest_codex_image() -> Path | None:
+    """Return the newest image generated by Codex's local image tool, if any."""
+    root = Path.home() / ".codex" / "generated_images"
+    if not root.exists():
+        return None
+    exts = {".png", ".jpg", ".jpeg", ".webp"}
+    candidates = [
+        p for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in exts
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _codex_job_path(job_id: str) -> Path:
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "", job_id or "")
+    return IMAGE_JOBS_DIR / f"{safe}.json"
+
+
+def _read_codex_job(job_id: str) -> dict | None:
+    path = _codex_job_path(job_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _write_codex_job(job: dict) -> None:
+    atomic_write_text(
+        _codex_job_path(job["id"]),
+        json.dumps(job, ensure_ascii=False, indent=2),
+        keep_backup=False,
+    )
+
+
+def _list_codex_jobs(status: str | None = None) -> list[dict]:
+    jobs = []
+    for path in IMAGE_JOBS_DIR.glob("*.json"):
+        try:
+            job = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if status and job.get("status") != status:
+            continue
+        jobs.append(job)
+    jobs.sort(key=lambda j: j.get("created_at", ""), reverse=True)
+    return jobs
+
+
+def _import_codex_image(latest: Path, prompt: str = "", job_id: str = "") -> dict:
+    import shutil
+
+    out_dir = UPLOADS_DIR / "images" / "generated"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ext = latest.suffix.lower() or ".png"
+    dest = out_dir / f"codex_{int(time.time())}_{uuid.uuid4().hex[:8]}{ext}"
+    shutil.copy2(latest, dest)
+
+    rel = str(dest.relative_to(UPLOADS_DIR)).replace("\\", "/")
+    return {
+        "ok": True,
+        "provider": "codex-session" if job_id else "codex-drop",
+        "model": "codex image tool",
+        "prompt": prompt or "Imported from Codex generated_images",
+        "size": "",
+        "url": "/api/uploads/" + rel,
+        "path": rel,
+        "source_path": str(latest),
+        "job_id": job_id,
+        "mime_type": "image/png" if ext == ".png" else f"image/{ext.lstrip('.')}",
+    }
+
+
+async def api_image_codex_latest(request):
+    """GET /api/image/codex/latest — newest local Codex-generated image."""
+    latest = _find_latest_codex_image()
+    if not latest:
+        return web.json_response({
+            "ok": False,
+            "error": "Kein Codex-Bild unter ~/.codex/generated_images gefunden",
+        }, status=200)
+    return web.json_response({
+        "ok": True,
+        "path": str(latest),
+        "filename": latest.name,
+        "mtime": latest.stat().st_mtime,
+        "size": latest.stat().st_size,
+    })
+
+
+async def api_image_codex_import(request):
+    """POST /api/image/codex/import — copy latest Codex image into MC uploads."""
+    latest = _find_latest_codex_image()
+    if not latest:
+        return web.json_response({
+            "ok": False,
+            "error": "Kein Codex-Bild unter ~/.codex/generated_images gefunden",
+        }, status=200)
+
+    return web.json_response(_import_codex_image(latest))
+
+
+async def api_image_codex_jobs_create(request):
+    """POST /api/image/codex/jobs — create a manual Codex image bridge job."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    prompt = (body.get("prompt") or "").strip()
+    if len(prompt) < 3:
+        return web.json_response({"ok": False, "error": "prompt erforderlich"}, status=400)
+
+    now = datetime.now().isoformat(timespec="seconds")
+    job = {
+        "id": uuid.uuid4().hex[:12],
+        "status": "pending",
+        "prompt": prompt,
+        "size": (body.get("size") or "").strip(),
+        "style": (body.get("style") or "").strip(),
+        "created_at": now,
+        "updated_at": now,
+        "result": None,
+        "error": None,
+        "notified": False,
+    }
+    _write_codex_job(job)
+    notified = send_push(
+        "Codex Image Job wartet",
+        f"{job['id']}: {prompt[:180]}",
+        priority=4,
+        tags=["art", "hourglass"],
+        click="http://localhost:8090/",
+    )
+    job["notified"] = bool(notified)
+    _write_codex_job(job)
+    return web.json_response({"ok": True, "job": job})
+
+
+async def api_image_codex_jobs_list(request):
+    """GET /api/image/codex/jobs?status=pending — list manual bridge jobs."""
+    status = (request.query.get("status") or "").strip() or None
+    return web.json_response({"ok": True, "jobs": _list_codex_jobs(status=status)})
+
+
+async def api_image_codex_job_get(request):
+    """GET /api/image/codex/jobs/{job_id} — job status."""
+    job_id = request.match_info.get("job_id", "")
+    job = _read_codex_job(job_id)
+    if not job:
+        return web.json_response({"ok": False, "error": "Job nicht gefunden"}, status=404)
+    return web.json_response({"ok": True, "job": job})
+
+
+async def api_image_codex_job_complete(request):
+    """POST /api/image/codex/jobs/{job_id}/complete — attach latest Codex image."""
+    job_id = request.match_info.get("job_id", "")
+    job = _read_codex_job(job_id)
+    if not job:
+        return web.json_response({"ok": False, "error": "Job nicht gefunden"}, status=404)
+
+    latest = _find_latest_codex_image()
+    if not latest:
+        job["status"] = "error"
+        job["error"] = "Kein Codex-Bild unter ~/.codex/generated_images gefunden"
+        job["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        _write_codex_job(job)
+        return web.json_response({"ok": False, "error": job["error"], "job": job}, status=200)
+
+    result = _import_codex_image(latest, prompt=job.get("prompt", ""), job_id=job_id)
+    job["status"] = "completed"
+    job["result"] = result
+    job["error"] = None
+    job["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    _write_codex_job(job)
+    return web.json_response({"ok": True, "job": job, **result})
+
+
+async def api_image_codex_job_fail(request):
+    """POST /api/image/codex/jobs/{job_id}/fail — mark bridge job failed."""
+    job_id = request.match_info.get("job_id", "")
+    job = _read_codex_job(job_id)
+    if not job:
+        return web.json_response({"ok": False, "error": "Job nicht gefunden"}, status=404)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    job["status"] = "error"
+    job["error"] = (body.get("error") or "Codex job failed").strip()
+    job["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    _write_codex_job(job)
+    return web.json_response({"ok": True, "job": job})
+
+
+_IMAGE_PROMPT_SKILL_PATH = Path(r"C:\Users\Robin\Jarvis\skills\image-prompt\SKILL.md")
+
+# One-Shot-Override: Der Skill ist auf interaktiven Multi-Step-Dialog ausgelegt
+# (asks dimensions, refines etc.). Im Auto-Enhance-Modus wollen wir aber genau
+# einen Output: den fertigen Prompt, ohne Rationale-Block, ohne Rueckfrage.
+_IMAGE_PROMPT_ONESHOT_TAIL = """
+
+---
+
+## ONE-SHOT MODE (CRITICAL OVERRIDE — read this first)
+
+Du bist im non-interaktiven Auto-Enhance-Modus. **Du darfst KEINE Tools aufrufen** — nicht
+Skill, nicht Task, nicht Read, nichts. Antworte ausschliesslich mit reinem Text.
+
+Ignoriere Steps 1, 3 und 4 oben (keine Nachfragen, kein "PROMPT:"-Block, keine Rationale,
+keine Refinement-Frage). Nutze NUR die Core Principles + Step-2-Struktur + Anti-Patterns.
+
+Nimm direkt die User-Eingabe als Vision (auch wenn sie kurz/vage ist) und antworte mit
+GENAU EINEM fertigen Image-Generation-Prompt — als deine erste und einzige Text-Antwort.
+
+Strikte Output-Regeln:
+- KEIN Tool-Use, KEIN Thinking sichtbar — nur der finale Prompt-Text.
+- Keine Anfuehrungszeichen, keine Markdown, keine Erklaerung, kein "PROMPT:"-Header.
+- Englisch (Image-Modelle reagieren darauf besser).
+- 60-200 Woerter. Prompts unter 40 Woerter sind zu vage.
+- Wenn der Input einen Personennamen enthaelt → 1:1 uebernehmen + dezent visuell ausschmuecken.
+- Keine erfundenen Details die mit dem Input kollidieren.
+"""
+
+
+def _load_image_prompt_skill() -> str:
+    """Laedt den image-prompt SKILL.md + haengt One-Shot-Tail an. Cached nicht —
+    Skill kann live editiert werden ohne MC-Restart."""
+    try:
+        return _IMAGE_PROMPT_SKILL_PATH.read_text(encoding="utf-8") + _IMAGE_PROMPT_ONESHOT_TAIL
+    except Exception as e:
+        print(f"[ImagePromptEnhancer] skill load failed ({e}) — falling back to minimal prompt")
+        return (
+            "Du bist ein Experte fuer Nano-Banana / Gemini Image-Prompts. "
+            "Schreib den User-Input in einen detaillierten englischen Image-Prompt um "
+            "(60-200 Woerter, Subject + Composition + Lighting + Style + Mood). "
+            "Antworte NUR mit dem fertigen Prompt, kein Drumherum."
+        )
+
+
+async def _enhance_image_prompt(user_prompt: str, style_hint: str | None = None) -> str | None:
+    """Schreibt einen User-Prompt in einen image-optimierten Prompt um.
+    Nutzt den ~/Jarvis/skills/image-prompt/SKILL.md Skill (Ken Kousen, basiert
+    auf Googles offizieller Nano-Banana-Doku) im One-Shot-Modus.
+    Provider: claude-cli (Sonnet), kein MCP, max-turns=1. Returns None bei Fehler."""
+    from llm_client import invoke_llm, Message, TextDelta, ErrorEvent, MessageStop
+
+    sys_prompt = _load_image_prompt_skill()
+    if style_hint:
+        sys_prompt += f"\n\nAdditional style hint from caller: {style_hint}"
+
+    out = ""
+    err = None
+    try:
+        async for ev in invoke_llm(
+            provider="claude-cli",
+            model="sonnet",
+            messages=[Message(role="user", content=user_prompt)],
+            system=sys_prompt,
+            max_turns=2,  # 1 reicht eigentlich, 2 als Sicherheit falls erstes Token tool_use ist
+            dangerous_skip_permissions=True,
+            system_replace=True,  # Skill ersetzt Claude-Code-Default fuer reinen Prompt-Rewriter-Modus
+            # Alle Tools verbieten — Modell soll DIREKT umschreiben, nicht den Skill als Tool callen
+            disallowed_tools="Skill,Task,Bash,Read,Write,Edit,Grep,Glob,WebFetch,WebSearch,TodoWrite,Agent",
+        ):
+            if isinstance(ev, TextDelta):
+                out += ev.text
+            elif isinstance(ev, ErrorEvent):
+                err = ev.message
+                break
+            elif isinstance(ev, MessageStop):
+                break
+    except Exception as e:
+        err = str(e)
+
+    if err or not out.strip():
+        print(f"[ImagePromptEnhancer] no output (err={err})")
+        return None
+    cleaned = out.strip().strip('"').strip("'").strip()
+    # Sicherheitsnetz: Falls Modell trotz One-Shot-Tail einen "PROMPT:"-Block produziert,
+    # extrahiere den Prompt-Text dazwischen.
+    import re as _re
+    m = _re.search(r"PROMPT:\s*\n?[─\-]+\s*\n([\s\S]+?)\n[─\-]+", cleaned)
+    if m:
+        cleaned = m.group(1).strip()
+    # Falls Modell trotzdem mehrere Absaetze produziert (Rationale unten), nimm ersten Block
+    if "\n\n" in cleaned:
+        cleaned = cleaned.split("\n\n", 1)[0].strip()
+    return cleaned[:1500]
+
+
+async def api_image_generate(request):
+    """POST /api/image/generate
+    Body: {provider, prompt, model?, size?, quality?, style?, session_id?}
+
+    Generiert ein Bild via OpenAI oder Gemini und speichert es in UPLOADS.
+    Bei session_id: broadcastet `chat.image_generated`-Event an Subscriber damit
+    das Bild sofort im Chat inline erscheint.
+    Response: {ok, path, url, provider, model, prompt, size, metadata}
+    """
+    from image_client import generate_image, ImageGenError
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    provider = (body.get("provider") or "gemini").strip().lower()
+    user_prompt = (body.get("prompt") or "").strip()
+    if not user_prompt:
+        return web.json_response({"ok": False, "error": "prompt erforderlich"}, status=400)
+
+    model = (body.get("model") or "").strip() or None
+    size = (body.get("size") or "1024x1024").strip()
+    quality = (body.get("quality") or "auto").strip()
+    style = (body.get("style") or "").strip() or None
+    session_id = (body.get("session_id") or "").strip()
+    enhance = bool(body.get("enhance", True))
+
+    # Prompt-Enhancer: schreibt User-Eingabe in einen detaillierten Image-Gen-Prompt um.
+    # Ein-Shot-Call mit Claude Sonnet (claude-cli, ohne MCP). Wenn's failt: original-Prompt nehmen.
+    enhanced_prompt = None
+    if enhance and len(user_prompt) > 4:
+        try:
+            enhanced_prompt = await _enhance_image_prompt(user_prompt, style)
+        except Exception as e:
+            print(f"[ImagePromptEnhancer] failed (using original): {e}")
+            enhanced_prompt = None
+
+    final_prompt = enhanced_prompt or user_prompt
+
+    # Avatar-Auto-Detection: Wenn der Prompt Personen-Namen aus dem Avatare-Tab
+    # enthaelt, packen wir deren References als visual context ans Modell.
+    # Nur Gemini supportet das aktuell nativ.
+    reference_paths: list[Path] = []
+    references_used: list[dict] = []
+    if provider == "gemini":
+        try:
+            import library as _lib
+            avatars = _lib.list_avatars(AVATARS_DIR)
+            prompt_lower = (user_prompt + " " + (final_prompt or "")).lower()
+            import re as _re
+            words = set(_re.findall(r"[a-zäöüß]+", prompt_lower))
+            for av in avatars:
+                if av["name"].lower() not in words: continue
+                if av["ref_count"] == 0: continue
+                detail = _lib.get_avatar(AVATARS_DIR, av["name"])
+                # max 4 references pro Person, max 6 total (Modell-Limits)
+                taken = []
+                for ref in detail["references"][:4]:
+                    if len(reference_paths) >= 6: break
+                    p = AVATARS_DIR / av["name"] / "references" / ref["filename"]
+                    if p.is_file():
+                        reference_paths.append(p)
+                        taken.append(ref["filename"])
+                if taken:
+                    references_used.append({"name": av["name"], "files": taken})
+            if references_used:
+                # Anchor-Text differenziert nach Modell:
+                # Verifiziert 2026-04-25: Nano Banana Pro filtert (IMAGE_OTHER) wenn der
+                # Anchor PERSONENNAMEN + Phrasen wie "reference image"/"real person"/
+                # "facial features and identity" kombiniert (Deepfake-Vorsicht). Neutrale
+                # Style-Sprache OHNE Personenname klappt. Flash-Varianten (Nano Banana /
+                # Nano Banana 2) sind toleranter, da geht der staerkere Identity-Anchor.
+                is_pro = (model or "") == "gemini-3-pro-image-preview"
+                if is_pro:
+                    # Ein einziger neutraler Satz — kein Name, keine "real person"-Phrase
+                    anchor = "Use the provided reference images as visual style guide for the subject's appearance."
+                else:
+                    names = ", ".join(u["name"] for u in references_used)
+                    anchor = f"The reference image(s) of {names} show the same person — keep their appearance and features consistent with these references."
+                final_prompt = anchor + "\n\n" + final_prompt
+                print(f"[ImageRefs] using {len(reference_paths)} refs for: {[u['name'] for u in references_used]} (pro_mode={is_pro})")
+        except Exception as e:
+            print(f"[ImageRefs] auto-detect failed (continuing without refs): {e}")
+
+    try:
+        img = await generate_image(
+            provider=provider, prompt=final_prompt,
+            uploads_dir=UPLOADS_DIR,
+            model=model, size=size, quality=quality, style=style,
+            reference_images=reference_paths or None,
+        )
+    except ImageGenError as e:
+        return web.json_response(
+            {"ok": False, "error": e.message, "code": e.code, "provider": provider},
+            status=200,  # Client-sichtbarer Fehler, kein 5xx
+        )
+    except Exception as e:
+        return web.json_response(
+            {"ok": False, "error": f"{type(e).__name__}: {e}", "provider": provider},
+            status=500,
+        )
+
+    # Frisch generiertes Bild direkt in die Library (_inbox) verschieben.
+    # Damit ist es persistent + im Image-Lab unter "Library" auffindbar,
+    # statt nur als Upload-Cache (max 24 in localStorage) wegzuflattern.
+    library_url = img.url
+    library_path_rel = str(img.path.relative_to(UPLOADS_DIR)).replace("\\", "/")
+    library_folder = ""
+    try:
+        inbox = IMAGES_LIBRARY_DIR / "_inbox"
+        inbox.mkdir(parents=True, exist_ok=True)
+        target = inbox / img.path.name
+        if target.exists():
+            stem, suf = target.stem, target.suffix
+            i = 2
+            while (inbox / f"{stem}_{i}{suf}").exists():
+                i += 1
+            target = inbox / f"{stem}_{i}{suf}"
+        img.path.rename(target)
+        library_url = f"/library/_inbox/{target.name}"
+        library_path_rel = f"_inbox/{target.name}"
+        library_folder = "_inbox"
+        img.path = target
+        img.url = library_url
+    except Exception as _e:
+        print(f"[Library] Move to library failed for {img.path}: {_e}")
+
+    # Sidecar-Meta-File: User-Prompt + Enhanced-Prompt + Provider/Model/Size + ggf References
+    try:
+        import library as _lib
+        _lib.write_image_meta(img.path, {
+            "user_prompt": user_prompt,
+            "enhanced_prompt": enhanced_prompt,
+            "final_prompt": final_prompt,
+            "provider": img.provider,
+            "model": img.model,
+            "size": img.size,
+            "style": style,
+            "references_used": references_used,
+            "created_at": datetime.now().isoformat(),
+        })
+    except Exception as _e:
+        print(f"[Library] Sidecar write failed: {_e}")
+
+    payload = {
+        "ok": True,
+        "provider": img.provider,
+        "model": img.model,
+        "prompt": user_prompt,
+        "enhanced_prompt": enhanced_prompt,
+        "final_prompt": final_prompt,
+        "references_used": references_used,
+        "size": img.size,
+        "url": library_url,
+        "path": library_path_rel,
+        "library_folder": library_folder,
+        "library_filename": img.path.name,
+        "mime_type": img.mime_type,
+        "metadata": img.metadata,
+    }
+
+    # Wenn Session mitgegeben: Bild sofort in den Chat posten
+    if session_id and sessions.sessions.get(session_id):
+        session = sessions.sessions[session_id]
+        # Als Assistant-Message mit Bild-Markdown einfügen
+        image_md = f"![{img.prompt[:80]}]({img.url})\n\n*Generiert via {img.provider} ({img.model})*"
+        session.history.append({
+            "role": "assistant",
+            "content": image_md,
+            "_image": True,
+            "_image_url": img.url,
+        })
+        sessions.persist()
+        await _broadcast_stream_event(session_id, {
+            "type": "chat.image_generated",
+            "session_id": session_id,
+            "url": img.url,
+            "prompt": img.prompt,
+            "provider": img.provider,
+            "model": img.model,
+        })
+
+    return web.json_response(payload)
+
+
+# ============================================================================
+# Image Library + Avatare — siehe library.py
+# ============================================================================
+
+async def api_library_list(request):
+    """GET /api/library?folder=<name>&group=day
+    Ohne folder → folders + flat list. Mit folder → Bilder dieses Folders.
+    group=day → zusaetzlich grouped_by_day.
+    """
+    import library as _lib
+    folder = request.query.get("folder") or None
+    group = request.query.get("group", "")
+    try:
+        folders = _lib.list_folders(IMAGES_LIBRARY_DIR)
+        images = _lib.list_images(IMAGES_LIBRARY_DIR, folder)
+        out = {"ok": True, "folders": folders, "images": images}
+        if group == "day":
+            out["grouped"] = _lib.list_grouped_by_day(IMAGES_LIBRARY_DIR, folder)
+        return web.json_response(out)
+    except ValueError as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+
+async def api_library_folder_create(request):
+    import library as _lib
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+    try:
+        folder = _lib.create_folder(IMAGES_LIBRARY_DIR, (body.get("name") or "").strip())
+        return web.json_response({"ok": True, "folder": folder})
+    except (ValueError, FileExistsError) as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+
+async def api_library_folder_delete(request):
+    import library as _lib
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    name = (body.get("name") or request.query.get("name") or "").strip()
+    force = bool(body.get("force") or request.query.get("force") in ("1", "true"))
+    try:
+        n = _lib.delete_folder(IMAGES_LIBRARY_DIR, name, force=force)
+        return web.json_response({"ok": True, "deleted_images": n})
+    except (ValueError, FileNotFoundError) as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+
+async def api_library_move(request):
+    import library as _lib
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+    try:
+        new_url = _lib.move_image(
+            IMAGES_LIBRARY_DIR,
+            (body.get("src_folder") or "").strip(),
+            (body.get("filename") or "").strip(),
+            (body.get("dest_folder") or "").strip(),
+        )
+        return web.json_response({"ok": True, "url": new_url})
+    except (ValueError, FileNotFoundError) as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+
+async def api_library_image_delete(request):
+    import library as _lib
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    folder = (body.get("folder") or request.query.get("folder") or "").strip()
+    filename = (body.get("filename") or request.query.get("filename") or "").strip()
+    try:
+        _lib.delete_image(IMAGES_LIBRARY_DIR, folder, filename)
+        return web.json_response({"ok": True})
+    except (ValueError, FileNotFoundError) as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+
+async def api_avatars_list(request):
+    import library as _lib
+    return web.json_response({"ok": True, "avatars": _lib.list_avatars(AVATARS_DIR)})
+
+
+async def api_avatars_get(request):
+    import library as _lib
+    name = request.match_info.get("name", "")
+    try:
+        return web.json_response({"ok": True, "avatar": _lib.get_avatar(AVATARS_DIR, name)})
+    except (ValueError, FileNotFoundError) as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=404)
+
+
+async def api_avatars_create(request):
+    import library as _lib
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+    try:
+        avatar = _lib.create_avatar(
+            AVATARS_DIR,
+            (body.get("name") or "").strip(),
+            description=(body.get("description") or "").strip(),
+            style_hints=(body.get("style_hints") or "").strip(),
+        )
+        return web.json_response({"ok": True, "avatar": avatar})
+    except (ValueError, FileExistsError) as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+
+async def api_avatars_update(request):
+    import library as _lib
+    name = request.match_info.get("name", "")
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+    try:
+        avatar = _lib.update_avatar(
+            AVATARS_DIR, name,
+            description=body.get("description"),
+            style_hints=body.get("style_hints"),
+        )
+        return web.json_response({"ok": True, "avatar": avatar})
+    except (ValueError, FileNotFoundError) as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+
+async def api_avatars_delete(request):
+    import library as _lib
+    name = request.match_info.get("name", "")
+    try:
+        _lib.delete_avatar(AVATARS_DIR, name)
+        return web.json_response({"ok": True})
+    except (ValueError, FileNotFoundError) as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+
+async def api_avatars_upload_reference(request):
+    """multipart/form-data: file=<image>"""
+    import library as _lib
+    name = request.match_info.get("name", "")
+    try:
+        reader = await request.multipart()
+        field = await reader.next()
+        if not field or field.name != "file":
+            return web.json_response({"ok": False, "error": "field 'file' fehlt"}, status=400)
+        filename = field.filename or "ref.png"
+        content = bytearray()
+        while True:
+            chunk = await field.read_chunk()
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > 20 * 1024 * 1024:
+                return web.json_response({"ok": False, "error": "Datei zu gross (max 20MB)"}, status=400)
+        url = _lib.add_reference(AVATARS_DIR, name, filename, bytes(content))
+        return web.json_response({"ok": True, "url": url})
+    except (ValueError, FileNotFoundError) as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+
+async def api_avatars_delete_reference(request):
+    import library as _lib
+    name = request.match_info.get("name", "")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    filename = (body.get("filename") or request.query.get("filename") or "").strip()
+    try:
+        _lib.delete_reference(AVATARS_DIR, name, filename)
+        return web.json_response({"ok": True})
+    except (ValueError, FileNotFoundError) as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+
+async def api_medical_reason(request):
+    """POST /api/medical/reason
+    Body: {query, provider?, model?, include_sources?: list[str]}
+      include_sources filter — default ["amboss", "viamedici", "rag"]
+
+    Sammelt parallel Kontext aus Amboss + ViaMedici + Vault-RAG, kombiniert zu
+    einem strukturierten System-Prompt, und lässt den gewählten LLM-Provider
+    (default claude-cli) eine synthesierte medizinische Antwort formulieren.
+    Non-streaming — gibt vollständige Response nach Abschluss zurück.
+
+    Response: {ok, answer, sources: {amboss, viamedici, rag}, provider, model, latency_ms}
+    """
+    import time as _time
+    from llm_client import invoke_llm, Message, TextDelta, ErrorEvent, MessageStop, UsageEvent
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    query = (body.get("query") or "").strip()
+    if not query or len(query) < 5:
+        return web.json_response({"ok": False, "error": "query zu kurz"}, status=400)
+
+    provider = (body.get("provider") or "claude-cli").strip()
+    model = (body.get("model") or "").strip()
+    include = body.get("include_sources") or ["amboss", "viamedici", "rag"]
+    if isinstance(include, str):
+        include = [s.strip() for s in include.split(",") if s.strip()]
+
+    t0 = _time.time()
+
+    # Parallel fetchen
+    tasks: dict[str, asyncio.Future] = {}
+    if "rag" in include:
+        tasks["rag"] = asyncio.create_task(_build_rag_context(query, n_results=6, min_score=0.3))
+    if "amboss" in include:
+        tasks["amboss"] = asyncio.create_task(_fetch_amboss_medical(query, UPLOADS_DIR))
+    if "viamedici" in include:
+        tasks["viamedici"] = asyncio.create_task(_fetch_viamedici_medical(query, UPLOADS_DIR))
+
+    rag_result = amboss_result = viamedici_result = None
+    if "rag" in tasks:
+        try:
+            rag_result = await tasks["rag"]
+        except Exception as e:
+            print(f"[MedAgent] rag failed: {e}")
+    if "amboss" in tasks:
+        try:
+            amboss_result = await tasks["amboss"]
+        except Exception as e:
+            print(f"[MedAgent] amboss failed: {e}")
+    if "viamedici" in tasks:
+        try:
+            viamedici_result = await tasks["viamedici"]
+        except Exception as e:
+            print(f"[MedAgent] viamedici failed: {e}")
+
+    # Strukturierter Context-Block
+    ctx_parts: list[str] = []
+    if rag_result and rag_result[0]:
+        ctx_parts.append(rag_result[0])  # Schon formatierter Block
+    if amboss_result:
+        amboss_block = "\n\n--- AMBOSS ---\n" + "\n\n".join(
+            f"### {a['title']}  (eid: {a['eid']})\n"
+            f"{a.get('abstract', '')}\n\n{a.get('text', '')}"
+            for a in amboss_result
+        )
+        ctx_parts.append(amboss_block)
+    if viamedici_result:
+        vm_block = "\n\n--- THIEME/VIAMEDICI ---\n" + "\n\n".join(
+            f"### {v['title']}  (assetId: {v['assetId']})\n{v['text']}"
+            for v in viamedici_result
+        )
+        ctx_parts.append(vm_block)
+
+    gather_ms = int((_time.time() - t0) * 1000)
+
+    if not ctx_parts:
+        return web.json_response({
+            "ok": False,
+            "error": "Keine Quelle lieferte Kontext (Cookies abgelaufen? Frage zu spezifisch?)",
+            "sources": {"amboss": [], "viamedici": [], "rag_chunks": 0},
+            "gather_ms": gather_ms,
+        }, status=200)
+
+    combined_context = "\n".join(ctx_parts)
+    system_prompt = (
+        "Du bist ein medizinisches Reasoning-System für den Medizinstudenten Robin. "
+        "Antworte präzise auf Deutsch, strukturiert, klinisch relevant. "
+        "Nutze AUSSCHLIESSLICH die bereitgestellten Quellen unten (Amboss, Thieme/"
+        "ViaMedici, Robins Vault). Wenn eine Aussage NICHT durch die Quellen "
+        "gedeckt ist, sage es explizit ('nicht in den Quellen'). Markiere pro "
+        "Aussage die Quelle (Amboss / Thieme / Vault)."
+        + combined_context
+    )
+
+    # LLM-Call — non-streaming, sammeln bis MessageStop
+    messages = [Message(role="user", content=query)]
+    answer_text = ""
+    usage: dict = {}
+    error_msg: str | None = None
+    LLM_TIMEOUT = 120.0 # 2 Minuten für die Antwort-Synthese
+
+    try:
+        # Wir nutzen wait_for um den gesamten Generator-Lauf zu begrenzen
+        async def _run_llm():
+            nonlocal answer_text, usage, error_msg
+            async for ev in invoke_llm(
+                provider=provider,
+                model=model,
+                messages=messages,
+                system=system_prompt,
+                max_tokens=1500,
+            ):
+                if isinstance(ev, TextDelta):
+                    answer_text += ev.text
+                elif isinstance(ev, UsageEvent):
+                    usage = {
+                        "input_tokens": ev.input_tokens + ev.cache_read_tokens,
+                        "output_tokens": ev.output_tokens,
+                    }
+                elif isinstance(ev, ErrorEvent):
+                    error_msg = f"{ev.code}: {ev.message}"
+                elif isinstance(ev, MessageStop):
+                    break
+        
+        await asyncio.wait_for(_run_llm(), timeout=LLM_TIMEOUT)
+
+    except asyncio.TimeoutError:
+        error_msg = f"LLM Timeout ({LLM_TIMEOUT}s)"
+        print(f"[MedAgent] LLM synthesis timed out after {LLM_TIMEOUT}s")
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        print(f"[MedAgent] LLM synthesis failed: {e}")
+
+    total_ms = int((_time.time() - t0) * 1000)
+
+    if error_msg and not answer_text:
+        return web.json_response({
+            "ok": False,
+            "error": error_msg,
+            "provider": provider,
+            "latency_ms": total_ms,
+        }, status=200)
+
+    return web.json_response({
+        "ok": True,
+        "query": query,
+        "answer": answer_text,
+        "sources": {
+            "amboss": amboss_result or [],
+            "viamedici": viamedici_result or [],
+            "rag_chunks": (rag_result[1] if rag_result else 0),
+        },
+        "provider": provider,
+        "model": model or "default",
+        "usage": usage,
+        "gather_ms": gather_ms,
+        "latency_ms": total_ms,
+    })
+
+
+async def api_vault_bundles(request):
+    """GET /api/vault/bundles — kuratierte Themen-Bundles + File-Counts
+    (für Frontend-Context-Picker).
+    """
+    result = []
+    for name, paths in VAULT_CONTEXT_BUNDLES.items():
+        file_count = 0
+        sample_files: list[str] = []
+        for rel in paths:
+            abs_path = _VAULT_ROOT / rel
+            if not abs_path.exists():
+                continue
+            if abs_path.is_file() and abs_path.suffix.lower() == ".md":
+                file_count += 1
+                sample_files.append(rel)
+            elif abs_path.is_dir():
+                for md in abs_path.rglob("*.md"):
+                    file_count += 1
+                    if len(sample_files) < 5:
+                        sample_files.append(
+                            str(md.relative_to(_VAULT_ROOT)).replace("\\", "/")
+                        )
+        result.append({
+            "name": name,
+            "paths": paths,
+            "file_count": file_count,
+            "sample_files": sample_files[:5],
+        })
+    return web.json_response({"bundles": result})
+
+
+async def api_chat_session_context(request):
+    """POST /api/chat/session/{session_id}/context
+    Body: {"bundles": ["medizin", "dissertation"]}
+    Setzt Context-Bundles pro Session. Leere Liste deaktiviert Global-Context.
+    """
+    sid = request.match_info.get("session_id", "")
+    session = sessions.sessions.get(sid)
+    if not session:
+        return web.json_response({"ok": False, "error": "Session nicht gefunden"}, status=404)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    bundles_raw = body.get("bundles") or []
+    if not isinstance(bundles_raw, list):
+        return web.json_response({"ok": False, "error": "bundles muss Liste sein"}, status=400)
+
+    valid = [b for b in bundles_raw if isinstance(b, str) and b.lower() in VAULT_CONTEXT_BUNDLES]
+    session.context_bundles = valid
+    sessions.persist()
+
+    if valid:
+        await _broadcast_stream_event(session.session_id, {
+            "type": "chat.system",
+            "session_id": session.session_id,
+            "message": f"📁 Vault-Kontext aktiviert: {', '.join(valid)}",
+        })
+    return web.json_response({
+        "ok": True,
+        "session_id": session.session_id,
+        "context_bundles": session.context_bundles,
+    })
+
+
+async def api_llm_providers(request):
+    """GET /api/llm/providers — Capability-Liste aller registrierten LLM-Provider.
+
+    Frontend nutzt das um:
+      - Den Provider-Dropdown dynamisch zu befüllen
+      - Capability-spezifische UI-Hints zu zeigen (z.B. Resume-Indicator,
+        Image-Badge, "streamt nicht fließend" bei codex-cli)
+    """
+    from llm_client import list_providers
+    return web.json_response({"providers": list_providers()})
+
+
+async def api_chat_session_provider(request):
+    """POST /api/chat/session/{session_id}/provider — Provider/Model einer
+    Session setzen oder wechseln.
+
+    Body: {"provider": str, "model": str|null}
+    Response: {"ok": bool, "provider_switched": bool, "message": str|null, ...}
+
+    Triggert _set_session_provider — Provider-Wechsel → provider_thread_id
+    wird verworfen und eine Systemmeldung in history angehängt.
+    """
+    session_id = request.match_info.get("session_id", "")
+    session = sessions.sessions.get(session_id)
+    if not session:
+        return web.json_response({"ok": False, "error": "Session nicht gefunden"}, status=404)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    provider = (body.get("provider") or "").strip()
+    model = body.get("model")
+    if model is not None:
+        model = str(model).strip()
+    if not provider:
+        return web.json_response({"ok": False, "error": "provider erforderlich"}, status=400)
+
+    # jarvis-main + jarvis-heartbeat sind die Orchestrator-Sessions und auf
+    # claude-cli fixiert — keine Provider-Wechsel erlaubt.
+    if session_id in ("jarvis-main", "jarvis-heartbeat") and provider != "claude-cli":
+        return web.json_response({
+            "ok": False,
+            "error": "Jarvis-Sessions laufen fest auf Claude (CLI). Provider-Wechsel hier nicht erlaubt.",
+        }, status=400)
+
+    try:
+        info = _set_session_provider(session, provider, model)
+    except ValueError as ve:
+        return web.json_response({"ok": False, "error": str(ve)}, status=400)
+
+    # Wenn ein System-Message in history kam, via WS broadcasten (Client sieht's gleich)
+    if info.get("provider_switched") and info.get("message"):
+        await _broadcast_stream_event(session.session_id, {
+            "type": "chat.system",
+            "session_id": session.session_id,
+            "message": info["message"],
+        })
+
+    return web.json_response({
+        "ok": True,
+        "session_id": session.session_id,
+        "provider": session.provider,
+        "model": session.model,
+        "provider_thread_id": session.provider_thread_id,
+        "provider_switched": info.get("provider_switched", False),
+        "message": info.get("message"),
+    })
+
+
+async def api_chat_session_compress(request):
+    """POST /api/chat/session/{session_id}/compress
+
+    Komprimiert die Session-History in eine kompakte Zusammenfassung und startet
+    eine frische CLI-Session mit dem Summary als Kontext-Seed.
+
+    Nur möglich wenn die Session gerade nicht streamt und >= 10 Messages hat.
+    """
+    session_id = request.match_info.get("session_id", "")
+    session = sessions.sessions.get(session_id)
+    if not session:
+        return web.json_response({"ok": False, "error": "Session nicht gefunden"}, status=404)
+    if session._stream_active or session.lock.locked():
+        return web.json_response({"ok": False, "error": "Session streamt gerade"}, status=409)
+
+    history = session.history or []
+    user_assistant = [m for m in history if m.get("role") in ("user", "assistant")]
+    if len(user_assistant) < 10:
+        return web.json_response({"ok": False, "error": "Zu wenige Messages für Komprimierung"}, status=400)
+
+    # Build conversation text (last 100 messages, max 800 chars each)
+    lines = []
+    for m in user_assistant[-100:]:
+        role = "Robin" if m["role"] == "user" else "Jarvis"
+        content = (m.get("content") or "")[:800]
+        lines.append(f"[{role}] {content}")
+    conv_text = "\n\n".join(lines)
+
+    # One-shot summary via _llm_oneshot
+    system = (
+        "Du bist Jarvis, Robins persönlicher AI-Assistent. "
+        "Erstelle eine kompakte, strukturierte Zusammenfassung des folgenden Gesprächs. "
+        "Halte alle wichtigen Fakten, Entscheidungen, offenen Aufgaben und Kontext. "
+        "Format: Bullet-Punkte, maximal 1500 Zeichen. Deutsch."
+    )
+    user_prompt = f"Fasse dieses Gespräch kompakt zusammen:\n\n{conv_text[:12000]}"
+
+    print(f"[Compress] Session {session_id[:8]}: {len(user_assistant)} msgs → summary start")
+    summary, _, err = await _llm_oneshot(
+        provider=session.provider or "claude-cli",
+        model=session.model or "",
+        user_message=user_prompt,
+        system=system,
+        max_tokens=1500,
+    )
+    if err and not summary:
+        return web.json_response({"ok": False, "error": f"Summary-Fehler: {err}"}, status=500)
+
+    # Reset session: clear history → summary als Seed, neue CLI-Session
+    old_count = len(user_assistant)
+    seed = (
+        f"[KONTEXT-KOMPRIMIERUNG — {old_count} Messages zusammengefasst]\n\n"
+        f"{summary}"
+    )
+    session.history = [{"role": "assistant", "content": seed}]
+    session.provider_thread_id = None
+    session.cli_session_id = None
+    session.message_count = 1
+    sessions.persist()
+
+    # Broadcast system event so frontend reloads chat
+    await _broadcast_stream_event(session.session_id, {
+        "type": "chat.compressed",
+        "session_id": session.session_id,
+        "old_count": old_count,
+        "summary": seed,
+    })
+
+    print(f"[Compress] Session {session_id[:8]}: done — {old_count} msgs → {len(seed)} chars summary")
+    return web.json_response({
+        "ok": True,
+        "old_message_count": old_count,
+        "summary_length": len(summary),
+        "seed_preview": seed[:200],
+    })
+
+
+async def _run_chat(ws, session, message, attachments=None):
+    """Provider-agnostischer Chat-Stream. Nutzt llm_client.invoke_llm() statt
+    direktem Subprocess. Funktioniert mit allen registrierten Providern
+    (claude-cli, claude-api, codex-cli, openai).
+
+    Semantik gegenüber dem legacy _run_claude bewahrt:
+      - chat.start / chat.delta / chat.tool_use / chat.tool_result / chat.ping
+        / chat.done / chat.error als WS-Events
+      - Partial-Persist alle 5 s
+      - Ping alle 30 s wenn kein Text fließt (Frontend-Stuck-Timer)
+      - Subscriber-Check: wenn alle WS weg → Task canceln (Provider beendet
+        seinen Subprocess über CancelledError-Pfad)
+      - Stale-resume-Retry: wenn claude-cli mit --resume leer zurückkommt,
+        provider_thread_id droppen + einmal ohne Resume retry
+      - Genau EIN Abschluss-Event (chat.done ODER chat.error), niemals beides
+        und niemals keins — Frontend sieht nie einen hängenden Turn
+    """
+    import time as _time
+    from llm_client import (
+        invoke_llm, Message, TextDelta, ToolUseStart, ToolUseEnd,
+        ToolResultEvent, MessageStop, UsageEvent, MetadataEvent, ErrorEvent, get_provider_info,
+    )
+
+    # Provider-Info für Gating (supports_images, streams_incremental_text, ...)
+    try:
+        prov_info = get_provider_info(session.provider or "claude-cli")
+    except Exception as e:
+        await _broadcast_stream_event(session.session_id, {
+            "type": "chat.error",
+            "session_id": session.session_id,
+            "error": f"Unbekannter Provider {session.provider!r}: {e}",
+        })
+        return
+
+    _stream_start(session.session_id)
+    if ws is not None:
+        _stream_subscribers.setdefault(session.session_id, set()).add(ws)
+    else:
+        _stream_subscribers.setdefault(session.session_id, set())
+    _activity_set("chat", active=True)
+    session._stream_active = True
+    session.last_heartbeat = datetime.now().isoformat()
+    sessions.persist()
+
+    # State für genau-einmaligen Abschluss
+    _done_sent = False
+
+    async def _send_done(payload: dict):
+        """Genau EIN Abschluss-Event. Subsequent calls no-op."""
+        nonlocal _done_sent
+        if _done_sent:
+            return
+        _done_sent = True
+        await _broadcast_stream_event(session.session_id, payload)
+        # chat.done und chat.error gehen zusaetzlich an alle Clients —
+        # so kann ein nach Restart frisch verbundener Browser den Stuck-Spinner
+        # einer Session aufloesen, fuer die er noch keinen Subscriber hatte.
+        if payload.get("type") in ("chat.done", "chat.error"):
+            await _broadcast_all_ws(payload)
+        _activity_set("chat", active=False, pending_delta=1)
+        _stream_end(session.session_id)
+        asyncio.get_event_loop().call_later(30, _stream_cleanup, session.session_id)
+
+    async with session.lock:
+        session._lock_acquired_at = _time.time()
+        try:
+            # Attachment-Notes bauen (Image-Gate nach supports_images)
+            attachment_notes, _image_blocks = _build_attachment_notes(
+                attachments, bool(prov_info.get("supports_images", False)),
+            )
+
+            # Messages-Liste
+            messages = _history_to_messages(session, message, attachment_notes)
+
+            # System-Prompt — MC-spezifisch, egal welcher Provider
+            system = _build_system_prompt()
+
+            # Shared RAG (Geminis Stufe 1): semantisch ähnliche Chunks aus Vault +
+            # Diss als zusätzlichen System-Context. Funktioniert provider-agnostisch
+            # weil es im System-Prompt landet — kein Tool-Wiring nötig.
+            try:
+                rag_ctx, rag_n = await _build_rag_context(message)
+                if rag_ctx:
+                    system = system + rag_ctx
+                    print(f"[RAG] injected {rag_n} chunks for session {session.session_id[:8]}")
+                    await _broadcast_stream_event(session.session_id, {
+                        "type": "chat.rag_info",
+                        "session_id": session.session_id,
+                        "chunks": rag_n,
+                    })
+            except Exception as e:
+                print(f"[RAG] context skipped (error: {e})")
+
+            # Shared Scratchpad (Stufe 3): wenn der Peer was reingeschrieben hat,
+            # bekommt der aktuelle Provider es als System-Context zu sehen.
+            if getattr(session, "shared_notes", None):
+                notes_block = "\n\n--- SHARED SCRATCHPAD (Peer-Notes) ---\n"
+                for k, v in session.shared_notes.items():
+                    notes_block += f"### {k}\n{v[:2000]}\n\n"
+                system = system + notes_block
+
+            # Global Context (Geminis #2): kuratierte Vault-Bereiche als Volltext
+            # — nur wenn die Session Bundles aktiviert hat. Ergänzt RAG um "atme
+            # das ganze Dissertation-Kapitel" statt nur Score-getroffene Chunks.
+            if session.context_bundles:
+                try:
+                    gc_ctx, gc_n, gc_paths = await asyncio.to_thread(
+                        _load_vault_context, session.context_bundles,
+                    )
+                    if gc_ctx:
+                        system = system + gc_ctx
+                        print(f"[Vault] injected {gc_n} files from bundles={session.context_bundles}")
+                        await _broadcast_stream_event(session.session_id, {
+                            "type": "chat.vault_context",
+                            "session_id": session.session_id,
+                            "files": gc_n,
+                            "bundles": list(session.context_bundles),
+                            "paths": gc_paths[:10],
+                        })
+                except Exception as e:
+                    print(f"[Vault] context skipped (error: {e})")
+
+            # Provider-kwargs mit Resume-Token-Callback
+            def _on_resume_token(new_token: str):
+                """Provider liefert neue Thread/Session-ID → in Session persistieren."""
+                session.provider_thread_id = new_token
+                if session.provider == "claude-cli":
+                    session.cli_session_id = new_token  # Legacy-Sync
+                sessions.persist()
+                print(f"[Chat] {session.provider} thread_id: {new_token[:12]}")
+
+            prov_kwargs = _build_provider_kwargs(session, on_resume_token=_on_resume_token)
+
+            # Persist User-Message SOFORT (überlebt Reload während Streaming)
+            session.history.append({"role": "user", "content": message})
+            sessions.persist()
+
+            # chat.start → session subs + alle clients (Sidebar-Indikator)
+            from llm_client import _humanize_model_name
+            start_event = {"type": "chat.start", "session_id": session.session_id,
+                           "provider": session.provider, 
+                           "model": _humanize_model_name(session.provider, session.model)}
+            await _broadcast_stream_event(session.session_id, start_event)
+            await _broadcast_all_ws(start_event)
+
+            used_resume = bool(session.provider_thread_id) and session.provider == "claude-cli"
+            used_model = session.model or "(Auto)"
+            print(f"[Chat] provider={session.provider} model={used_model} "
+                  f"resume={session.provider_thread_id[:12] if session.provider_thread_id else 'new'}")
+            t_start = _time.time()
+
+            full_text = ""
+            last_tool = ""
+            last_tool_id = ""
+            usage_info: dict = {}
+            stop_reason = "end_turn"
+            error_seen: str | None = None
+            error_code: str = ""
+            _last_partial_persist = _time.time()
+            _stream_started_at = _time.time()
+            _last_ping = _time.time()
+
+            async def _ping_loop():
+                """Sendet alle ~30 s einen chat.ping wenn nichts fließt. Läuft parallel zum Stream."""
+                nonlocal _last_ping
+                while True:
+                    await asyncio.sleep(28)
+                    if _done_sent:
+                        break
+                    elapsed = _time.time() - _stream_started_at
+                    if _time.time() - _last_ping >= 28:
+                        _last_ping = _time.time()
+                        session.last_heartbeat = datetime.now().isoformat()
+                        await _broadcast_stream_event(session.session_id, {
+                            "type": "chat.ping",
+                            "session_id": session.session_id,
+                            "elapsed": int(elapsed),
+                        })
+
+            async def _subscriber_watchdog(stream_task: asyncio.Task):
+                """Bricht den Stream wenn alle WS-Subscriber weg sind."""
+                while not stream_task.done():
+                    await asyncio.sleep(5)
+                    subs = _stream_subscribers.get(session.session_id, set())
+                    alive_subs = {s for s in subs if not s.closed}
+                    if not alive_subs and not _ws_clients:
+                        print(f"[Chat] All subs gone for {session.session_id[:8]} — cancelling")
+                        stream_task.cancel()
+                        return
+
+            # Background-Tasks für Ping + Watchdog
+            ping_task = asyncio.create_task(_ping_loop())
+            current_stream_task = asyncio.current_task()
+            watchdog_task = asyncio.create_task(_subscriber_watchdog(current_stream_task))
+
+            try:
+                async for ev in invoke_llm(
+                    provider=session.provider,
+                    model=session.model or "",
+                    messages=messages,
+                    system=system,
+                    **prov_kwargs,
+                ):
+                    # Alle Events resetzen den Stuck-Timer
+                    _last_ping = _time.time()
+
+                    if isinstance(ev, TextDelta):
+                        if ev.text:
+                            full_text += ev.text
+                            await _broadcast_stream_event(session.session_id, {
+                                "type": "chat.delta",
+                                "session_id": session.session_id,
+                                "text": ev.text,
+                            })
+                    elif isinstance(ev, ToolUseStart):
+                        last_tool = ev.name
+                        last_tool_id = ev.id
+                        # chat.tool_use wird beim End mit finalem input gesendet
+                    elif isinstance(ev, ToolUseEnd):
+                        last_tool = ev.name
+                        last_tool_id = ev.id
+                        # Große String-Inputs truncaten fürs WS (Write-Bodies etc.)
+                        safe_input: dict = {}
+                        for k, v in (ev.input or {}).items():
+                            if isinstance(v, str) and len(v) > 200:
+                                safe_input[k] = v[:200] + "..."
+                            else:
+                                safe_input[k] = v
+                        await _broadcast_stream_event(session.session_id, {
+                            "type": "chat.tool_use",
+                            "session_id": session.session_id,
+                            "tool": last_tool,
+                            "input": safe_input,
+                        })
+                    elif isinstance(ev, ToolResultEvent):
+                        await _broadcast_stream_event(session.session_id, {
+                            "type": "chat.tool_result",
+                            "session_id": session.session_id,
+                            "tool": ev.tool_name or last_tool,
+                            "is_error": ev.is_error,
+                        })
+                    elif isinstance(ev, UsageEvent):
+                        # Context = alles was das Modell in diesem Turn sieht.
+                        # Bei Claude CLI mit Prompt-Cache liegt der grosse Block
+                        # (System-Prompt + History) in cache_read_input_tokens —
+                        # ohne den waere _total_used massiv unterschaetzt.
+                        _total_used = (
+                            ev.input_tokens
+                            + ev.cache_creation_tokens
+                            + ev.cache_read_tokens
+                            + ev.output_tokens
+                        )
+                        _m = (used_model or "").lower()
+                        if any(x in _m for x in ("gemini-1.5", "gemini-exp")):
+                            _ctx_win = 1_000_000
+                        elif "gemini" in _m:
+                            _ctx_win = 1_048_576
+                        else:
+                            _ctx_win = 200_000
+                        usage_info = {
+                            "input_tokens": ev.input_tokens + ev.cache_creation_tokens + ev.cache_read_tokens,
+                            "output_tokens": ev.output_tokens,
+                            "cache_creation_tokens": ev.cache_creation_tokens,
+                            "cache_read_tokens": ev.cache_read_tokens,
+                            "context_window": _ctx_win,
+                            "context_used": _total_used,
+                            "context_pct": round(_total_used / _ctx_win * 100, 1) if _total_used else 0,
+                        }
+                        print(f"[Context] in={ev.input_tokens} cc={ev.cache_creation_tokens} cr={ev.cache_read_tokens} out={ev.output_tokens} → {_total_used}/{_ctx_win} = {usage_info['context_pct']}%")
+                        await _broadcast_stream_event(session.session_id, {
+                            "type": "chat.usage",
+                            "session_id": session.session_id,
+                            **usage_info
+                        })
+                        # Broadcast context% to ALL clients — bypasses stream-subscriber filter.
+                        # Ensures topbar always shows correct context even if WS wasn't subscribed.
+                        await _broadcast_all_ws({
+                            "type": "context.update",
+                            "session_id": session.session_id,
+                            "context_pct": usage_info["context_pct"],
+                            "context_used": usage_info["context_used"],
+                            "context_window": usage_info["context_window"],
+                        })
+                    elif isinstance(ev, MessageStop):
+                        stop_reason = ev.stop_reason
+                    elif isinstance(ev, MetadataEvent):
+                        if ev.model:
+                            used_model = ev.model
+                        await _broadcast_stream_event(session.session_id, {
+                            "type": "chat.metadata",
+                            "session_id": session.session_id,
+                            "model": ev.model,
+                            "provider": session.provider,
+                        })
+                    elif isinstance(ev, ErrorEvent):
+                        error_seen = ev.message
+                        error_code = ev.code
+
+                    # Partial-Persist alle 5 s
+                    if full_text and (session._streaming_partial is None or
+                                      (_time.time() - _last_partial_persist) > 5):
+                        _last_partial_persist = _time.time()
+                        session._streaming_partial = full_text
+                        sessions.persist()
+            finally:
+                ping_task.cancel()
+                watchdog_task.cancel()
+
+            duration_ms = int((_time.time() - t_start) * 1000)
+
+            # Stale-resume-Detection (claude-cli-spezifisch)
+            if used_resume and full_text and session.provider == "claude-cli":
+                _low = full_text.lower()
+                if "session" in _low and "not found" in _low and len(full_text) < 500:
+                    print("[Chat] Stale --resume detected, forcing retry")
+                    full_text = ""
+                    # Fehler vom Stale-Resume nicht als echten Fehler melden
+                    error_seen = None
+
+            # Fehler-Pfad: ErrorEvent gesehen ODER (leer & kein Resume-Retry möglich)
+            if error_seen:
+                session._stream_active = False
+                sessions.persist()
+                await _send_done({
+                    "type": "chat.error",
+                    "session_id": session.session_id,
+                    "error": error_seen,
+                    "error_code": error_code,
+                    "provider": session.provider,
+                })
+                print(f"[Chat] error: {error_code} — {error_seen[:120]}")
+                return
+
+            # Leer-Pfad: Stale-resume-Retry für claude-cli
+            if not full_text:
+                if used_resume and session.provider == "claude-cli":
+                    print("[Chat] --resume lieferte leer, retry ohne resume")
+                    session.provider_thread_id = None
+                    session.cli_session_id = None
+                    sessions.persist()
+                    if session.history and session.history[-1].get("role") == "user":
+                        session.history.pop()
+                        sessions.persist()
+                    _stream_end(session.session_id)
+                    asyncio.get_event_loop().call_later(30, _stream_cleanup, session.session_id)
+                    # Wichtig: nicht über _send_done — das wäre stale Dup. Stattdessen Recursive-Call.
+                    await _run_chat(ws, session, message, attachments)
+                    return
+                session._stream_active = False
+                sessions.persist()
+                await _send_done({
+                    "type": "chat.error",
+                    "session_id": session.session_id,
+                    "error": f"{session.provider} hat keine Antwort geliefert.",
+                    "provider": session.provider,
+                })
+                return
+
+            # Erfolgspfad
+            session.history.append({"role": "assistant", "content": full_text})
+            session.message_count += 1
+            session.last_message = datetime.now().isoformat()
+            session.last_heartbeat = session.last_message
+            session.process = None
+            session._streaming_partial = None
+            session._stream_active = False
+            sessions.persist()
+
+            done_payload: dict = {
+                "type": "chat.done",
+                "session_id": session.session_id,
+                "full_text": full_text,
+                "duration_ms": duration_ms,
+                "model": used_model,
+                "provider": session.provider,
+                "stop_reason": stop_reason,
+            }
+            if usage_info:
+                done_payload.update(usage_info)
+            print(f"[Chat-done-debug] context_pct={done_payload.get('context_pct')} usage_info_keys={list(usage_info.keys()) if usage_info else 'EMPTY'}")
+            await _send_done(done_payload)
+            print(f"[Chat] chat.done: session={session.session_id[:8]} "
+                  f"({len(full_text)} chars, {duration_ms}ms, provider={session.provider})")
+
+            # Auto-classify wie im Legacy-Pfad
+            _should_classify = (
+                (not session.topic and session.message_count >= 2) or
+                (session.message_count == 4 and not session.custom_title) or
+                (not session.topic and session.message_count % 3 == 0)
+            )
+            if _should_classify:
+                asyncio.create_task(_classify_session_headless(session))
+
+        except asyncio.CancelledError:
+            print(f"[Chat] Cancelled: session={session.session_id[:8]}")
+            _ft = locals().get("full_text", "")
+            if _ft and (not session.history or session.history[-1].get("content") != _ft + "\n\n_(abgebrochen)_"):
+                session.history.append({"role": "assistant", "content": _ft + "\n\n_(abgebrochen)_"})
+            session._stream_active = False
+            sessions.persist()
+            # Abschluss-Event auch bei Cancel, damit Frontend nicht hängt
+            if not _done_sent:
+                await _send_done({
+                    "type": "chat.error",
+                    "session_id": session.session_id,
+                    "error": "Abgebrochen.",
+                    "provider": session.provider,
+                })
+            raise
+        except Exception as e:
+            print(f"[Chat] Exception: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            session._stream_active = False
+            sessions.persist()
+            if not _done_sent:
+                await _send_done({
+                    "type": "chat.error",
+                    "session_id": session.session_id,
+                    "error": f"{type(e).__name__}: {e}",
+                    "provider": session.provider,
+                })
+
+
 async def _run_claude(ws, session, message, attachments=None):
-    """Run Claude CLI subprocess with stream-json and send granular WS events."""
+    """Legacy-Wrapper: delegiert an _run_chat. Alle neuen WS-Handler rufen
+    _run_chat direkt auf. Bleibt für Backward-Compat mit bestehenden Call-Sites.
+    """
+    return await _run_chat(ws, session, message, attachments)
+
+
+# --- Legacy _run_claude-Body (vor Chat-Refactor 2026-04-23) -------------------
+# Wird nicht mehr gerufen, aber als Referenz behalten. Nach 1-2 Wochen stabiler
+# Nutzung des provider-agnostischen Pfads löschen.
+async def _run_claude_legacy(ws, session, message, attachments=None):
+    """[DEPRECATED] Alter Claude-CLI-direkter Pfad. Nicht mehr aktiv."""
     import time as _time
 
     _stream_start(session.session_id)
@@ -6438,7 +13349,8 @@ async def _run_claude(ws, session, message, attachments=None):
             stdin_text = full_prompt
             used_resume = session.cli_session_id
 
-            used_model = model or "default"
+            from llm_client import _humanize_model_name
+            used_model = _humanize_model_name("claude-cli", model)
             print(f"[Claude] Streaming: session={session.session_id[:8]} model={used_model} resume={used_resume or 'new'}")
             t_start = _time.time()
 
@@ -6468,6 +13380,7 @@ async def _run_claude(ws, session, message, attachments=None):
 
             full_text = ""
             result_event = None
+            last_usage = {}  # fallback: captured from assistant events
             last_tool = ""
             _last_partial_persist = _time.time()  # track periodic partial saves
             _stream_started_at = _time.time()
@@ -6537,6 +13450,9 @@ async def _run_claude(ws, session, message, attachments=None):
                         continue
 
                     if evt_type == "assistant":
+                        _msg_usage = event.get("message", {}).get("usage", {})
+                        if _msg_usage:
+                            last_usage = _msg_usage
                         for block in event.get("message", {}).get("content", []):
                             block_type = block.get("type", "")
                             if block_type == "text":
@@ -6659,26 +13575,46 @@ async def _run_claude(ws, session, message, attachments=None):
                 "full_text": full_text,
                 "duration_ms": duration_ms,
                 "model": used_model,
+                "provider": session.provider,
             }
             if result_event:
                 done_payload["cost_usd"] = result_event.get("total_cost_usd", result_event.get("cost_usd", 0))
-                usage = result_event.get("usage", {})
-                input_base = usage.get("input_tokens", 0)
-                cache_read = usage.get("cache_read_input_tokens", 0)
-                cache_create = usage.get("cache_creation_input_tokens", 0)
-                done_payload["input_tokens"] = input_base + cache_read + cache_create
-                done_payload["output_tokens"] = usage.get("output_tokens", 0)
-                # Context fill info  -  use only base input + output (cache-read tokens don't count against context)
-                model_usage = result_event.get("modelUsage", {})
-                for _, mu in model_usage.items():
-                    ctx_window = mu.get("contextWindow", 0)
-                    if ctx_window:
-                        total_used = input_base + cache_create + done_payload["output_tokens"]
-                        done_payload["context_window"] = ctx_window
-                        done_payload["context_used"] = total_used
-                        done_payload["context_pct"] = round(total_used / ctx_window * 100, 1)
-                        print(f"[Context] {total_used}/{ctx_window} = {done_payload['context_pct']}%")
-                        break
+            # Use result_event.usage, fall back to last assistant-event usage
+            usage = (result_event or {}).get("usage", {}) or last_usage
+            input_base = usage.get("input_tokens", 0)
+            cache_read = usage.get("cache_read_input_tokens", 0)
+            cache_create = usage.get("cache_creation_input_tokens", 0)
+            done_payload["input_tokens"] = input_base + cache_read + cache_create
+            done_payload["output_tokens"] = usage.get("output_tokens", 0)
+            # Context fill — estimate window from modelUsage (rare) or model name
+            model_usage = (result_event or {}).get("modelUsage", {})
+            total_used = input_base + cache_create + done_payload["output_tokens"]
+            ctx_window = 0
+            for _, mu in model_usage.items():
+                ctx_window = mu.get("contextWindow", 0)
+                if ctx_window:
+                    break
+            if not ctx_window:
+                _m = (used_model or "").lower()
+                if any(x in _m for x in ("gemini-1.5", "gemini-exp")):
+                    ctx_window = 1_000_000
+                elif "gemini" in _m:
+                    ctx_window = 1_048_576
+                else:
+                    ctx_window = 200_000  # Claude Sonnet/Opus/Haiku all 200K
+            # Prefer usage_info from UsageEvent (accurate cache_read included) over recomputed total
+            if usage_info.get("context_pct") is not None and usage_info["context_pct"] > 0:
+                done_payload["context_window"] = usage_info.get("context_window", 200_000)
+                done_payload["context_used"] = usage_info.get("context_used", 0)
+                done_payload["context_pct"] = usage_info["context_pct"]
+                print(f"[Context-done] using UsageEvent value: {done_payload['context_pct']}%")
+            elif ctx_window and total_used:
+                done_payload["context_window"] = ctx_window
+                done_payload["context_used"] = total_used
+                done_payload["context_pct"] = round(total_used / ctx_window * 100, 1)
+                print(f"[Context-done] recomputed: {total_used}/{ctx_window} = {done_payload['context_pct']}%")
+            else:
+                print(f"[Context-debug] result_event={'None' if result_event is None else 'yes'}, usage={usage}, total_used={total_used}")
 
             await _broadcast_stream_event(session.session_id, done_payload)
             await _broadcast_all_ws(done_payload)  # also notify all clients for sidebar toast + indicator
@@ -7142,11 +14078,32 @@ async def ws_chat(request):
                 session_id = data.get("session_id")
                 message = data.get("message", "").strip()
                 attachments = data.get("attachments", [])  # list of filenames in uploads/
+                # Provider + Model optional pro Message — wenn gesetzt & abweichend,
+                # triggert Switch-Logik (Thread-Reset bei Provider-Wechsel).
+                desired_provider = (data.get("provider") or "").strip()
+                desired_model = data.get("model")
+                if desired_model is not None:
+                    desired_model = str(desired_model).strip()
                 if not message and not attachments:
                     await ws.send_json({"type": "chat.error", "error": "Empty message"})
                     continue
 
                 session = sessions.get_or_create(session_id)
+
+                # Validiere gewünschten Provider (nur Check, noch kein State-Update),
+                # damit ungültiger Provider NICHT erst nach Lock-Check gemeldet wird.
+                if desired_provider:
+                    try:
+                        from llm_client import PROVIDER_NAMES as _PN
+                        if desired_provider not in _PN:
+                            raise ValueError(
+                                f"Unbekannter Provider {desired_provider!r}. Erlaubt: {', '.join(_PN)}"
+                            )
+                    except ValueError as ve:
+                        await ws.send_json({"type": "chat.error",
+                                            "session_id": session.session_id,
+                                            "error": str(ve)})
+                        continue
 
                 if session.lock.locked():
                     # Auto-unlock only truly stuck sessions:
@@ -7179,8 +14136,29 @@ async def ws_chat(request):
                     })
                     continue
 
-                # Run Claude in background task so WS can still receive cancel etc.
-                asyncio.create_task(_run_claude(ws, session, message or "(siehe Anhang)", attachments))
+                # Provider-Switch atomar mit Send: erst nach Lock-Check, bevor
+                # der Stream startet. So kann der Switch nicht durchrutschen
+                # wenn der Send selbst gerade abgelehnt wurde.
+                if desired_provider:
+                    try:
+                        switch_info = _set_session_provider(session, desired_provider, desired_model)
+                        if switch_info["provider_switched"] and switch_info["message"]:
+                            await _broadcast_stream_event(session.session_id, {
+                                "type": "chat.system",
+                                "session_id": session.session_id,
+                                "message": switch_info["message"],
+                            })
+                    except ValueError as ve:
+                        # Sollte schon oben validiert sein, Safety-Net
+                        await ws.send_json({"type": "chat.error",
+                                            "session_id": session.session_id, "error": str(ve)})
+                        continue
+                elif desired_model is not None and desired_model != session.model:
+                    # Model-only-Wechsel im selben Provider: kein Thread-Reset
+                    _set_session_provider(session, session.provider, desired_model)
+
+                # Run chat in background task so WS can still receive cancel etc.
+                asyncio.create_task(_run_chat(ws, session, message or "(siehe Anhang)", attachments))
 
             elif msg_type == "chat.cancel":
                 session_id = data.get("session_id")
@@ -7298,11 +14276,212 @@ async def index_handler(request):
     })
 
 
+# ---------------------------------------------------------------------------
+# Betreuer view (read-only, token-protected)
+# ---------------------------------------------------------------------------
+BETREUER_TOKEN = "diss-betreuer-2026"  # share this URL with your supervisor
+
+async def betreuer_handler(request):
+    token = request.query.get("token", "")
+    if token != BETREUER_TOKEN:
+        return web.Response(status=403, text="Zugriff verweigert")
+    return web.FileResponse(STATIC_DIR / "betreuer.html", headers={
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+    })
+
+async def betreuer_check_handler(request):
+    token = request.query.get("token", "")
+    if token != BETREUER_TOKEN:
+        return web.Response(status=403, text="invalid token")
+    return web.json_response({"ok": True})
+
+
+
+# ============================================================================
+# HEARTBEAT & ORCHESTRATOR LOGIC — externes Modul (heartbeat.py). Die alten
+# in-line-Funktionen wurden in den HeartbeatManager migriert. Die legacy-
+# Definitionen unten bleiben als dünne No-Ops stehen für Code-Pfade die
+# noch darauf referenzieren, werden aber nicht mehr genutzt.
+# ============================================================================
+
+_HEARTBEAT_INTERVAL = 600  # legacy, wird ignoriert — siehe config.heartbeat.interval_minutes
+_heartbeat_task = None  # legacy — HeartbeatManager verwaltet seinen eigenen Task
+
+async def _gather_environment_context():
+    """[Deprecated] legacy — siehe heartbeat.HeartbeatManager._build_status_context."""
+    now = datetime.now()
+    ctx = [
+        f"### AUTONOMER HEARTBEAT - {now.strftime('%Y-%m-%d %H:%M:%S')} ###",
+        f"Context: win32, Jarvis Mission Control V3",
+        f"Status: {len(sessions.sessions)} aktive Sessions, {len(list(DATA_DIR.glob('tasks.json')))} Task-Dateien.",
+    ]
+    
+    # Minecraft-Status-Check (Beispielhaft)
+    try:
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            if s.connect_ex(('127.0.0.1', 25565)) == 0:
+                ctx.append("Minecraft Server: Online (Port 25565)")
+            else:
+                ctx.append("Minecraft Server: Offline")
+    except:
+        pass
+        
+    return "\n".join(ctx)
+
+async def _run_heartbeat_pulse():
+    """Führt einen einzelnen autonomen Heartbeat-Turn aus."""
+    print(f"[Heartbeat] Puls startet...", flush=True)
+    
+    # Orchestrator-Session finden oder erstellen
+    oid = "orchestrator"
+    session = sessions.get_or_create(oid)
+    session.provider = "openclaw"
+    session.model = "" # OpenClaw Default
+    
+    env_ctx = await _gather_environment_context()
+    prompt = (
+        f"{env_ctx}\n\n"
+        "Du bist der autonome Orchestrator von Jarvis. Dies ist ein Heartbeat-Turn. "
+        "Prüfe den Status und entscheide, ob Aktionen (z.B. Notifications via send_push, "
+        "Skill-Aktivierungen via skill_activate) notwendig sind. "
+        "Wenn alles okay ist und keine Aktion erforderlich ist, antworte nur mit 'OK'. "
+        "Antworte kurz und präzise."
+    )
+    
+    # Wir rufen den LLM-Client direkt auf (Headless)
+    try:
+        from llm_client import invoke_llm, Message, TextDelta
+        full_response = ""
+        async for ev in invoke_llm(
+            provider=session.provider,
+            model=session.model,
+            messages=[Message(role="user", content=prompt)],
+            system="Du bist Jarvis Orchestrator. Handle autonom basierend auf dem System-Status.",
+        ):
+            if isinstance(ev, TextDelta):
+                full_response += ev.text
+        
+        # Ergebnis in der Session loggen (für UI Sichtbarkeit)
+        session.history.append({"role": "user", "content": f"[System Heartbeat at {datetime.now().strftime('%H:%M')}]"})
+        session.history.append({"role": "assistant", "content": full_response.strip()})
+        session.message_count += 2
+        sessions.persist()
+        
+        print(f"[Heartbeat] Antwort: {full_response[:50].strip()}...", flush=True)
+        
+    except Exception as e:
+        print(f"[Heartbeat] Fehler: {e}", flush=True)
+
+async def _heartbeat_loop():
+    """Endlosschleife für den autonomen Puls."""
+    await asyncio.sleep(120)  # 2 Minuten warten nach Boot
+    while True:
+        try:
+            await _run_heartbeat_pulse()
+            await asyncio.sleep(_HEARTBEAT_INTERVAL)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[Heartbeat] Loop Error: {e}", flush=True)
+            await asyncio.sleep(60)
+
+async def _start_heartbeat(app):
+    """Startet den neuen HeartbeatManager (heartbeat.py). Legacy-Loop ist tot."""
+    global _heartbeat_manager
+    from heartbeat import HeartbeatManager
+    try:
+        from notify import send_push as _send_push
+    except ImportError:
+        _send_push = None
+    _heartbeat_manager = HeartbeatManager(
+        config=CONFIG.get("heartbeat", {}),
+        sessions=sessions,
+        invoke_llm_oneshot=_llm_oneshot,
+        broadcast_all=_broadcast_all_ws,
+        build_system_prompt=_build_system_prompt,
+        send_push=_send_push,
+    )
+    await _heartbeat_manager.start()
+
+
+async def _stop_heartbeat(app):
+    global _heartbeat_manager
+    if _heartbeat_manager:
+        await _heartbeat_manager.stop()
+        _heartbeat_manager = None
+
+
+# Globales Handle auf den laufenden Manager (von REST-Endpoints konsumiert)
+_heartbeat_manager = None
+
+
+# ---- REST-Endpoints für Heartbeat-UI (Task #41) -----------------------------
+
+async def api_heartbeat_status(request):
+    """GET /api/heartbeat/status — Live-Status + Tick-History für Dashboard-UI."""
+    if not _heartbeat_manager:
+        return web.json_response({
+            "ok": False, "error": "Heartbeat-Manager nicht initialisiert",
+            "enabled": False, "running": False,
+        })
+    return web.json_response({"ok": True, **_heartbeat_manager.status_dict()})
+
+
+async def api_heartbeat_config(request):
+    """POST /api/heartbeat/config — Config-Patch zur Laufzeit.
+    Body: {enabled?, interval_minutes?, autonomy?, provider?, model?,
+           push_enabled?, cron_jobs?}
+    """
+    if not _heartbeat_manager:
+        return web.json_response({"ok": False, "error": "nicht initialisiert"}, status=500)
+    try:
+        patch = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+    # Nur erlaubte Keys durchlassen
+    allowed = {"enabled", "interval_minutes", "autonomy", "provider", "model",
+               "push_enabled", "max_tick_history", "cron_jobs", "boot_delay_seconds"}
+    clean = {k: v for k, v in (patch or {}).items() if k in allowed}
+    new_cfg = _heartbeat_manager.update_config(clean)
+    # Auch in config.json persistieren damit es Neustart überlebt
+    try:
+        cfg_path = BASE_DIR / "config.json"
+        full = json.loads(cfg_path.read_text(encoding="utf-8"))
+        full.setdefault("heartbeat", {}).update(clean)
+        cfg_path.write_text(json.dumps(full, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[Heartbeat] config persist failed: {e}")
+    # Wenn enabled geändert, Loop entsprechend starten/stoppen
+    if "enabled" in clean:
+        if clean["enabled"] and not (_heartbeat_manager._task and not _heartbeat_manager._task.done()):
+            await _heartbeat_manager.start()
+        elif not clean["enabled"]:
+            await _heartbeat_manager.stop()
+    return web.json_response({"ok": True, "config": new_cfg})
+
+
+async def api_heartbeat_trigger(request):
+    """POST /api/heartbeat/trigger — Manueller Tick jetzt (für UI-Button)."""
+    if not _heartbeat_manager:
+        return web.json_response({"ok": False, "error": "nicht initialisiert"}, status=500)
+    try:
+        body = await request.json() if request.content_length else {}
+    except Exception:
+        body = {}
+    reason = (body.get("reason") or "manual").strip() or "manual"
+    entry = await _heartbeat_manager.trigger_now(reason=reason)
+    return web.json_response({"ok": True, "tick": entry})
+
+
 def create_app():
-    app = web.Application()
+    app = web.Application(client_max_size=MAX_UPLOAD_BYTES)
 
     # Pages
     app.router.add_get("/", index_handler)
+    app.router.add_get("/betreuer", betreuer_handler)
+    app.router.add_get("/betreuer/check", betreuer_check_handler)
 
     # API
     app.router.add_get("/api/tasks", api_tasks)
@@ -7313,6 +14492,12 @@ def create_app():
     app.router.add_get("/api/memory/{filename}", api_memory_file)
     app.router.add_get("/api/sessions", api_sessions)
     app.router.add_get("/api/email", api_email)
+    # New Email v2 (Outlook-style: accounts + folders + messages, local SQLite cache)
+    try:
+        import email_routes
+        email_routes.register_routes(app)
+    except Exception as _e:
+        print(f"[Email v2] route registration failed: {_e}")
     app.router.add_get("/api/calendar", api_calendar)
     app.router.add_get("/api/system", api_system)
     app.router.add_post("/api/system/restart", api_system_restart)
@@ -7325,14 +14510,65 @@ def create_app():
     app.router.add_get("/api/bots/diss-research", api_bots_diss_research)
     app.router.add_get("/api/knowledge-graph", api_knowledge_graph)
     app.router.add_get("/api/diss/research", api_diss_research)
+    app.router.add_post("/api/diss/research", api_diss_research)
     app.router.add_get("/api/diss/session-topic", api_diss_session_topic)
     app.router.add_post("/api/diss/session-topic", api_diss_session_topic)
     app.router.add_get("/api/diss/wiki-log", api_diss_wiki_log)
     app.router.add_get("/api/diss/wiki-index", api_diss_wiki_index)
+    app.router.add_get("/api/diss/word", api_diss_word)
+    app.router.add_post("/api/diss/word", api_diss_word)
+    app.router.add_get("/api/diss/word-url", api_diss_word_url)
+    app.router.add_post("/api/diss/word-url", api_diss_word_url)
+    app.router.add_get("/api/diss/prism-results", api_diss_prism_results)
+    app.router.add_post("/api/diss/prism-results", api_diss_prism_results)
+    app.router.add_post("/api/diss/prism-analyse", api_diss_prism_analyse)
+    app.router.add_get("/api/diss/delta", api_diss_delta)
+    app.router.add_post("/api/diss/delta", api_diss_delta)
+    app.router.add_delete("/api/diss/delta", api_diss_delta)
+    app.router.add_get("/api/diss/structure", api_diss_structure)
+    app.router.add_post("/api/diss/structure", api_diss_structure)
     app.router.add_get("/api/medizin/log", api_medizin_log)
     app.router.add_post("/api/medizin/log", api_medizin_log)
     app.router.add_post("/api/medizin/lernplan", api_medizin_lernplan)
     app.router.add_post("/api/anki/generate", api_anki_generate)
+    app.router.add_get("/api/anki/decks", api_anki_decks)
+    app.router.add_post("/api/anki/bulk-sync", api_anki_bulk_sync)
+    app.router.add_get("/api/llm/providers", api_llm_providers)
+    app.router.add_post("/api/chat/session/{session_id}/provider", api_chat_session_provider)
+    app.router.add_post("/api/chat/session/{session_id}/compress", api_chat_session_compress)
+    app.router.add_get("/api/vault/bundles", api_vault_bundles)
+    app.router.add_post("/api/chat/session/{session_id}/context", api_chat_session_context)
+    app.router.add_post("/api/medical/reason", api_medical_reason)
+    app.router.add_get("/api/image/providers", api_image_providers)
+    app.router.add_get("/api/image/usage", api_image_usage)
+    app.router.add_get("/api/image/codex/latest", api_image_codex_latest)
+    app.router.add_post("/api/image/codex/import", api_image_codex_import)
+    app.router.add_get("/api/image/codex/jobs", api_image_codex_jobs_list)
+    app.router.add_post("/api/image/codex/jobs", api_image_codex_jobs_create)
+    app.router.add_get("/api/image/codex/jobs/{job_id}", api_image_codex_job_get)
+    app.router.add_post("/api/image/codex/jobs/{job_id}/complete", api_image_codex_job_complete)
+    app.router.add_post("/api/image/codex/jobs/{job_id}/fail", api_image_codex_job_fail)
+    app.router.add_post("/api/image/generate", api_image_generate)
+    # Image-Library
+    app.router.add_get("/api/library", api_library_list)
+    app.router.add_post("/api/library/folder", api_library_folder_create)
+    app.router.add_delete("/api/library/folder", api_library_folder_delete)
+    app.router.add_post("/api/library/move", api_library_move)
+    app.router.add_delete("/api/library/image", api_library_image_delete)
+    # Avatare
+    app.router.add_get("/api/avatars", api_avatars_list)
+    app.router.add_post("/api/avatars", api_avatars_create)
+    app.router.add_get("/api/avatars/{name}", api_avatars_get)
+    app.router.add_put("/api/avatars/{name}", api_avatars_update)
+    app.router.add_delete("/api/avatars/{name}", api_avatars_delete)
+    app.router.add_post("/api/avatars/{name}/reference", api_avatars_upload_reference)
+    app.router.add_delete("/api/avatars/{name}/reference", api_avatars_delete_reference)
+    app.router.add_get("/api/heartbeat/status", api_heartbeat_status)
+    app.router.add_post("/api/heartbeat/config", api_heartbeat_config)
+    app.router.add_post("/api/heartbeat/trigger", api_heartbeat_trigger)
+    app.router.add_post("/api/llm/ask-peer", api_llm_ask_peer)
+    app.router.add_get("/api/chat/session/{session_id}/scratchpad", api_chat_session_scratchpad)
+    app.router.add_post("/api/chat/session/{session_id}/scratchpad", api_chat_session_scratchpad)
     app.router.add_get("/api/trading/account", api_trading_account)
     app.router.add_get("/api/trading/positions", api_trading_positions)
     app.router.add_get("/api/trading/summary", api_trading_summary)
@@ -7348,6 +14584,8 @@ def create_app():
     app.router.add_post("/api/trading/bots/{id}/start", api_trading_bots_start)
     app.router.add_post("/api/trading/bots/{id}/stop", api_trading_bots_stop)
     app.router.add_post("/api/trading/bots/{id}/restart", api_trading_bots_restart)
+    app.router.add_get("/api/trading/bots/rank", api_trading_bots_rank)
+    app.router.add_post("/api/trading/bots/kick-mutate", api_trading_bots_kick_mutate)
     app.router.add_get("/api/world-monitor", api_world_monitor)
 
     # Smart Tasks
@@ -7379,9 +14617,16 @@ def create_app():
     app.router.add_delete("/api/arena/rooms/{id}", api_arena_delete)
     app.router.add_post("/api/arena/rooms/{id}/start", api_arena_start)
     app.router.add_post("/api/arena/rooms/{id}/stop", api_arena_stop)
+    app.router.add_post("/api/arena/trialog/start", api_arena_trialog_start)
+    app.router.add_post("/api/arena/trialog/{id}/stop", api_arena_trialog_stop)
+    app.router.add_post("/api/arena/trialog/{id}/read", api_arena_trialog_read)
     app.router.add_post("/api/arena/rooms/{id}/inject", api_arena_inject)
     app.router.add_post("/api/arena/rooms/{id}/execute", api_arena_execute)
     app.router.add_post("/api/arena/rooms/{id}/orchestrator", api_arena_orchestrator_chat)
+    app.router.add_post("/api/arena/rooms/{id}/snapshot", api_arena_snapshot)
+    app.router.add_get("/api/arena/rooms/{id}/snapshots", api_arena_snapshots_list)
+    app.router.add_delete("/api/arena/rooms/{id}/consensus_marks/{index}", api_arena_consensus_mark_delete)
+    app.router.add_post("/api/arena/rooms/{id}/unclear", api_arena_unclear)
     app.router.add_post("/api/arena/rooms/{id}/summarize", api_arena_summarize)
     app.router.add_post("/api/arena/rooms/{id}/approve", api_arena_approve)
     app.router.add_post("/api/arena/rooms/{id}/continue", api_arena_continue)
@@ -7395,6 +14640,106 @@ def create_app():
     app.router.add_post("/api/upload", api_upload)
     app.router.add_get("/api/funnel/log", api_funnel_log)
     app.router.add_post("/api/funnel/ingest", api_funnel_ingest)
+    app.router.add_post("/api/learn/ingest", api_learn_ingest)
+    app.router.add_post("/api/learn/generate", api_learn_generate)
+    app.router.add_get("/api/learn/meta", api_learn_meta)
+    app.router.add_get("/api/learn/history", api_learn_history)
+    app.router.add_get("/api/learn/decks/{deck_id}/apkg", api_learn_deck_apkg)
+    app.router.add_get("/api/learn/decks/{deck_id}/preview", api_learn_deck_preview)
+    app.router.add_get("/api/learn/feedback", api_learn_feedback)
+    app.router.add_delete("/api/learn/feedback", api_learn_feedback)
+    app.router.add_post("/api/learn/screenshot", api_learn_screenshot)
+    app.router.add_post("/api/learn/upload", api_learn_upload)
+    app.router.add_post("/api/learn/export-zip", api_learn_export_zip)
+
+    # --- Documents-Tab (Bewerbungen, gesyncte Word/Google-Docs) ---
+    _DOCS_JSON = DATA_DIR / "documents.json"
+    _DOCS_SYNC_REQUESTS = DATA_DIR / "document-sync-requests.jsonl"
+
+    def _load_documents() -> list[dict]:
+        try:
+            return json.loads(_DOCS_JSON.read_text(encoding="utf-8")).get("documents", [])
+        except Exception:
+            return []
+
+    async def api_documents_list(request):
+        docs = _load_documents()
+        # Word-File-Status pro Dokument anreichern (existiert? mtime? size?)
+        for d in docs:
+            wp = d.get("word_path", "")
+            if wp:
+                p = Path(wp)
+                if p.exists():
+                    st = p.stat()
+                    d["word_exists"] = True
+                    d["word_mtime"] = datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")
+                    d["word_size_kb"] = round(st.st_size / 1024, 1)
+                else:
+                    d["word_exists"] = False
+        return web.json_response({"ok": True, "documents": docs})
+
+    async def api_documents_word(request):
+        """GET /api/documents/{id}/word — liefert die Word-Datei als Download."""
+        doc_id = request.match_info.get("id", "")
+        for d in _load_documents():
+            if d.get("id") == doc_id:
+                wp = Path(d.get("word_path", ""))
+                if not wp.exists():
+                    return web.json_response({"ok": False, "error": "Word-Datei fehlt"}, status=404)
+                return web.FileResponse(
+                    path=wp,
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{d.get("word_filename", wp.name)}"',
+                    },
+                )
+        return web.json_response({"ok": False, "error": "Document nicht gefunden"}, status=404)
+
+    async def api_documents_sync(request):
+        """POST /api/documents/{id}/sync — schreibt Sync-Request in JSONL.
+        Claude liest die Requests + macht den eigentlichen Sync (Google Doc -> Word)
+        bei naechster Session oder bei expliziter Aufforderung.
+        """
+        doc_id = request.match_info.get("id", "")
+        docs = _load_documents()
+        target = next((d for d in docs if d.get("id") == doc_id), None)
+        if not target:
+            return web.json_response({"ok": False, "error": "Document nicht gefunden"}, status=404)
+        try:
+            req_entry = {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "doc_id": doc_id,
+                "gdoc_id": target.get("gdoc_id"),
+                "word_path": target.get("word_path"),
+                "status": "pending",
+            }
+            with open(_DOCS_SYNC_REQUESTS, "a", encoding="utf-8") as f:
+                f.write(json.dumps(req_entry, ensure_ascii=False) + "\n")
+            return web.json_response({
+                "ok": True,
+                "message": "Sync-Request angelegt. Sage Jarvis: 'sync das PROMOS-Doc' (oder warte auf naechste Auto-Sync)",
+                "request": req_entry,
+            })
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    app.router.add_get("/api/documents/list", api_documents_list)
+    app.router.add_get("/api/documents/{id}/word", api_documents_word)
+    app.router.add_post("/api/documents/{id}/sync", api_documents_sync)
+
+    async def api_learn_anki_preview(request):
+        """GET /api/learn/anki-preview — Browser-Vorschau, wie die exportierten
+        Anki-Karten aussehen sollten (CSS+Templates aus apkg_export.py)."""
+        try:
+            from apkg_export import render_preview_html
+            return web.Response(text=render_preview_html(), content_type="text/html")
+        except Exception as e:
+            return web.Response(text=f"Preview-Fehler: {type(e).__name__}: {e}", status=500)
+    app.router.add_get("/api/learn/anki-preview", api_learn_anki_preview)
+    app.router.add_post("/api/learn/amboss-login", api_learn_amboss_login)
+    app.router.add_get("/api/learn/amboss-test", api_learn_amboss_test)
+    app.router.add_post("/api/learn/viamedici-login", api_learn_viamedici_login)
+    app.router.add_get("/api/learn/viamedici-test", api_learn_viamedici_test)
+    app.router.add_post("/api/learn/preview-card", api_learn_preview_card)
 
     # TTS
     app.router.add_post("/api/tts", api_tts)
@@ -7498,6 +14843,7 @@ def create_app():
     app.router.add_static("/static/", path=str(STATIC_DIR), name="static")
     app.router.add_static("/avatars/", path=str(AVATARS_DIR), name="avatars")
     app.router.add_static("/api/uploads/", path=str(UPLOADS_DIR), name="uploads")
+    app.router.add_static("/library/", path=str(IMAGES_LIBRARY_DIR), name="library")
 
     # Startup: classify all sessions that have history but no topic yet
     async def _startup_classify(app):
@@ -7583,7 +14929,9 @@ def create_app():
             print("[Classify] Periodic timer stopped")
 
     app.on_startup.append(_start_periodic_classify)
+    app.on_startup.append(_start_heartbeat)
     app.on_cleanup.append(_stop_periodic_classify)
+    app.on_cleanup.append(_stop_heartbeat)
 
     # -----------------------------------------------------------------------
     # Dead-stream watchdog: detects sessions stuck in _active_streams where
@@ -7670,6 +15018,78 @@ def create_app():
     app.on_startup.append(_start_dead_stream_watchdog)
     app.on_cleanup.append(_stop_dead_stream_watchdog)
 
+    # -----------------------------------------------------------------------
+    # Stale-Executor-Watchdog (Alpha-Action aus Arena-Consensus):
+    # Wenn ein executor_checkpoint seit >10min auf "running" steht ohne
+    # last_action_at-Bump, ist der Worker de facto tot. Markiere als "stale"
+    # und setze hängende pending/running-Actions auf "failed" mit Grund.
+    # Läuft alle 120s. Im Gegensatz zum Startup-Check greift das WÄHREND
+    # MC läuft (z.B. Subprocess deadlock ohne Crash).
+    # -----------------------------------------------------------------------
+    _stale_exec_watchdog_task = None
+
+    async def _stale_executor_watchdog_loop():
+        STALE_MIN = 10.0
+        while True:
+            await asyncio.sleep(120)
+            try:
+                rooms = _load_arena_rooms()
+                dirty = False
+                now = datetime.now()
+                for r in rooms:
+                    cp = r.get("executor_checkpoint") or {}
+                    if cp.get("status") != "running":
+                        continue
+                    # Stale, wenn weder started_at noch last_action_at in den letzten 10min
+                    ref_ts = cp.get("last_action_at") or cp.get("started_at")
+                    if not ref_ts:
+                        continue
+                    try:
+                        age_min = (now - datetime.fromisoformat(ref_ts)).total_seconds() / 60.0
+                    except Exception:
+                        continue
+                    if age_min <= STALE_MIN:
+                        continue
+                    aid = cp.get("approval_id")
+                    cp["status"] = "stale"
+                    cp["stale_detected_at"] = now.isoformat()
+                    r["executor_checkpoint"] = cp
+                    # pending/running Actions im passenden Approval-Block als failed schließen
+                    for m in r.get("messages") or []:
+                        if m.get("role") != "approval" or m.get("approval_id") != aid:
+                            continue
+                        for a in m.get("actions") or []:
+                            if (a or {}).get("status") in ("pending", "running"):
+                                a["status"] = "failed"
+                                a["result"] = "Executor stale (>10min inaktiv) — vom Watchdog beendet."
+                    dirty = True
+                    print(f"[StaleExecWatchdog] room={r.get('id','?')[:8]} approval={(aid or '')[:8]} age={age_min:.1f}min → stale")
+                if dirty:
+                    _save_arena_rooms(rooms)
+                    try:
+                        await _broadcast_all_ws({"type": "arena.executor_stale"})
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[StaleExecWatchdog] loop error: {e}")
+
+    async def _start_stale_executor_watchdog(app):
+        nonlocal _stale_exec_watchdog_task
+        _stale_exec_watchdog_task = asyncio.create_task(_stale_executor_watchdog_loop())
+        print("[StaleExecWatchdog] started (interval: 120s, threshold: 10min)")
+
+    async def _stop_stale_executor_watchdog(app):
+        nonlocal _stale_exec_watchdog_task
+        if _stale_exec_watchdog_task:
+            _stale_exec_watchdog_task.cancel()
+            try:
+                await _stale_exec_watchdog_task
+            except asyncio.CancelledError:
+                pass
+
+    app.on_startup.append(_start_stale_executor_watchdog)
+    app.on_cleanup.append(_stop_stale_executor_watchdog)
+
     async def _startup_arena_recovery(app):
         """On server start: mark any rooms that were 'running' as 'paused' (process died)."""
         try:
@@ -7678,6 +15098,7 @@ def create_app():
             for r in rooms:
                 if r.get("status") == "running":
                     r["status"] = "paused"
+                    r["paused_reason"] = "server_restart"
                     changed = True
                     print(f"[Arena] Recovered room {r.get('title','?')} → paused")
             if changed:
@@ -7690,6 +15111,157 @@ def create_app():
         except Exception as e:
             print(f"[Arena] Startup recovery error: {e}")
     app.on_startup.append(_startup_arena_recovery)
+
+    async def _auto_resume_paused_arena(app):
+        """Self-start any Arena rooms that were paused by the server-restart recovery hook.
+
+        Robin wants rooms to continue on their own after a crash/restart, without
+        having to click Start again. We wait a few seconds so recovery has flipped
+        statuses and WS clients can reconnect, then kick off _run_arena for each.
+        """
+        async def _go():
+            await asyncio.sleep(4)
+            try:
+                rooms = _load_arena_rooms()
+            except Exception as e:
+                print(f"[ArenaAutoResume] load error: {e}")
+                return
+            pending = [
+                r for r in rooms
+                if r.get("status") == "paused"
+                and r.get("paused_reason") == "server_restart"
+                and r.get("id") not in _arena_rooms
+            ]
+            if not pending:
+                return
+            print(f"[ArenaAutoResume] Resuming {len(pending)} paused room(s)")
+            changed = False
+            for r in pending:
+                rid = r.get("id")
+                if not rid:
+                    continue
+                try:
+                    spawn_task = _spawn_for_room(rid, rooms)
+                    if spawn_task is None:
+                        continue
+                    r.pop("paused_reason", None)
+                    r["status"] = "running"
+                    r["last_active"] = datetime.now().isoformat()
+                    changed = True
+                    _mode = (r.get("mode") or "arena").lower()
+                    print(f"[ArenaAutoResume] → {r.get('title','?')} ({rid[:8]}, mode={_mode})")
+                except Exception as e:
+                    _arena_rooms.pop(rid, None)
+                    print(f"[ArenaAutoResume] spawn failed for {rid}: {e}")
+                    continue
+                await asyncio.sleep(0.5)  # stagger to avoid subprocess pile-up
+            if changed:
+                try:
+                    _save_arena_rooms(rooms)
+                except Exception as e:
+                    print(f"[ArenaAutoResume] save error: {e}")
+                try:
+                    await _broadcast_all_ws({"type": "arena.auto_resumed", "count": len(pending)})
+                except Exception:
+                    pass
+        asyncio.create_task(_go())
+    app.on_startup.append(_auto_resume_paused_arena)
+
+    async def _auto_resume_paused_executor(app):
+        """Re-spawn executors whose approval had unfinished actions when the
+        server died. Finds approval messages with any action in status
+        'pending' or 'running', resets running→pending (the worker is gone),
+        and re-calls _run_executor(..., skip_done=True) so already-finished
+        actions are not re-executed.
+        """
+        async def _go():
+            await asyncio.sleep(5)  # after _auto_resume_paused_arena (4s)
+            try:
+                rooms = _load_arena_rooms()
+            except Exception as e:
+                print(f"[ArenaExecResume] load error: {e}")
+                return
+            _OPEN = {"pending", "running"}
+            resumed = 0
+            dirty = False
+            for r in rooms:
+                rid = r.get("id")
+                if not rid:
+                    continue
+                for m in r.get("messages") or []:
+                    if m.get("role") != "approval":
+                        continue
+                    aid = m.get("approval_id")
+                    acts = m.get("actions") or []
+                    if not aid or not acts:
+                        continue
+                    open_idx = [i for i, a in enumerate(acts) if (a or {}).get("status") in _OPEN]
+                    if not open_idx:
+                        continue
+                    # Reset running→pending (the worker that was running died with the process)
+                    for i in open_idx:
+                        if acts[i].get("status") == "running":
+                            acts[i]["status"] = "pending"
+                            dirty = True
+                    # Checkpoint reconcile: wenn executor_checkpoint fehlt oder zu einem
+                    # anderen Approval gehoert → aus Message-Scan rekonstruieren (Betas
+                    # Fallback). Zusaetzlich Stale-Check (Alphas Vorschlag): ein running-
+                    # Checkpoint, dessen started_at > 10min alt ist, war ein toter Worker
+                    # → als stale markieren, damit Seed/Bots wissen dass der Stand
+                    # rekonstruiert ist.
+                    _cp_cur = r.get("executor_checkpoint") or {}
+                    _done_count = sum(1 for a in acts if (a or {}).get("status") == "done")
+                    _needs_rebuild = (not _cp_cur) or _cp_cur.get("approval_id") != aid
+                    _stale = False
+                    if not _needs_rebuild and _cp_cur.get("status") == "running":
+                        _started = _cp_cur.get("started_at")
+                        if _started:
+                            try:
+                                _age_min = (datetime.now() - datetime.fromisoformat(_started)).total_seconds() / 60.0
+                                if _age_min > 10.0:
+                                    _stale = True
+                            except Exception:
+                                _stale = True
+                        else:
+                            _stale = True
+                    if _needs_rebuild:
+                        r["executor_checkpoint"] = {
+                            "approval_id": aid,
+                            "completed": _done_count,
+                            "total": len(acts),
+                            "status": "recovered",
+                            "started_at": datetime.now().isoformat(),
+                            "recovered_from": "message_scan",
+                        }
+                        dirty = True
+                        print(f"[ArenaExecResume] rebuilt checkpoint room={rid[:8]} approval={aid[:8]} done={_done_count}/{len(acts)}")
+                    elif _stale:
+                        _cp_cur["status"] = "stale"
+                        _cp_cur["stale_detected_at"] = datetime.now().isoformat()
+                        _cp_cur["completed"] = _done_count  # sync mit realem Message-Stand
+                        r["executor_checkpoint"] = _cp_cur
+                        dirty = True
+                        print(f"[ArenaExecResume] stale checkpoint room={rid[:8]} approval={aid[:8]} (>10min)")
+                    action_texts = [a.get("text", "") for a in acts]
+                    try:
+                        asyncio.create_task(_run_executor(rid, aid, action_texts, skip_done=True))
+                        resumed += 1
+                        print(f"[ArenaExecResume] → room={rid[:8]} approval={aid[:8]} open={len(open_idx)}/{len(acts)}")
+                    except Exception as e:
+                        print(f"[ArenaExecResume] spawn failed for {rid[:8]}/{aid[:8]}: {e}")
+                    await asyncio.sleep(0.5)  # stagger
+            if dirty:
+                try:
+                    _save_arena_rooms(rooms)
+                except Exception as e:
+                    print(f"[ArenaExecResume] save error: {e}")
+            if resumed:
+                try:
+                    await _broadcast_all_ws({"type": "arena.executor_resumed", "count": resumed})
+                except Exception:
+                    pass
+        asyncio.create_task(_go())
+    app.on_startup.append(_auto_resume_paused_executor)
 
     async def _startup_smart_tasks_recovery(app):
         """On server start: reset any 'running' smart tasks to 'interrupted' (subprocesses died with parent)."""
@@ -7736,52 +15308,44 @@ def create_app():
         asyncio.create_task(_window_hider_loop())
     app.on_startup.append(_start_window_hider)
 
-    async def _auto_resume_interrupted(app):
-        """Re-trigger any session whose last turn was cut off by a restart.
-
-        Detection is done in SessionManager.load() via `needs_resume`. We wait a
-        few seconds so WS clients can (re)connect and watch the stream live.
+    async def _cleanup_interrupted(app):
+        """Sessions die beim Restart mid-stream waren bekommen einen sauberen
+        'abgebrochen'-Marker. Kein automatisches Weiterfuehren mehr — das hat
+        zu haengenden UIs gefuehrt, weil Resume-Events ins Leere broadcastet
+        wurden bevor der Browser-Client wieder verbunden war.
         """
-        async def _safe_resume(s):
-            """Wrap _run_claude so a crash during resume does not leave the session
-            silently hung — broadcast an error event instead."""
-            try:
-                await _run_claude(
-                    None, s,
-                    "Bitte mach weiter wo du aufgehört hast — der Server ist neugestartet.",
-                    None,
-                )
-            except Exception as e:
-                import traceback as _tb
-                err_txt = f"{type(e).__name__}: {e}"
-                print(f"[AutoResume] Resume crashed for {s.session_id[:8]}: {err_txt}")
-                print(_tb.format_exc())
-                try:
-                    s._stream_active = False
-                    sessions.persist()
-                except Exception:
-                    pass
-                try:
-                    await _broadcast_stream_event(s.session_id, {
-                        "type": "chat.error",
-                        "session_id": s.session_id,
-                        "error": f"Auto-Resume fehlgeschlagen: {err_txt}",
-                    })
-                except Exception:
-                    pass
-
         async def _go():
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
             pending = [s for s in list(sessions.sessions.values()) if getattr(s, "needs_resume", False)]
             if not pending:
                 return
-            print(f"[AutoResume] Resuming {len(pending)} interrupted session(s)")
+            print(f"[Cleanup] Marking {len(pending)} interrupted session(s) as aborted")
             for s in pending:
                 s.needs_resume = False
-                asyncio.create_task(_safe_resume(s))
-                await asyncio.sleep(0.5)  # stagger to avoid MCP startup pile-up
+                s._stream_active = False
+                # Wenn nicht eh schon ein partial-Recover-Marker drinhaengt: einen Hinweis anhaengen
+                if s.history and s.history[-1].get("role") == "user":
+                    s.history.append({
+                        "role": "assistant",
+                        "content": "_(Server wurde neugestartet bevor eine Antwort kam — bitte nochmal senden falls du eine willst)_",
+                    })
+                    s.message_count += 1
+            sessions.persist()
+            # Allen Clients sagen dass diese Sessions nicht mehr streamen — sobald
+            # sie sich verbinden bekommen sie eh chat.sessions, das hier ist nur
+            # ein expliziter chat.done falls ein Client schon dranhing.
+            for s in pending:
+                try:
+                    await _broadcast_all_ws({
+                        "type": "chat.done",
+                        "session_id": s.session_id,
+                        "full_text": "",
+                        "interrupted": True,
+                    })
+                except Exception:
+                    pass
         asyncio.create_task(_go())
-    app.on_startup.append(_auto_resume_interrupted)
+    app.on_startup.append(_cleanup_interrupted)
 
     return app
 
@@ -7808,5 +15372,9 @@ if __name__ == "__main__":
     print(f"  LAN:     {protocol}://{lan_ip}:{port}")
     print()
     web.run_app(create_app(), host=host, port=port, ssl_context=ssl_ctx, print=None)
+
+
+
+
 
 

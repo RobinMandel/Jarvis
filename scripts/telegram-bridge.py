@@ -358,13 +358,12 @@ def download_telegram_file(file_id, suffix=".jpg"):
 
 
 # --- Claude CLI ---
-MIN_EDIT_INTERVAL = 1.5  # seconds between Telegram edits (TG rate-limit safe)
-MIN_EDIT_DELTA = 40      # min new chars before we bother editing
+TYPING_REFRESH_INTERVAL = 4.0  # Telegram typing-action expires after 5s, refresh every 4s
 
 
 def ask_claude(message, chat_id, image_paths=None):
-    """Send a message to Claude CLI with streaming. Edits Telegram message live.
-    Returns the final text. Telegram send is handled internally."""
+    """Send a message to Claude CLI. Keeps typing-indicator alive while Claude thinks.
+    Sends ONE final message at the end. Returns the final text."""
     prompt = build_prompt_with_history(message)
     system_prompt = (
         "Du bist Jarvis, Robins persoenlicher AI-Assistent. "
@@ -402,14 +401,14 @@ def ask_claude(message, chat_id, image_paths=None):
         "--no-session-persistence",
     ] + extra_args
 
-    # Placeholder message — will be edited live
-    placeholder_id = send_message_get_id(chat_id, "...")
-
     accumulated = ""
     final_text = ""
-    last_edit_time = 0.0
-    last_edit_text = ""
+    last_typing = 0.0
     start_time = time.time()
+
+    # Kick off typing indicator immediately
+    send_typing(chat_id)
+    last_typing = time.time()
 
     try:
         log.info(f"Claude stream: max_turns={max_turns}, prompt={len(prompt)} chars")
@@ -436,6 +435,12 @@ def ask_claude(message, chat_id, image_paths=None):
                     proc.kill()
                     break
 
+                # Refresh typing indicator every 4s so Telegram keeps showing "schreibt..."
+                now = time.time()
+                if now - last_typing >= TYPING_REFRESH_INTERVAL:
+                    send_typing(chat_id)
+                    last_typing = now
+
                 line = line.strip()
                 if not line:
                     continue
@@ -447,7 +452,7 @@ def ask_claude(message, chat_id, image_paths=None):
 
                 etype = event.get("type")
 
-                # Partial text deltas (true streaming)
+                # Partial text deltas (true streaming) — we only track for fallback
                 if etype == "stream_event":
                     se = event.get("event", {})
                     if se.get("type") == "content_block_delta":
@@ -468,24 +473,6 @@ def ask_claude(message, chat_id, image_paths=None):
                     if isinstance(r_text, str) and r_text.strip():
                         final_text = r_text
 
-                # Throttled live-edit
-                display = accumulated or final_text
-                if placeholder_id and display:
-                    now = time.time()
-                    grew = len(display) - len(last_edit_text)
-                    if grew >= MIN_EDIT_DELTA and (now - last_edit_time) >= MIN_EDIT_INTERVAL:
-                        preview = display
-                        if len(preview) > MAX_MESSAGE_LENGTH:
-                            preview = preview[:MAX_MESSAGE_LENGTH - 3] + "..."
-                        # Streaming-Cursor anhaengen (signalisiert: noch am tippen)
-                        preview_with_cursor = preview + " \u258C"
-                        try:
-                            if edit_message(chat_id, placeholder_id, preview_with_cursor):
-                                last_edit_time = now
-                                last_edit_text = display
-                        except Exception as ee:
-                            log.debug(f"Edit-Fehler (nicht fatal): {ee}")
-
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
@@ -501,43 +488,22 @@ def ask_claude(message, chat_id, image_paths=None):
         if not final:
             final = stderr_out.strip()[:500] or "Keine Antwort von Claude."
 
-        # Final delivery: edit placeholder to final text (or split if too long)
-        # Haken am Ende signalisiert: fertig
-        final_with_check = final + " \u2713"
-        if placeholder_id:
-            if len(final_with_check) <= MAX_MESSAGE_LENGTH:
-                if not edit_message(chat_id, placeholder_id, final_with_check):
-                    send_message(chat_id, final)
-            else:
-                # Too long: put first chunk in placeholder, send rest as follow-ups
-                first = final[:MAX_MESSAGE_LENGTH]
-                rest = final[MAX_MESSAGE_LENGTH:]
-                if not edit_message(chat_id, placeholder_id, first):
-                    send_message(chat_id, first)
-                send_message(chat_id, rest)
-        else:
-            send_message(chat_id, final)
-
+        # Clean one-shot delivery — send_message handles splitting if too long
+        send_message(chat_id, final)
         return final
 
     except FileNotFoundError:
         log.error(f"Claude CLI nicht gefunden: {CLAUDE_CLI}")
         err = "Claude CLI nicht gefunden."
-        if placeholder_id:
-            edit_message(chat_id, placeholder_id, err)
-        else:
-            send_message(chat_id, err)
+        send_message(chat_id, err)
         return err
     except Exception as e:
         log.error(f"Claude Fehler: {e}", exc_info=True)
         err = f"Fehler: {e}"
-        if placeholder_id:
-            try:
-                edit_message(chat_id, placeholder_id, err)
-            except Exception:
-                send_message(chat_id, err)
-        else:
+        try:
             send_message(chat_id, err)
+        except Exception:
+            pass
         return err
 
 
@@ -650,10 +616,24 @@ def poll_loop(args):
                 msg_types = [k for k in ("text", "photo", "voice", "audio", "document", "sticker", "video", "video_note") if k in msg]
                 log.info(f"Update {update_id} von {user_name} (chat {chat_type}): types={msg_types}")
 
-                # Security: only allow Robin
+                # Gruppen-Pre-Filter: in Gruppen nur reagieren wenn Bot erwähnt oder gerepliet wurde.
+                # Alles andere (inkl. unautorisierter User) wird still verworfen — kein Spam, kein Outing.
+                if chat_type in ("group", "supergroup"):
+                    mention = f"@{BOT_USERNAME}"
+                    raw_text = msg.get("text", "") or msg.get("caption", "")
+                    reply_to = msg.get("reply_to_message") or {}
+                    reply_from = (reply_to.get("from") or {}).get("username", "") or ""
+                    is_reply_to_bot = reply_from.lower() == BOT_USERNAME.lower()
+                    if mention.lower() not in raw_text.lower() and not is_reply_to_bot:
+                        log.debug(f"Gruppe ohne Mention/Reply — ignoriert (user={user_name})")
+                        continue
+
+                # Security: only allow Robin. In Gruppen still weitergehen (wurde oben schon gefiltert),
+                # hier nur in DMs Klartext-Reply.
                 if user_id not in ALLOWED_USERS:
-                    log.warning(f"Unauthorized user: {user_id} ({user_name})")
-                    send_message(chat_id, "Nicht autorisiert.")
+                    log.warning(f"Unauthorized user: {user_id} ({user_name}) in {chat_type}")
+                    if chat_type == "private":
+                        send_message(chat_id, "Nicht autorisiert.")
                     continue
 
                 # --- Voice memo support ---
@@ -714,17 +694,10 @@ def poll_loop(args):
                             send_message(chat_id, f"Konnte Dokument nicht verarbeiten: {de}")
                             continue
 
-                # --- @-Mention filter for group chats ---
+                # --- In Gruppen: Bot-Mention aus text strippen (Pre-Filter oben hat Zugang schon validiert) ---
                 if chat_type in ("group", "supergroup"):
-                    mention = f"@{BOT_USERNAME}"
-                    # For photos/docs/voice: check the original caption, not the rewritten text
-                    raw_text = msg.get("text", "") or msg.get("caption", "")
-                    if mention.lower() not in raw_text.lower():
-                        log.debug(f"Gruppe: Nachricht ohne @-Mention ignoriert (raw={raw_text[:50]}, text={text[:50]})")
-                        continue
-                    # Strip the mention from the text
                     text = re.sub(rf"@{BOT_USERNAME}", "", text, flags=re.IGNORECASE).strip()
-                    # If only mention was in caption and text got rewritten to [Bild]..., keep the image text
+                    # Wenn nur Mention in Caption war und text zu [Bild]... umgeschrieben wurde, fallback
                     if not text and image_paths:
                         text = "[Bild] Robin hat dir ein Bild geschickt. Beschreibe was du siehst."
 

@@ -6,6 +6,7 @@
     world:      'World Monitor',
     chat:       'Chat',
     multichat:  'Multi-Chat',
+    imagelab:   'Image Lab',
     diss:       'Dissertation',
     medizin:    'Medizinstudium',
     trading:    'Trading',
@@ -21,6 +22,7 @@
     'smart-tasks': 'Build Queue',
     skills:        'Skills Lab',
     arena:         'Bot Arena',
+    documents:     'Dokumente',
   };
 
   // ── Lazy-load registry ───────────────────────────────────────────────────
@@ -34,12 +36,14 @@
     ['medizin',  function() { if (window.MedizinView) window.MedizinView.init(); }],
     ['trading',  loadTrading],
     ['tanzania', loadTanzania],
+    ['imagelab', function() { if (window.ImageLab) window.ImageLab.init(); }],
     ['memory',      function() { loadKnowledgeGraph(); }],
     ['funnel',      function() { if (window.FunnelView) window.FunnelView.init(); }],
     ['smart-tasks', loadSmartTasks],
     ['bots',        function() { if (window.initBotsView) window.initBotsView(); }],
     ['skills',      function() { if (window.loadSkills) window.loadSkills(); }],
     ['arena',       function() { if (MC.arena) MC.arena.init(); }],
+    ['documents',   function() { if (window.DocumentsView) window.DocumentsView.init(); }],
   ]);
   const loadedViews = new Set();
 

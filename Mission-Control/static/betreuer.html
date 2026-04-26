@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dissertationsfortschritt – Robin Mandel</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d26;
+      --border: #2a2d3a;
+      --text: #e8eaf0;
+      --muted: #8a8fa8;
+      --accent: #5b8dee;
+      --green: #4caf7d;
+      --amber: #f0a830;
+      --red: #e05c5c;
+      --teal: #2ec4b6;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 2rem 1rem;
+    }
+    .container { max-width: 900px; margin: 0 auto; }
+
+    /* Header */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 2.5rem;
+      padding-bottom: 1.5rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .header-left h1 { font-size: 1.5rem; font-weight: 600; color: var(--text); }
+    .header-left p { color: var(--muted); font-size: 0.875rem; margin-top: 0.25rem; }
+    .badge {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.5rem 1rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+      text-align: right;
+    }
+    .badge strong { display: block; color: var(--accent); font-size: 1rem; }
+
+    /* Sections */
+    .section { margin-bottom: 2rem; }
+    .section-title {
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 1rem;
+    }
+
+    /* Card */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.25rem 1.5rem;
+      margin-bottom: 0.75rem;
+    }
+
+    /* Progress phases */
+    .phase-row {
+      display: grid;
+      grid-template-columns: 180px 1fr 44px;
+      align-items: center;
+      gap: 1rem;
+      padding: 0.6rem 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .phase-row:last-child { border-bottom: none; }
+    .phase-label { font-size: 0.875rem; font-weight: 500; }
+    .phase-note { font-size: 0.75rem; color: var(--muted); margin-top: 2px; }
+    .bar-wrap { background: rgba(255,255,255,0.06); border-radius: 4px; height: 6px; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 4px; transition: width 0.6s ease; }
+    .phase-pct { font-size: 0.8rem; color: var(--muted); text-align: right; }
+
+    /* Figures */
+    .figures-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+      gap: 0.75rem;
+    }
+    .fig-card {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+    .fig-icon { font-size: 1.5rem; }
+    .fig-title { font-size: 0.8rem; font-weight: 500; }
+    .fig-status {
+      font-size: 0.7rem;
+      padding: 2px 6px;
+      border-radius: 4px;
+      width: fit-content;
+    }
+    .status-planned { background: rgba(91,141,238,0.15); color: var(--accent); }
+    .status-idea    { background: rgba(240,168,48,0.15); color: var(--amber); }
+    .status-done    { background: rgba(76,175,125,0.15); color: var(--green); }
+
+    /* Research entries */
+    .research-entry {
+      padding: 0.75rem 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .research-entry:last-child { border-bottom: none; }
+    .research-date { font-size: 0.75rem; color: var(--muted); margin-bottom: 0.25rem; }
+    .research-title { font-size: 0.875rem; font-weight: 500; }
+    .research-count { font-size: 0.75rem; color: var(--teal); margin-top: 0.2rem; }
+
+    /* Prism results */
+    .prism-entry {
+      padding: 0.75rem 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .prism-entry:last-child { border-bottom: none; }
+    .prism-meta { display: flex; gap: 1rem; align-items: center; margin-bottom: 0.4rem; }
+    .prism-context { font-size: 0.8rem; font-weight: 500; }
+    .prism-mode {
+      font-size: 0.7rem;
+      background: rgba(46,196,182,0.12);
+      color: var(--teal);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .prism-ts { font-size: 0.72rem; color: var(--muted); margin-left: auto; }
+    .prism-output { font-size: 0.8rem; color: #b0b8d0; line-height: 1.5; white-space: pre-wrap; }
+
+    /* Session topic */
+    .topic-box {
+      font-size: 1rem;
+      font-weight: 500;
+      color: var(--accent);
+      padding: 0.5rem 0;
+    }
+    .topic-date { font-size: 0.75rem; color: var(--muted); }
+
+    /* Word iframe */
+    .word-iframe-wrap { position: relative; width: 100%; padding-top: 60%; border-radius: 8px; overflow: hidden; background: var(--bg); }
+    .word-iframe-wrap iframe { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: none; }
+    .word-placeholder { padding: 2rem; text-align: center; color: var(--muted); font-size: 0.875rem; }
+
+    /* Footer */
+    footer {
+      margin-top: 3rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--border);
+      text-align: center;
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
+
+    /* Access denied */
+    #access-denied { display: none; text-align: center; padding: 4rem 2rem; }
+    #access-denied h2 { color: var(--red); margin-bottom: 0.5rem; }
+    #main-content { display: none; }
+
+    /* Loading */
+    .spinner { color: var(--muted); text-align: center; padding: 1rem; font-size: 0.875rem; }
+
+    @media (max-width: 600px) {
+      .phase-row { grid-template-columns: 1fr; gap: 0.3rem; }
+      header { flex-direction: column; align-items: flex-start; gap: 1rem; }
+    }
+  </style>
+</head>
+<body>
+<div class="container">
+
+  <div id="access-denied">
+    <h2>Zugriff verweigert</h2>
+    <p>Ungültiger oder fehlender Zugangscode.</p>
+  </div>
+
+  <div id="main-content">
+    <header>
+      <div class="header-left">
+        <h1>Dissertationsfortschritt</h1>
+        <p>Robin Mandel · Doktorarbeit ITI · Universität Ulm</p>
+      </div>
+      <div class="badge">
+        Stand <strong id="last-updated">–</strong>
+        <span id="session-topic-date" style="display:none"></span>
+      </div>
+    </header>
+
+    <!-- Aktuelles Thema -->
+    <div class="section">
+      <div class="section-title">Aktuelles Arbeitsschwerpunkt</div>
+      <div class="card">
+        <div class="topic-date" id="topic-date"></div>
+        <div class="topic-box" id="topic-text">Wird geladen…</div>
+      </div>
+    </div>
+
+    <!-- Fortschritt -->
+    <div class="section">
+      <div class="section-title">Fortschritt nach Arbeitspaket</div>
+      <div class="card" id="phases-container">
+        <div class="spinner">Wird geladen…</div>
+      </div>
+    </div>
+
+    <!-- Abbildungen -->
+    <div class="section">
+      <div class="section-title">Geplante Abbildungen</div>
+      <div class="figures-grid" id="figures-grid">
+        <div class="spinner">Wird geladen…</div>
+      </div>
+    </div>
+
+    <!-- Prism-Analysen -->
+    <div class="section">
+      <div class="section-title">Statistische Analysen (Prism)</div>
+      <div class="card" id="prism-container">
+        <div class="spinner">Wird geladen…</div>
+      </div>
+    </div>
+
+    <!-- Word Dokument -->
+    <div class="section" id="word-section" style="display:none">
+      <div class="section-title">Manuskript · Word Online</div>
+      <div class="card">
+        <div id="word-embed-container"><div class="word-placeholder">Wird geladen…</div></div>
+      </div>
+    </div>
+
+    <!-- Literaturrecherche -->
+    <div class="section">
+      <div class="section-title">Nacht-Recherche · Analysierte Paper</div>
+      <div class="card" id="research-container">
+        <div class="spinner">Wird geladen…</div>
+      </div>
+    </div>
+
+    <footer>
+      Nur-Lese-Ansicht für Betreuer · Generiert von Jarvis Mission Control
+    </footer>
+  </div>
+</div>
+
+<script>
+// ── Token check ────────────────────────────────────────────────────────────
+const params = new URLSearchParams(location.search);
+const token  = params.get('token') || '';
+
+async function checkAccess() {
+  const res = await fetch('/betreuer/check?token=' + encodeURIComponent(token));
+  if (!res.ok) {
+    document.getElementById('access-denied').style.display = 'block';
+    return false;
+  }
+  return true;
+}
+
+// ── Phases (static config, same as diss.js) ───────────────────────────────
+const PHASES = [
+  { id: 'elisa',  label: 'ELISA / Biomarker',   pct: 15, color: '#5b8dee', note: 'NGAL, MPO, IL-6 Daten vorhanden' },
+  { id: 'klinik', label: 'Klinische Daten',      pct: 40, color: '#5b8dee', note: 'Baseline-Tabellen erstellt, KDIGO ausstehend' },
+  { id: 'korr',   label: 'Korrelationen',         pct:  5, color: '#2ec4b6', note: 'Prism-Analyse in Arbeit' },
+  { id: 'flow',   label: 'Flow-Zytometrie',       pct: 10, color: '#5b8dee', note: '229 .fcs Dateien, CD10/CD16 Analyse geplant' },
+  { id: 'manu',   label: 'Manuskript',             pct:  5, color: '#f0a830', note: 'Gliederung steht, IMRaD-Struktur' },
+];
+
+const FIGURES = [
+  { icon: '📉', title: 'Fig 1 · CD10low Verlauf',     status: 'planned' },
+  { icon: '📈', title: 'Fig 2 · CD16 Kinetik',         status: 'planned' },
+  { icon: '🔵', title: 'Fig 3 · Korrelation ELISA',   status: 'idea' },
+  { icon: '📋', title: 'Fig 4 · Klinische Outcomes',  status: 'idea' },
+  { icon: '🧫', title: 'Fig 5 · Flow-Zytometrie',     status: 'idea' },
+];
+
+function renderPhases() {
+  const c = document.getElementById('phases-container');
+  c.innerHTML = PHASES.map(p => `
+    <div class="phase-row">
+      <div>
+        <div class="phase-label">${p.label}</div>
+        <div class="phase-note">${p.note}</div>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar-fill" style="width:${p.pct}%;background:${p.color}"></div>
+      </div>
+      <div class="phase-pct">${p.pct}%</div>
+    </div>
+  `).join('');
+}
+
+function renderFigures() {
+  const g = document.getElementById('figures-grid');
+  g.innerHTML = FIGURES.map(f => `
+    <div class="fig-card">
+      <div class="fig-icon">${f.icon}</div>
+      <div class="fig-title">${f.title}</div>
+      <div class="fig-status status-${f.status}">${
+        f.status === 'planned' ? 'Geplant' : f.status === 'done' ? 'Fertig' : 'Idee'
+      }</div>
+    </div>
+  `).join('');
+}
+
+async function loadTopic() {
+  try {
+    const r = await fetch('/api/diss/session-topic');
+    const d = await r.json();
+    document.getElementById('topic-text').textContent = d.topic || 'Kein Schwerpunkt gesetzt';
+    if (d.date) document.getElementById('topic-date').textContent = d.date;
+  } catch(e) {
+    document.getElementById('topic-text').textContent = '–';
+  }
+}
+
+async function loadPrism() {
+  const c = document.getElementById('prism-container');
+  try {
+    const r = await fetch('/api/diss/prism-results');
+    const data = await r.json();
+    if (!data.length) { c.innerHTML = '<div class="spinner">Noch keine Analysen gespeichert.</div>'; return; }
+    c.innerHTML = data.slice(0,6).map(e => `
+      <div class="prism-entry">
+        <div class="prism-meta">
+          <span class="prism-context">${e.context || '–'}</span>
+          <span class="prism-mode">${e.mode || ''}</span>
+          <span class="prism-ts">${(e.ts||'').slice(0,10)}</span>
+        </div>
+        <div class="prism-output">${(e.output||'').slice(0,600)}${(e.output||'').length>600?'…':''}</div>
+      </div>
+    `).join('');
+  } catch(e) {
+    c.innerHTML = '<div class="spinner">Keine Daten verfügbar.</div>';
+  }
+}
+
+async function loadResearch() {
+  const c = document.getElementById('research-container');
+  try {
+    const r = await fetch('/api/diss/research');
+    const data = await r.json();
+    const entries = Array.isArray(data) ? data : (data.sessions || []);
+    if (!entries.length) { c.innerHTML = '<div class="spinner">Noch keine Recherche-Sessions.</div>'; return; }
+    c.innerHTML = entries.slice(0,5).map(e => `
+      <div class="research-entry">
+        <div class="research-date">${e.date || ''}</div>
+        <div class="research-title">${e.title || e.topic || 'Recherche-Session'}</div>
+        ${e.count ? `<div class="research-count">${e.count} Paper analysiert</div>` : ''}
+      </div>
+    `).join('');
+  } catch(e) {
+    c.innerHTML = '<div class="spinner">Keine Daten verfügbar.</div>';
+  }
+}
+
+async function loadWordEmbed() {
+  try {
+    const r = await fetch('/api/diss/word-url');
+    const d = await r.json();
+    const embedUrl = d.url || '';
+    const container = document.getElementById('word-embed-container');
+    if (!embedUrl) { container.innerHTML = '<div class="word-placeholder">Kein Word-Dokument verknüpft.</div>'; return; }
+    document.getElementById('word-section').style.display = 'block';
+    container.innerHTML = `<div class="word-iframe-wrap"><iframe src="${embedUrl}" allowfullscreen></iframe></div>`;
+  } catch(e) { /* silent */ }
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────
+(async () => {
+  const ok = await checkAccess();
+  if (!ok) return;
+
+  document.getElementById('main-content').style.display = 'block';
+  document.getElementById('last-updated').textContent = new Date().toLocaleDateString('de-DE');
+
+  renderPhases();
+  renderFigures();
+  await Promise.all([loadTopic(), loadPrism(), loadResearch(), loadWordEmbed()]);
+})();
+</script>
+</body>
+</html>

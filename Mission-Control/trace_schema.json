@@ -1,0 +1,70 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TurnTraceEvent",
+  "description": "Schema for a single turn event in a Mission Control session, designed for observability and debugging.",
+  "type": "object",
+  "properties": {
+    "trace_id": {
+      "description": "Unique identifier for this specific trace event (e.g., a UUID).",
+      "type": "string"
+    },
+    "session_id": {
+      "description": "Identifier for the parent session containing this turn.",
+      "type": "string"
+    },
+    "turn_id": {
+        "description": "Monotonically increasing integer for the turn number within a session.",
+        "type": "integer",
+        "minimum": 0
+    },
+    "timestamp_utc": {
+      "description": "ISO 8601 timestamp of when the event occurred.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "kind": {
+      "description": "The category of the event being traced.",
+      "type": "string",
+      "enum": [
+        "provider_request",
+        "provider_response",
+        "orchestrator_decision",
+        "memory_write_attempt",
+        "dependency_health_check"
+      ]
+    },
+    "status": {
+        "description": "The outcome of the event.",
+        "type": "string",
+        "enum": ["ok", "error", "blocked"]
+    },
+    "actor": {
+        "description": "The component or bot that generated this event.",
+        "type": "string"
+    },
+    "details": {
+        "type": "object",
+        "properties": {
+            "provider": { "type": "string" },
+            "latency_ms": { "type": "integer", "minimum": 0 },
+            "prompt_tokens": { "type": "integer", "minimum": 0 },
+            "completion_tokens": { "type": "integer", "minimum": 0 },
+            "diff_size": { "type": "integer" },
+            "evidence_path": { "type": "string" },
+            "blocked_by": { "type": "string" },
+            "error_class": {
+                "description": "A structured error identifier based on the four main axes.",
+                "type": "string",
+                "pattern": "^(provider|orchestrator|memory|dependency)_"
+            },
+            "error_message": { "type": "string" },
+            "caused_by_trace_id": {
+                "description": "The trace_id of a preceding event that is the likely root cause of this one (e.g., a dependency_down event causing a provider_error). Resolved by the offline reader.",
+                "type": "string"
+            }
+        },
+        "required": []
+    }
+  },
+  "required": ["trace_id", "session_id", "turn_id", "timestamp_utc", "kind", "status", "actor"]
+}

@@ -16,6 +16,42 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 _NO_WINDOW = 0x08000000 if sys.platform == 'win32' else 0
 
 CLAUDE_CLI = r"C:\Users\Robin\.local\bin\claude.exe"
+ZOTERO_SCRIPT = Path(__file__).parent / "zotero-add.py"
+
+
+def _zotero_import(raw_json: str, output_file: Path | None = None) -> str:
+    """Extract DOIs from night-research JSON, push to Zotero, write status back."""
+    try:
+        data = json.loads(raw_json)
+    except Exception:
+        return raw_json
+    changed = False
+    for paper in data.get("papers", []):
+        doi = (paper.get("doi") or "").strip()
+        if not doi or doi == "null":
+            paper["zotero"] = "no_doi"
+            continue
+        try:
+            r = subprocess.run(
+                [sys.executable, str(ZOTERO_SCRIPT), "--doi", doi],
+                capture_output=True, text=True, timeout=30,
+                encoding="utf-8", errors="replace",
+            )
+            out = r.stdout.strip() or r.stderr.strip()
+            print(f"  Zotero [{doi}]: {out[:120]}")
+            try:
+                result = json.loads(out)
+                paper["zotero"] = "ok" if result.get("ok") else "error"
+            except Exception:
+                paper["zotero"] = "ok" if r.returncode == 0 else "error"
+        except Exception as e:
+            print(f"  Zotero [{doi}] Fehler: {e}")
+            paper["zotero"] = "error"
+        changed = True
+    updated = json.dumps(data, ensure_ascii=False, indent=2)
+    if changed and output_file:
+        output_file.write_text(updated, encoding="utf-8")
+    return updated
 VAULT_KNOWLEDGE = Path("E:/OneDrive/AI/Obsidian-Vault/Jarvis-Brain/Jarvis-Knowledge/Forschung")
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
@@ -58,6 +94,7 @@ Fasse die Top 3-5 relevantesten Ergebnisse zusammen als JSON:
     {
       "title": "Paper-Titel",
       "authors": "Erstautor et al.",
+      "doi": "10.xxxx/xxxxx oder null",
       "summary": "2-3 Saetze Zusammenfassung",
       "relevance": "Warum relevant fuer Robins Arbeit",
       "url": "URL falls vorhanden"
@@ -89,6 +126,7 @@ Gib NUR das JSON aus, kein anderer Text."""
         if result.returncode == 0 and result.stdout.strip():
             output_file.write_text(result.stdout.strip(), encoding="utf-8")
             print(f"Recherche geschrieben: {output_file}")
+            _zotero_import(result.stdout.strip(), output_file)
         else:
             print(f"Claude Fehler: RC={result.returncode} | stdout={result.stdout[:100]!r} | stderr={result.stderr[:300]!r}")
 
